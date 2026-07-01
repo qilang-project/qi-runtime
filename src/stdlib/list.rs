@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 // 列表类型枚举
@@ -18,7 +19,8 @@ enum ListValue {
 
 // 全局列表存储
 static LISTS: Mutex<Option<HashMap<u64, ListValue>>> = Mutex::new(None);
-static mut NEXT_LIST_ID: u64 = 1;
+// 原子句柄计数器（真并发下 static mut 竞态会发重复句柄 → 堆损坏）
+static NEXT_LIST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 初始化列表存储
 fn init_lists() {
@@ -28,13 +30,9 @@ fn init_lists() {
     }
 }
 
-/// 获取下一个列表 ID
+/// 获取下一个列表 ID（原子，真并发安全）
 fn next_list_id() -> u64 {
-    unsafe {
-        let id = NEXT_LIST_ID;
-        NEXT_LIST_ID += 1;
-        id
-    }
+    NEXT_LIST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 // ============================================================================

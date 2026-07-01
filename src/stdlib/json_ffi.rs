@@ -7,11 +7,14 @@ use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 // JSON值存储
 static JSON_VALUES: Mutex<Option<HashMap<u64, Value>>> = Mutex::new(None);
-static mut NEXT_JSON_ID: u64 = 1;
+// 句柄计数器：必须原子 —— 真并发下多 goroutine 同时建 JSON，`static mut u64`
+// 竞态自增会发出重复句柄，两个「不同」对象别名同一 HashMap 项，并发改动 → 堆损坏。
+static NEXT_JSON_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 初始化JSON存储
 fn init_json_storage() {
@@ -21,13 +24,9 @@ fn init_json_storage() {
     }
 }
 
-/// 获取下一个JSON ID
+/// 获取下一个JSON ID（原子，真并发安全）
 fn next_json_id() -> u64 {
-    unsafe {
-        let id = NEXT_JSON_ID;
-        NEXT_JSON_ID += 1;
-        id
-    }
+    NEXT_JSON_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 // ============================================================================

@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 // 哈希表值类型
@@ -17,7 +18,8 @@ enum MapValue {
 
 // 全局哈希表存储
 static HASHMAPS: Mutex<Option<HashMap<u64, MapValue>>> = Mutex::new(None);
-static mut NEXT_MAP_ID: u64 = 1;
+// 原子句柄计数器（真并发下 static mut 竞态会发重复句柄 → 堆损坏）
+static NEXT_MAP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 初始化哈希表存储
 fn init_hashmaps() {
@@ -27,13 +29,9 @@ fn init_hashmaps() {
     }
 }
 
-/// 获取下一个哈希表 ID
+/// 获取下一个哈希表 ID（原子，真并发安全）
 fn next_map_id() -> u64 {
-    unsafe {
-        let id = NEXT_MAP_ID;
-        NEXT_MAP_ID += 1;
-        id
-    }
+    NEXT_MAP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// 辅助函数：将 C 字符串转换为 Rust 字符串
