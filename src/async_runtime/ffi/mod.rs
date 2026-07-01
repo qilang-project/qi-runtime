@@ -48,10 +48,24 @@ pub(crate) fn 全局异步运行时() -> &'static tokio::runtime::Runtime {
                 workers, max_blocking
             );
         }
+        // 每个 `启动 处理连接` 都跑在 tokio 的 blocking 线程上（spawn_blocking）。
+        // Qi 编译出来的代码栈帧偏大（上下文 结构体按值层层传递 + 中间件闭包链 +
+        // parse/序列化），tokio 默认 2MB 线程栈在 keep-alive 深调用链下会顶到栈
+        // 守护页 → SIGBUS（崩溃栈落在 parse_http_request/cstring_from_bytes 只是
+        // 恰好在那里越过 guard page，实际是整条请求处理链爆栈）。
+        //
+        // 实测：2MB 默认在 wrk 压测 ~13 万请求后必崩；4MB 起稳定。取 8MB 给足
+        // 余量（≈崩溃阈值 4×，与 macOS 主线程栈同量级），可用 QI_ASYNC_STACK 覆盖。
+        let stack_size = std::env::var("QI_ASYNC_STACK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n >= 1024 * 1024)
+            .unwrap_or(8 * 1024 * 1024);
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(workers)
             .max_blocking_threads(max_blocking)
+            .thread_stack_size(stack_size)
             .thread_name("qi-tokio")
             .build()
             .expect("failed to start tokio runtime")
