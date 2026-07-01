@@ -54,13 +54,17 @@ pub(crate) fn 全局异步运行时() -> &'static tokio::runtime::Runtime {
         // 守护页 → SIGBUS（崩溃栈落在 parse_http_request/cstring_from_bytes 只是
         // 恰好在那里越过 guard page，实际是整条请求处理链爆栈）。
         //
-        // 实测：2MB 默认在 wrk 压测 ~13 万请求后必崩；4MB 起稳定。取 8MB 给足
-        // 余量（≈崩溃阈值 4×，与 macOS 主线程栈同量级），可用 QI_ASYNC_STACK 覆盖。
+        // 实测：2MB 默认在 wrk 压测 ~13 万请求后必崩；4MB 对简单 handler 稳定，但
+        // qi-todo-web 这类深链 handler（路由→鉴权→DB→模板，逐层按值传上下文 + 拼接链）
+        // 在 8MB 下 wrk -c10 ~30 万请求后仍会顶到栈守护页 → SIGBUS（崩栈落在
+        // parse_http_request/cstring_from_bytes 只是恰好越界处）。实测 16MB 起对
+        // qi-todo-web 稳定（wrk -t2 -c10 70 万请求 0 错误存活）。取 16MB 默认，
+        // 可用 QI_ASYNC_STACK 覆盖。
         let stack_size = std::env::var("QI_ASYNC_STACK")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|n| *n >= 1024 * 1024)
-            .unwrap_or(8 * 1024 * 1024);
+            .unwrap_or(16 * 1024 * 1024);
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(workers)
