@@ -62,7 +62,9 @@ unsafe fn header_of_mut(base: *const u8) -> *mut BufHeader {
 }
 
 fn buffer_layout(capacity: usize) -> Layout {
-    Layout::from_size_align(HEADER_SIZE + capacity, 8).expect("invalid layout")
+    // +1 尾部 NUL：让 QiStr.ptr 永远是合法 C 字符串，可直接传给 c_char FFI
+    // （strlen/CStr::from_ptr 安全，不越界）。capacity（header 内）仍是真实字节数。
+    Layout::from_size_align(HEADER_SIZE + capacity + 1, 8).expect("invalid layout")
 }
 
 /// 分配一个 owned buffer，写入 data 内容，返回 QiStr (refcount = 1)
@@ -86,6 +88,8 @@ pub fn alloc_owned(data: &[u8]) -> QiStr {
         });
         let data_ptr = raw.add(HEADER_SIZE);
         std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
+        // 写尾部 NUL（buffer_layout 已多分配 1 字节），使 QiStr.ptr 是合法 C 字符串
+        *data_ptr.add(data.len()) = 0;
         QiStr {
             ptr: data_ptr,
             len: data.len() as i64,
