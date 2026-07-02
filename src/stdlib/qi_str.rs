@@ -111,6 +111,7 @@ pub fn alloc_owned(data: &[u8]) -> QiStr {
         std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, data.len());
         // 写尾部 NUL（buffer_layout 已多分配 1 字节），使 QiStr.ptr 是合法 C 字符串
         *data_ptr.add(data.len()) = 0;
+        super::rc_obj::diag_str_alloc();
         QiStr {
             ptr: data_ptr,
             len: data.len() as i64,
@@ -149,6 +150,10 @@ unsafe fn retain_base(base: *const u8) {
             super::rc_obj::obj_retain_raw(base);
             return;
         }
+        if (*header).magic == super::closure_ffi::QI_CLO_MAGIC {
+            super::closure_ffi::clo_retain_raw(base);
+            return;
+        }
         warn_non_rc_pointer_once();
         return;
     }
@@ -172,6 +177,10 @@ unsafe fn release_base(base: *const u8) {
             super::rc_obj::obj_release_shallow(base);
             return;
         }
+        if (*header).magic == super::closure_ffi::QI_CLO_MAGIC {
+            super::closure_ffi::clo_release_raw(base);
+            return;
+        }
         warn_non_rc_pointer_once();
         return;
     }
@@ -184,6 +193,7 @@ unsafe fn release_base(base: *const u8) {
         let cap = (*header).capacity as usize;
         let layout = buffer_layout(cap);
         dealloc(header as *mut u8, layout);
+        super::rc_obj::diag_str_free();
     }
 }
 
@@ -428,10 +438,7 @@ mod tests {
         let p = rc_cstr_from_bytes(b"hello rc");
         assert!(!p.is_null());
         unsafe {
-            assert_eq!(
-                std::ffi::CStr::from_ptr(p).to_str().unwrap(),
-                "hello rc"
-            );
+            assert_eq!(std::ffi::CStr::from_ptr(p).to_str().unwrap(), "hello rc");
             let h = header_of(p as *const u8);
             assert_eq!((*h).refcount.load(Ordering::Relaxed), 1);
         }
@@ -460,10 +467,7 @@ mod tests {
         rc_cstr_release(p1);
         rc_cstr_release(p1);
         rc_cstr_release(p1);
-        assert_eq!(
-            RC_CSTR_EMPTY.refcount.load(Ordering::Relaxed),
-            IMMORTAL_RC
-        );
+        assert_eq!(RC_CSTR_EMPTY.refcount.load(Ordering::Relaxed), IMMORTAL_RC);
         unsafe {
             assert_eq!(*p1, 0, "释放后仍可读（immortal 永不释放）");
         }

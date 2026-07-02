@@ -386,6 +386,14 @@ pub extern "C-unwind" fn qi_future_await_string(future: *mut Future) -> *const c
 /// Await a future and get its pointer value (blocking)
 /// FFI: qi_future_await_ptr(future: *mut Future) -> *mut u8
 /// Returns: pointer value on success, null on failure
+///
+/// Round E 所有权语义（与 codegen 的 ARC 纪律对齐）：
+/// - Pointer payload：**take** —— 把指针从 future 内部取走（置 None），
+///   所有权（创建时转移进 future 的那份 +1）随返回值移交调用方。
+///   再次 await 同一 future 返回 null（take 语义，杜绝双释放）。
+/// - String payload：每次 await 返回**新分配**的 rc C 串（+1 交调用方，
+///   可重复 await，各自独立释放）——顺带修复老的 Pointer-only 匹配漏洞
+///   （`未来<字符串>` 由 ready_string/FFI 完成时 payload 是 String）。
 #[no_mangle]
 pub extern "C-unwind" fn qi_future_await_ptr(future: *mut Future) -> *mut u8 {
     if future.is_null() {
@@ -395,7 +403,18 @@ pub extern "C-unwind" fn qi_future_await_ptr(future: *mut Future) -> *mut u8 {
     unsafe {
         let future_ref = &*future;
         match future_ref.await_value() {
-            Ok(FutureValue::Pointer(ptr)) => ptr,
+            Ok(FutureValue::Pointer(_)) => {
+                // take：在锁内原子取走所有权并置空 —— 并发双 await 时只有
+                // 一方拿到指针，另一方得 null（绝不双释放）。
+                let mut guard = future_ref.value.lock().unwrap();
+                if let Some(FutureValue::Pointer(p)) = *guard {
+                    *guard = None;
+                    p
+                } else {
+                    std::ptr::null_mut()
+                }
+            }
+            Ok(FutureValue::String(s)) => crate::stdlib::qi_str::rc_cstr_from_string(s) as *mut u8,
             Err(e) => throw_future_error(e),
             _ => std::ptr::null_mut(),
         }
@@ -433,11 +452,20 @@ pub extern "C" fn qi_future_is_completed(future: *mut Future) -> i32 {
 
 /// Free a future
 /// FFI: qi_future_free(future: *mut Future)
+///
+/// Round E：future 私藏的 Pointer payload 若从未被 await 取走，释放前
+/// 用 qi_rc_release_any 归还那份 +1（STR magic 完整释放 / OBJ 浅释放 /
+/// 其余静默）。await 取走过的（value 已置 None）自然跳过 —— 无双释放。
 #[no_mangle]
 pub extern "C" fn qi_future_free(future: *mut Future) {
     if !future.is_null() {
         unsafe {
-            let _ = Box::from_raw(future);
+            let boxed = Box::from_raw(future);
+            let leftover = boxed.value.lock().ok().and_then(|mut guard| guard.take());
+            if let Some(FutureValue::Pointer(p)) = leftover {
+                crate::stdlib::rc_obj::qi_rc_release_any(p as *const u8);
+            }
+            drop(boxed);
         }
     }
 }
@@ -547,6 +575,56 @@ mod tests {
         }
 
         qi_future_free(future_ptr);
+    }
+
+    #[test]
+    fn await_ptr_takes_ownership_once() {
+        // Pointer payload：第一次 await 取走（future 置空），第二次得 null
+        let obj = crate::stdlib::rc_obj::qi_obj_alloc(16);
+        let fut = qi_future_ready_ptr(obj);
+        let got = qi_future_await_ptr(fut);
+        assert_eq!(got, obj);
+        let second = qi_future_await_ptr(fut);
+        assert!(second.is_null(), "take 后第二次 await 应得 null");
+        // free 时 payload 已被取走 → 不双释放
+        qi_future_free(fut);
+        // 调用方持有唯一 +1，正常释放
+        crate::stdlib::rc_obj::qi_rc_release_any(obj as *const u8);
+    }
+
+    #[test]
+    fn future_free_releases_untaken_ptr_payload() {
+        // rc 观测（不依赖全局活跃计数 —— 并行测试会扰动那个）：
+        // obj rc=2（我方 +1、future 持 +1）→ free future 归还其 +1 → rc=1
+        let obj = crate::stdlib::rc_obj::qi_obj_alloc(8);
+        crate::stdlib::rc_obj::qi_obj_retain(obj); // rc=2
+        let fut = qi_future_ready_ptr(obj);
+        // 从未 await → free 归还 payload 的 +1
+        qi_future_free(fut);
+        // 只剩我方一份：dec 返回旧值 1 ⇒ future 的 +1 确已释放
+        assert_eq!(
+            crate::stdlib::rc_obj::qi_obj_dec(obj),
+            1,
+            "未取走的 Pointer payload 应随 future free 释放"
+        );
+        crate::stdlib::rc_obj::qi_obj_free(obj);
+    }
+
+    #[test]
+    fn await_ptr_handles_string_payload() {
+        // 未来<字符串>（payload 是 String）经 await_ptr：每次返回新 rc 串
+        let s = "串负载";
+        let fut = qi_future_ready_string(s.as_ptr(), s.len());
+        let p1 = qi_future_await_ptr(fut);
+        let p2 = qi_future_await_ptr(fut);
+        assert!(!p1.is_null() && !p2.is_null());
+        unsafe {
+            assert_eq!(CStr::from_ptr(p1 as *const c_char).to_str().unwrap(), s);
+            assert_eq!(CStr::from_ptr(p2 as *const c_char).to_str().unwrap(), s);
+        }
+        qi_string_free(p1 as *mut c_char);
+        qi_string_free(p2 as *mut c_char);
+        qi_future_free(fut);
     }
 
     #[test]
