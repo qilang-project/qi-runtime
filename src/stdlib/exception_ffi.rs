@@ -13,9 +13,11 @@
 
 #![allow(non_snake_case)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use std::sync::{Mutex, OnceLock};
 
 // jmp_buf 在 macOS arm64 上是 192 字节；预留 256 给所有平台对齐
 pub const JMP_BUF_SIZE: usize = 256;
@@ -30,6 +32,113 @@ thread_local! {
     static EXC_STACK: RefCell<Vec<*mut u8>> = const { RefCell::new(Vec::new()) };
     /// 当前线程最近一次抛出的错误消息
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+    /// 当前线程是否正在执行一个 goroutine 体（spawn wrapper 设置）
+    static IN_GOROUTINE: Cell<bool> = const { Cell::new(false) };
+}
+
+// ── 协程异常队列 ────────────────────────────────────────────────────────────
+//
+// goroutine 里 `抛出` 且没有任何 `尝试` frame 时，不能 abort 整个进程 ——
+// 转成 panic（QiUncaughtException payload）让 spawn 点的 catch_unwind 接住，
+// 由 spawn wrapper 把消息记入全局队列。Qi 侧通过
+// `协程异常数量()` / `获取协程异常()` 查询。
+
+/// goroutine 内未捕获 `抛出` 的 panic payload（区别于 Rust 自身 panic）
+pub struct QiUncaughtException(pub String);
+
+/// 全局协程异常队列（FIFO）
+static GOROUTINE_EXC_QUEUE: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+/// spawn wrapper 捕获到 goroutine panic 后调用：记录异常消息
+pub fn record_goroutine_exception(msg: String) {
+    if let Ok(mut q) = GOROUTINE_EXC_QUEUE.lock() {
+        q.push_back(msg);
+    }
+}
+
+/// 从 panic payload 提取消息；返回 (消息, 是否为 Qi `抛出`)
+pub fn goroutine_panic_message(payload: Box<dyn std::any::Any + Send>) -> (String, bool) {
+    match payload.downcast::<QiUncaughtException>() {
+        Ok(e) => (e.0, true),
+        Err(p) => {
+            let msg = if let Some(s) = p.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = p.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            (msg, false)
+        }
+    }
+}
+
+/// RAII：标记当前线程正在跑 goroutine 体（spawn_blocking 线程复用，必须恢复原值）
+pub struct GoroutineGuard {
+    prev: bool,
+}
+
+impl GoroutineGuard {
+    pub fn new() -> Self {
+        let prev = IN_GOROUTINE.with(|c| c.replace(true));
+        Self { prev }
+    }
+}
+
+impl Default for GoroutineGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for GoroutineGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        IN_GOROUTINE.with(|c| c.set(prev));
+    }
+}
+
+fn in_goroutine() -> bool {
+    IN_GOROUTINE.with(|c| c.get())
+}
+
+/// 安装一次性 panic hook：QiUncaughtException 是受控的控制流（goroutine 内
+/// `抛出`），不该打印 "thread panicked" 噪音；其它 panic 交原 hook。
+pub fn install_qi_panic_hook() {
+    static HOOK: OnceLock<()> = OnceLock::new();
+    HOOK.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info
+                .payload()
+                .downcast_ref::<QiUncaughtException>()
+                .is_some()
+            {
+                return;
+            }
+            prev(info);
+        }));
+    });
+}
+
+/// 队列中未取出的协程异常数量
+#[no_mangle]
+pub extern "C" fn qi_exc_goroutine_count() -> i64 {
+    GOROUTINE_EXC_QUEUE
+        .lock()
+        .map(|q| q.len() as i64)
+        .unwrap_or(0)
+}
+
+/// 取出（弹出）最早的一条协程异常消息；队列为空返回空串
+#[no_mangle]
+pub extern "C" fn qi_exc_goroutine_take() -> *mut c_char {
+    let msg = GOROUTINE_EXC_QUEUE
+        .lock()
+        .ok()
+        .and_then(|mut q| q.pop_front())
+        .unwrap_or_default();
+    crate::stdlib::qi_str::rc_cstr_from_string(msg)
 }
 
 fn push_frame(ptr: *mut u8) {
@@ -91,6 +200,11 @@ pub extern "C-unwind" fn qi_exc_throw(msg: *const c_char) -> ! {
 
     if let Some(ptr) = top_frame() {
         unsafe { longjmp(ptr, 1) }
+    } else if in_goroutine() {
+        // goroutine 内未捕获的 `抛出`：不能 abort 整个进程。转成 panic
+        // （qi_exc_throw 是 C-unwind ABI，可跨 FFI 边界 unwind），由 spawn
+        // 点的 catch_unwind 接住并记入协程异常队列 / 句柄状态。
+        std::panic::panic_any(QiUncaughtException(msg_str));
     } else {
         eprintln!("[qi] 未捕获的异常: {}", msg_str);
         std::process::abort();

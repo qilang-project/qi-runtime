@@ -275,6 +275,7 @@ pub extern "C" fn qi_runtime_spawn_goroutine(function_ptr: *const c_void) {
         );
     }
 
+    crate::stdlib::exception_ffi::install_qi_panic_hook();
     let func_addr = function_ptr as usize;
 
     // sync wrapper → spawn_blocking 走 tokio 的 blocking pool（默认上限可调）。
@@ -282,12 +283,16 @@ pub extern "C" fn qi_runtime_spawn_goroutine(function_ptr: *const c_void) {
     // 自己能伸缩到 max_blocking_threads。
     全局异步运行时().spawn_blocking(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let _g = crate::stdlib::exception_ffi::GoroutineGuard::new();
             let func = std::mem::transmute::<usize, fn()>(func_addr);
             func();
         }));
         if let Err(payload) = result {
-            let msg = panic_message(payload);
-            eprintln!("[qi] goroutine panic: {}", msg);
+            let (msg, is_qi_throw) = crate::stdlib::exception_ffi::goroutine_panic_message(payload);
+            if !is_qi_throw {
+                eprintln!("[qi] goroutine panic: {}", msg);
+            }
+            crate::stdlib::exception_ffi::record_goroutine_exception(msg);
         }
     });
 }
@@ -308,6 +313,7 @@ pub extern "C" fn qi_runtime_spawn_goroutine_with_args(
         );
     }
 
+    crate::stdlib::exception_ffi::install_qi_panic_hook();
     let wrapper_addr = wrapper_fn as usize;
     let count = if arg_count < 0 { 0 } else { arg_count as usize };
     let copied: Box<[i64]> = if count == 0 || args.is_null() {
@@ -322,24 +328,140 @@ pub extern "C" fn qi_runtime_spawn_goroutine_with_args(
     全局异步运行时().spawn_blocking(move || {
         let copied = copied;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let _g = crate::stdlib::exception_ffi::GoroutineGuard::new();
             let wrapper = std::mem::transmute::<usize, fn(*const i64)>(wrapper_addr);
             wrapper(copied.as_ptr());
         }));
         if let Err(payload) = result {
-            let msg = panic_message(payload);
-            eprintln!("[qi] goroutine panic: {}", msg);
+            let (msg, is_qi_throw) = crate::stdlib::exception_ffi::goroutine_panic_message(payload);
+            if !is_qi_throw {
+                eprintln!("[qi] goroutine panic: {}", msg);
+            }
+            crate::stdlib::exception_ffi::record_goroutine_exception(msg);
         }
     });
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
+    crate::stdlib::exception_ffi::goroutine_panic_message(payload).0
+}
+
+// ── 可等待协程（句柄）─────────────────────────────────────────────────────
+//
+// `启动并等待协程(函数值)` → 句柄；`等待协程(句柄)` join；
+// `协程有异常(句柄)` / `获取协程异常句柄(句柄)` 查询该协程的未捕获异常。
+// 函数值是 fat 闭包对象（slot0 = fn_ptr，调用约定 fn(env)，见 closure_ffi.rs）。
+
+/// 一个可 join 协程的完成状态
+struct GoroutineHandleState {
+    inner: Mutex<GoroutineOutcome>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GoroutineOutcome {
+    done: bool,
+    error: Option<String>,
+}
+
+static GOROUTINE_HANDLES: OnceLock<Mutex<HashMap<i64, std::sync::Arc<GoroutineHandleState>>>> =
+    OnceLock::new();
+static NEXT_GOROUTINE_HANDLE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+fn goroutine_handles() -> &'static Mutex<HashMap<i64, std::sync::Arc<GoroutineHandleState>>> {
+    GOROUTINE_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn goroutine_handle_state(handle: i64) -> Option<std::sync::Arc<GoroutineHandleState>> {
+    goroutine_handles().lock().ok()?.get(&handle).cloned()
+}
+
+/// 启动一个可等待的协程：参数是 fat 闭包对象（nullary），返回协程句柄。
+/// 协程体内未捕获的 `抛出` / panic 记录在句柄状态里（不进全局队列）。
+#[no_mangle]
+pub extern "C" fn qi_runtime_spawn_goroutine_handle(closure_obj: *const c_void) -> i64 {
+    ensure_runtime_initialized();
+    crate::stdlib::exception_ffi::install_qi_panic_hook();
+    if closure_obj.is_null() {
+        return -1;
     }
+
+    let handle = NEXT_GOROUTINE_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let state = std::sync::Arc::new(GoroutineHandleState {
+        inner: Mutex::new(GoroutineOutcome::default()),
+        cv: std::sync::Condvar::new(),
+    });
+    if let Ok(mut m) = goroutine_handles().lock() {
+        m.insert(handle, state.clone());
+    }
+
+    let obj_addr = closure_obj as usize;
+    全局异步运行时().spawn_blocking(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let _g = crate::stdlib::exception_ffi::GoroutineGuard::new();
+            let obj = obj_addr as *const c_void;
+            // fat obj slot0 = fn_ptr；nullary 闭包调用约定 fn(env)
+            let fn_addr = *(obj as *const usize);
+            let f = std::mem::transmute::<usize, fn(*const c_void)>(fn_addr);
+            f(obj);
+        }));
+        let mut outcome = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(payload) = result {
+            let (msg, is_qi_throw) = crate::stdlib::exception_ffi::goroutine_panic_message(payload);
+            if !is_qi_throw {
+                eprintln!("[qi] goroutine panic: {}", msg);
+            }
+            outcome.error = Some(msg);
+        }
+        outcome.done = true;
+        drop(outcome);
+        state.cv.notify_all();
+    });
+    handle
+}
+
+/// 等待协程完成（join）。未知句柄返回 -1，正常返回 0。
+#[no_mangle]
+pub extern "C" fn qi_runtime_goroutine_join(handle: i64) -> i64 {
+    let state = match goroutine_handle_state(handle) {
+        Some(s) => s,
+        None => return -1,
+    };
+    let mut outcome = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    while !outcome.done {
+        outcome = state.cv.wait(outcome).unwrap_or_else(|e| e.into_inner());
+    }
+    0
+}
+
+/// 协程是否以未捕获异常结束（隐式 join）。1=有异常 0=无 -1=未知句柄。
+#[no_mangle]
+pub extern "C" fn qi_runtime_goroutine_has_exception(handle: i64) -> i64 {
+    let state = match goroutine_handle_state(handle) {
+        Some(s) => s,
+        None => return -1,
+    };
+    let mut outcome = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    while !outcome.done {
+        outcome = state.cv.wait(outcome).unwrap_or_else(|e| e.into_inner());
+    }
+    outcome.error.is_some() as i64
+}
+
+/// 取该协程的异常消息（隐式 join）；无异常/未知句柄返回空串。
+#[no_mangle]
+pub extern "C" fn qi_runtime_goroutine_take_exception(handle: i64) -> *mut std::os::raw::c_char {
+    let msg = match goroutine_handle_state(handle) {
+        Some(state) => {
+            let mut outcome = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+            while !outcome.done {
+                outcome = state.cv.wait(outcome).unwrap_or_else(|e| e.into_inner());
+            }
+            outcome.error.clone().unwrap_or_default()
+        }
+        None => String::new(),
+    };
+    crate::stdlib::qi_str::rc_cstr_from_string(msg)
 }
 
 // Channel implementation

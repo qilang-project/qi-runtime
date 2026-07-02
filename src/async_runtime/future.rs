@@ -223,6 +223,14 @@ impl Future {
 
 // ===== FFI Functions for LLVM IR =====
 
+/// failed future 被 `等待`：错误沿 Qi 异常机制传播（qi_exc_throw 不返回 ——
+/// 有 `尝试` frame 时 longjmp 进 catch；goroutine 内无 frame 转 panic 进协程
+/// 异常队列；主线程无 frame 打印后 abort）。
+fn throw_future_error(err: String) -> ! {
+    let c = std::ffi::CString::new(err).unwrap_or_default();
+    crate::stdlib::exception_ffi::qi_exc_throw(c.as_ptr())
+}
+
 /// Create a ready future with an i64 value
 /// FFI: qi_future_ready_i64(value: i64) -> *mut Future
 #[no_mangle]
@@ -294,7 +302,7 @@ pub extern "C" fn qi_future_failed(error_ptr: *const u8, error_len: usize) -> *m
 /// FFI: qi_future_await_i64(future: *mut Future) -> i64
 /// Returns: value on success, -1 on failure
 #[no_mangle]
-pub extern "C" fn qi_future_await_i64(future: *mut Future) -> i64 {
+pub extern "C-unwind" fn qi_future_await_i64(future: *mut Future) -> i64 {
     if future.is_null() {
         return -1;
     }
@@ -303,6 +311,7 @@ pub extern "C" fn qi_future_await_i64(future: *mut Future) -> i64 {
         let future_ref = &*future;
         match future_ref.await_value() {
             Ok(FutureValue::Integer(value)) => value,
+            Err(e) => throw_future_error(e),
             _ => -1,
         }
     }
@@ -312,7 +321,7 @@ pub extern "C" fn qi_future_await_i64(future: *mut Future) -> i64 {
 /// FFI: qi_future_await_f64(future: *mut Future) -> f64
 /// Returns: value on success, 0.0 on failure
 #[no_mangle]
-pub extern "C" fn qi_future_await_f64(future: *mut Future) -> f64 {
+pub extern "C-unwind" fn qi_future_await_f64(future: *mut Future) -> f64 {
     if future.is_null() {
         return 0.0;
     }
@@ -321,6 +330,7 @@ pub extern "C" fn qi_future_await_f64(future: *mut Future) -> f64 {
         let future_ref = &*future;
         match future_ref.await_value() {
             Ok(FutureValue::Float(value)) => value,
+            Err(e) => throw_future_error(e),
             _ => 0.0,
         }
     }
@@ -330,7 +340,7 @@ pub extern "C" fn qi_future_await_f64(future: *mut Future) -> f64 {
 /// FFI: qi_future_await_bool(future: *mut Future) -> i32
 /// Returns: 1 for true, 0 for false/failure
 #[no_mangle]
-pub extern "C" fn qi_future_await_bool(future: *mut Future) -> i32 {
+pub extern "C-unwind" fn qi_future_await_bool(future: *mut Future) -> i32 {
     if future.is_null() {
         return 0;
     }
@@ -345,6 +355,7 @@ pub extern "C" fn qi_future_await_bool(future: *mut Future) -> i32 {
                     0
                 }
             }
+            Err(e) => throw_future_error(e),
             _ => 0,
         }
     }
@@ -354,7 +365,7 @@ pub extern "C" fn qi_future_await_bool(future: *mut Future) -> i32 {
 /// FFI: qi_future_await_string(future: *mut Future) -> *const c_char
 /// Returns: null-terminated C string, caller must free with qi_string_free
 #[no_mangle]
-pub extern "C" fn qi_future_await_string(future: *mut Future) -> *const c_char {
+pub extern "C-unwind" fn qi_future_await_string(future: *mut Future) -> *const c_char {
     if future.is_null() {
         return std::ptr::null();
     }
@@ -366,6 +377,7 @@ pub extern "C" fn qi_future_await_string(future: *mut Future) -> *const c_char {
                 // Allocate RC C string that caller must free (qi_string_free)
                 crate::stdlib::qi_str::rc_cstr_from_string(s)
             }
+            Err(e) => throw_future_error(e),
             _ => std::ptr::null(),
         }
     }
@@ -375,7 +387,7 @@ pub extern "C" fn qi_future_await_string(future: *mut Future) -> *const c_char {
 /// FFI: qi_future_await_ptr(future: *mut Future) -> *mut u8
 /// Returns: pointer value on success, null on failure
 #[no_mangle]
-pub extern "C" fn qi_future_await_ptr(future: *mut Future) -> *mut u8 {
+pub extern "C-unwind" fn qi_future_await_ptr(future: *mut Future) -> *mut u8 {
     if future.is_null() {
         return std::ptr::null_mut();
     }
@@ -384,6 +396,7 @@ pub extern "C" fn qi_future_await_ptr(future: *mut Future) -> *mut u8 {
         let future_ref = &*future;
         match future_ref.await_value() {
             Ok(FutureValue::Pointer(ptr)) => ptr,
+            Err(e) => throw_future_error(e),
             _ => std::ptr::null_mut(),
         }
     }
