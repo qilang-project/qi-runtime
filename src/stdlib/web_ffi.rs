@@ -4,7 +4,7 @@
 //! crashing handler returns a 500 response instead of taking down the goroutine.
 
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CStr};
 use std::io::Write;
 use std::sync::OnceLock;
 
@@ -196,15 +196,52 @@ pub extern "C" fn qi_runtime_serialize_http_response_ka(
 
 /// HTTP request parsed into 5 fields. Lives as long as the qi caller holds
 /// the opaque pointer; freed via qi_web_request_parts_free.
+///
+/// 字段用 **RC 分配的 C 串**（rc_cstr_*，隐藏 header），而非裸 CString：
+/// accessor 返回的指针语义仍是「借引用」（parts 存活期内有效，parts 持有一个引用），
+/// 但 QI_ARC 插桩的 qi_string_retain/free 对它是**有效且平衡**的 ——
+/// Qi 侧把它存进变量/结构体时 retain，parts_free 释放自己那份引用，
+/// buffer 在最后一个引用消失时才真正回收。零「非 RC 指针」警告，零 UAF。
 pub struct RequestParts {
-    method: CString,
-    path: CString,
-    query: CString,
-    headers: CString,
-    body: CString,
+    method: RcStr,
+    path: RcStr,
+    query: RcStr,
+    headers: RcStr,
+    body: RcStr,
     /// 1 = keep-alive, 0 = close。HTTP/1.1 默认 keep-alive，除非 Connection: close
     keep_alive: i64,
 }
+
+/// 持有一个 RC C 串引用的 RAII 包装：Drop 时 release。
+struct RcStr(*mut c_char);
+
+impl RcStr {
+    /// 从字节分配（内嵌 NUL 替换为空格，保持 C 字符串约束）。refcount = 1。
+    fn from_bytes(b: &[u8]) -> Self {
+        if b.contains(&0) {
+            let cleaned: Vec<u8> = b.iter().map(|&x| if x == 0 { b' ' } else { x }).collect();
+            RcStr(crate::stdlib::qi_str::rc_cstr_from_bytes(&cleaned))
+        } else {
+            RcStr(crate::stdlib::qi_str::rc_cstr_from_bytes(b))
+        }
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *const c_char {
+        self.0
+    }
+}
+
+impl Drop for RcStr {
+    fn drop(&mut self) {
+        crate::stdlib::qi_str::rc_cstr_release(self.0);
+    }
+}
+
+// RequestParts / MatchResult 以 i64 句柄跨 FFI 传递，可能在 runtime 线程池间移动。
+// RcStr 内部是 RC buffer 的 data 指针，引用计数原子递增减，跨线程安全。
+unsafe impl Send for RcStr {}
+unsafe impl Sync for RcStr {}
 
 /// 从字节切片句柄解析 HTTP/1.1 请求，返回 *mut RequestParts。
 /// 失败返回 null。调用方负责调 qi_web_request_parts_free 释放。
@@ -275,11 +312,11 @@ fn parse_http_request(bytes: &[u8]) -> RequestParts {
     let keep_alive = parse_connection_keep_alive(headers);
 
     RequestParts {
-        method: cstring_from_bytes(method),
-        path: cstring_from_bytes(path),
-        query: cstring_from_bytes(query),
-        headers: cstring_from_bytes(headers),
-        body: cstring_from_bytes(body),
+        method: RcStr::from_bytes(method),
+        path: RcStr::from_bytes(path),
+        query: RcStr::from_bytes(query),
+        headers: RcStr::from_bytes(headers),
+        body: RcStr::from_bytes(body),
         keep_alive,
     }
 }
@@ -336,12 +373,6 @@ fn parse_connection_keep_alive(headers: &[u8]) -> i64 {
         }
     }
     1
-}
-
-fn cstring_from_bytes(b: &[u8]) -> CString {
-    // 内嵌 NUL 替换为空格（C 字符串约束）
-    let cleaned: Vec<u8> = b.iter().map(|&x| if x == 0 { b' ' } else { x }).collect();
-    CString::new(cleaned).unwrap_or_else(|_| CString::new("").unwrap())
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -424,17 +455,17 @@ fn find_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
-// 借引用：返回 RequestParts 内部 CString 的指针。生命期跟 RequestParts 一致，
-// 调用方必须在调 qi_web_request_parts_free 之前别再读这些指针。
+// 借引用：返回 RequestParts 内部 RC C 串的指针。生命期跟 RequestParts 一致，
+// 调用方必须在调 qi_web_request_parts_free 之前别再读这些指针；
+// 若调用方（QI_ARC 插桩）retain 过，则 retain 的那份在 parts_free 之后依然有效。
 // qi-web 的安全契约：服务器 hot path 在 序列化响应 把 bytes 拷到独立 buffer
 // 之后才 free RequestParts，所以即便 handler 把请求字符串原样塞进响应也安全。
 //
-// 静态空字符串：accessor 入参为 null 时返回。常驻 .rodata，不参与释放。
-static EMPTY_CSTR: &[u8] = b"\0";
-
+// 空字符串：accessor 入参为 null 时返回 RC 分配器的 immortal 空串
+// （带合法 header，retain/free 皆 no-op —— 不会触发「非 RC 指针」警告）。
 #[inline]
 fn empty_cptr() -> *const c_char {
-    EMPTY_CSTR.as_ptr() as *const c_char
+    crate::stdlib::qi_str::rc_cstr_from_bytes(b"")
 }
 
 #[no_mangle]
@@ -607,7 +638,8 @@ pub extern "C" fn qi_web_router_register(
 pub struct MatchResult {
     handler_index: i64,
     path_hit: i64,
-    params: CString,
+    /// 参数串（RC 分配，Drop 时 release —— 语义同 RequestParts 字段）
+    params: RcStr,
     method_mask: u8,
 }
 
@@ -659,7 +691,7 @@ pub extern "C" fn qi_web_router_match(
     Box::into_raw(Box::new(MatchResult {
         handler_index,
         path_hit: 1,
-        params: CString::new(params).unwrap_or_else(|_| CString::new("").unwrap()),
+        params: RcStr::from_bytes(&params),
         method_mask,
     }))
 }
