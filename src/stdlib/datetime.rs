@@ -11,7 +11,7 @@
 //! Provides comprehensive time and date handling
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike, Utc};
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::thread;
 
@@ -74,7 +74,7 @@ pub extern "C" fn qi_datetime_format(timestamp: i64, format: *const c_char) -> *
     };
 
     let formatted = dt.format(format_str).to_string();
-    CString::new(formatted).unwrap().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(formatted)
 }
 
 /// 格式化 Unix 时间戳为字符串（本地时间）
@@ -97,7 +97,7 @@ pub extern "C" fn qi_datetime_format_local(timestamp: i64, format: *const c_char
     };
 
     let formatted = dt.format(format_str).to_string();
-    CString::new(formatted).unwrap().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(formatted)
 }
 
 // ============================================================================
@@ -697,15 +697,10 @@ pub extern "C" fn qi_datetime_sleep_micros(micros: i64) {
     }
 }
 
-/// 释放字符串
+/// 释放字符串（header-aware：qi_datetime_format* 返回的是 rc_cstr）
 #[no_mangle]
 pub extern "C" fn qi_datetime_free_string(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 /// 判断两个时间戳是否在同一天
@@ -811,6 +806,7 @@ pub extern "C" fn qi_datetime_diff_years(timestamp1: i64, timestamp2: i64) -> i6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn test_datetime_now() {

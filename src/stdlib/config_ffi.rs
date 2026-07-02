@@ -2,7 +2,7 @@
 //!
 //! 提供 TOML, YAML, INI 配置文件读写功能
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::fs;
 use std::os::raw::c_char;
 
@@ -22,10 +22,7 @@ pub extern "C" fn qi_config_read_toml(path: *const c_char) -> *mut c_char {
                     Ok(value) => {
                         // 转换为 JSON
                         match serde_json::to_string(&value) {
-                            Ok(json) => match CString::new(json) {
-                                Ok(c_str) => c_str.into_raw(),
-                                Err(_) => std::ptr::null_mut(),
-                            },
+                            Ok(json) => crate::stdlib::qi_str::rc_cstr_from_string(json),
                             Err(_) => std::ptr::null_mut(),
                         }
                     }
@@ -83,10 +80,7 @@ pub extern "C" fn qi_config_read_ini(path: *const c_char) -> *mut c_char {
                 let map = conf.get_map_ref();
 
                 match serde_json::to_string(&map) {
-                    Ok(json) => match CString::new(json) {
-                        Ok(c_str) => c_str.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    },
+                    Ok(json) => crate::stdlib::qi_str::rc_cstr_from_string(json),
                     Err(_) => std::ptr::null_mut(),
                 }
             }
@@ -129,14 +123,10 @@ pub extern "C" fn qi_config_write_ini(path: *const c_char, json: *const c_char) 
     }
 }
 
-/// 释放字符串
+/// 释放字符串（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_config_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 
 use super::crypto::{加密操作, 加密模块};
 use super::StdlibValue;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
@@ -34,7 +34,7 @@ pub extern "C" fn qi_crypto_md5(input: *const c_char) -> *mut c_char {
 
         let 模块 = 获取加密模块();
         match 模块.执行操作(加密操作::MD5哈希, &参数) {
-            Ok(StdlibValue::String(结果)) => CString::new(结果).unwrap().into_raw(),
+            Ok(StdlibValue::String(结果)) => crate::stdlib::qi_str::rc_cstr_from_string(结果),
             _ => std::ptr::null_mut(),
         }
     }
@@ -53,7 +53,7 @@ pub extern "C" fn qi_crypto_sha256(input: *const c_char) -> *mut c_char {
 
         let 模块 = 获取加密模块();
         match 模块.执行操作(加密操作::SHA256哈希, &参数) {
-            Ok(StdlibValue::String(结果)) => CString::new(结果).unwrap().into_raw(),
+            Ok(StdlibValue::String(结果)) => crate::stdlib::qi_str::rc_cstr_from_string(结果),
             _ => std::ptr::null_mut(),
         }
     }
@@ -72,7 +72,7 @@ pub extern "C" fn qi_crypto_sha512(input: *const c_char) -> *mut c_char {
 
         let 模块 = 获取加密模块();
         match 模块.执行操作(加密操作::SHA512哈希, &参数) {
-            Ok(StdlibValue::String(结果)) => CString::new(结果).unwrap().into_raw(),
+            Ok(StdlibValue::String(结果)) => crate::stdlib::qi_str::rc_cstr_from_string(结果),
             _ => std::ptr::null_mut(),
         }
     }
@@ -91,7 +91,7 @@ pub extern "C" fn qi_crypto_base64_encode(input: *const c_char) -> *mut c_char {
 
         let 模块 = 获取加密模块();
         match 模块.执行操作(加密操作::Base64编码, &参数) {
-            Ok(StdlibValue::String(结果)) => CString::new(结果).unwrap().into_raw(),
+            Ok(StdlibValue::String(结果)) => crate::stdlib::qi_str::rc_cstr_from_string(结果),
             _ => std::ptr::null_mut(),
         }
     }
@@ -110,7 +110,7 @@ pub extern "C" fn qi_crypto_base64_decode(input: *const c_char) -> *mut c_char {
 
         let 模块 = 获取加密模块();
         match 模块.执行操作(加密操作::Base64解码, &参数) {
-            Ok(StdlibValue::String(结果)) => CString::new(结果).unwrap().into_raw(),
+            Ok(StdlibValue::String(结果)) => crate::stdlib::qi_str::rc_cstr_from_string(结果),
             _ => std::ptr::null_mut(),
         }
     }
@@ -130,20 +130,16 @@ pub extern "C" fn qi_crypto_hmac_sha256(message: *const c_char, key: *const c_ch
 
         let 模块 = 获取加密模块();
         match 模块.执行操作(加密操作::HMAC_SHA256, &参数) {
-            Ok(StdlibValue::String(结果)) => CString::new(结果).unwrap().into_raw(),
+            Ok(StdlibValue::String(结果)) => crate::stdlib::qi_str::rc_cstr_from_string(结果),
             _ => std::ptr::null_mut(),
         }
     }
 }
 
-/// 释放字符串内存
+/// 释放字符串内存（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_crypto_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

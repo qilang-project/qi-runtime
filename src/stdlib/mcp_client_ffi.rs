@@ -171,15 +171,17 @@ fn get_conn(id: i64) -> Option<Arc<Connection>> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn to_cstr(s: String) -> *mut c_char {
-    // 替换 NUL 字节，防止 CString 创建失败
-    match CString::new(s.replace('\0', "\u{FFFD}")) {
-        Ok(c) => c.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+    // 替换 NUL 字节（rc_cstr 虽能照存内部 NUL，但 C 侧 strlen 会截断；
+    // 替换为 U+FFFD 保留可见内容，与旧 CString 语义一致）
+    if s.contains('\0') {
+        crate::stdlib::qi_str::rc_cstr_from_string(s.replace('\0', "\u{FFFD}"))
+    } else {
+        crate::stdlib::qi_str::rc_cstr_from_string(s)
     }
 }
 
 fn empty_cstr() -> *mut c_char {
-    CString::new("").unwrap().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_str("")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1078,14 +1080,11 @@ pub extern "C" fn qi_mcpc_drain_notifications(conn_id: i64) -> *mut c_char {
 // FFI：释放字符串
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 释放由 qi_mcpc_request 返回的字符串。
+/// 释放由 qi_mcpc_request 返回的字符串
+/// （委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）。
 #[no_mangle]
 pub extern "C" fn qi_mcpc_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

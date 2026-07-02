@@ -4,7 +4,7 @@
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Mutex;
@@ -541,10 +541,8 @@ pub extern "C" fn qi_cli_get_value(matches_id: i64, name: *const c_char) -> *mut
 
         if let Some(m) = matches.get(&(matches_id as usize)) {
             if let Some(value) = m.matches.get_one::<String>(&name_str) {
-                // 转换为C字符串
-                if let Ok(c_string) = CString::new(value.as_str()) {
-                    return c_string.into_raw();
-                }
+                // 转换为 RC C 字符串
+                return crate::stdlib::qi_str::rc_cstr_from_str(value.as_str());
             }
         }
 
@@ -644,14 +642,10 @@ pub extern "C" fn qi_cli_get_subcommand(matches_id: i64, name: *const c_char) ->
 
 // ==================== 内存管理 ====================
 
-/// 释放字符串内存
+/// 释放字符串内存（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_cli_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 /// 释放应用

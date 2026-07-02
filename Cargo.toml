@@ -61,3 +61,7 @@ configparser = "3.1"
 flate2 = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 log = "0.4.20"
+
+[dev-dependencies]
+# filesystem.rs 测试用（预先存在的缺口：tests 引用了 tempfile 但未声明）
+tempfile = "3"

@@ -4,7 +4,7 @@
 //! Provides key-value mapping with string keys and multiple value types
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -338,7 +338,7 @@ pub extern "C" fn qi_hashmap_string_get(map_id: i64, key: *const c_char) -> *mut
     if let Some(ref map_collection) = *maps {
         if let Some(MapValue::StringMap(ref map)) = map_collection.get(&(map_id as u64)) {
             if let Some(value) = map.get(&key_str) {
-                return CString::new(value.clone()).unwrap().into_raw();
+                return crate::stdlib::qi_str::rc_cstr_from_str(value);
             }
         }
     }
@@ -380,15 +380,10 @@ pub extern "C" fn qi_hashmap_free(map_id: i64) -> i64 {
     0
 }
 
-/// 释放字符串
+/// 释放字符串（header-aware：qi_hashmap_string_get 返回的是 rc_cstr）
 #[no_mangle]
 pub extern "C" fn qi_hashmap_free_string(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

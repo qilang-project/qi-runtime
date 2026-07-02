@@ -2,21 +2,29 @@
 //!
 //! 设计决策（grill 后落定）：
 //!   - struct: `{ ptr: *const u8, len: i64, base: *const u8 }`，24 字节按值传
-//!   - buffer header: `{ refcount: AtomicI64, capacity: i64 }`，16 字节，
-//!     位于 `base - 16` 处
+//!   - buffer header: `{ magic: u64, refcount: AtomicI64, capacity: i64 }`，
+//!     24 字节，位于 `base - 24` 处
 //!   - literals / borrows: `base = null`，clone/drop 走 null 旁路
 //!   - UTF-8: 边界一次性验证（lossy），内部使用 `from_utf8_unchecked`
 //!   - substring: 零拷贝，共享 backing；refcount++
 //!
 //! Buffer 内存布局：
+//! ```text
+//! +-------------------+-------------------+--------------------+
+//! | magic (u64)       | refcount (i64)    | capacity (i64)     |
+//! +-------------------+-------------------+--------------------+ ← base
+//! | data bytes (capacity 字节，UTF-8) + 尾部 NUL                 |
+//! +------------------------------------------------------------+
 //! ```
-//! +-------------------+--------------------+
-//! | refcount (i64)    | capacity (i64)     |
-//! +-------------------+--------------------+ ← base
-//! | data bytes (capacity 字节，UTF-8)       |
-//! +----------------------------------------+
-//! ```
-//! base 总是指向 data 起点。header 在 `base - 16` 处。
+//! base 总是指向 data 起点。header 在 `base - 24` 处。数据区尾部带 NUL，
+//! 因此 base（以及 rc_cstr_* 返回的指针）本身就是合法 C 字符串。
+//!
+//! magic 用于 `i8*` C 字符串 ABI 的防御：`qi_string_free` /
+//! `qi_string_retain` 收到的裸指针可能不是本分配器分配的（历史
+//! `CString::into_raw`、外部库串），magic 不符时宁泄漏不崩溃。
+//!
+//! refcount >= IMMORTAL_RC 表示 immortal（字面量 emit 的全局常量），
+//! 一切增减都 no-op、永不释放。
 //!
 //! literals / borrows: ptr 指向某个数据区起点（可能是 .rodata，可能是子串
 //! 偏移），base = null，永不参与 refcount。
@@ -24,7 +32,8 @@
 #![allow(non_snake_case)]
 
 use std::alloc::{alloc, dealloc, Layout};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::os::raw::c_char;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 /// Fat-pointer 字符串 — Qi 的新 字符串 类型在 ABI 上的表示
 #[repr(C)]
@@ -42,14 +51,25 @@ pub struct QiStr {
 unsafe impl Send for QiStr {}
 unsafe impl Sync for QiStr {}
 
-/// Owned buffer 的 header，位于 `base - 16`
+/// RC buffer 的识别 magic — header 首 8 字节（"QISRC1" 变体 + 版本号）
+pub const QI_STR_MAGIC: u64 = 0x5149_5352_4331_0001;
+
+/// refcount >= 此值 ⇒ immortal：增减皆 no-op，永不释放。
+/// codegen 会把字面量 emit 成 refcount = IMMORTAL_RC 的全局常量。
+pub const IMMORTAL_RC: i64 = 1 << 61;
+
+/// Owned buffer 的 header，位于 `base - 24`
 #[repr(C)]
 struct BufHeader {
+    magic: u64,
     refcount: AtomicI64,
     capacity: i64,
 }
 
-const HEADER_SIZE: usize = std::mem::size_of::<BufHeader>(); // 16
+const HEADER_SIZE: usize = std::mem::size_of::<BufHeader>(); // 24
+
+// 布局铁闸：header 必须正好 24 字节（magic/refcount/capacity 各 8）
+const _: () = assert!(std::mem::size_of::<BufHeader>() == 24);
 
 #[inline]
 unsafe fn header_of(base: *const u8) -> *const BufHeader {
@@ -83,6 +103,7 @@ pub fn alloc_owned(data: &[u8]) -> QiStr {
         }
         // 写 header
         (raw as *mut BufHeader).write(BufHeader {
+            magic: QI_STR_MAGIC,
             refcount: AtomicI64::new(1),
             capacity: data.len() as i64,
         });
@@ -98,13 +119,68 @@ pub fn alloc_owned(data: &[u8]) -> QiStr {
     }
 }
 
-/// 借引用：refcount++（如果 owned），返回新的 QiStr 实例（共享同一 buffer）
+// ============================================================================
+// retain / release 核心 —— QiStr fat-pointer 路径与 rc_cstr 裸指针路径共用
+// ============================================================================
+
+/// 进程级一次性防御日志开关（magic 不符的裸指针 → 警告一次，之后静默泄漏）
+static NON_RC_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[cold]
+fn warn_non_rc_pointer_once() {
+    if !NON_RC_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("qi_string_free: 非 RC 指针,已忽略(后续同类情况将静默泄漏,不再重复警告)");
+    }
+}
+
+/// retain 核心：base 指向 data 起点（header 在 base-24）。
+/// magic 不符 → 一次性警告后 no-op；immortal → no-op；否则 refcount++。
+///
+/// # Safety
+/// base 非 null，且 base-24 起 24 字节可读（RC buffer 天然满足；
+/// 非 RC 的 malloc 指针依赖分配器 header 区域可读 —— 这是 magic 防御的前提）。
+#[inline]
+unsafe fn retain_base(base: *const u8) {
+    let header = header_of(base);
+    if (*header).magic != QI_STR_MAGIC {
+        warn_non_rc_pointer_once();
+        return;
+    }
+    if (*header).refcount.load(Ordering::Relaxed) >= IMMORTAL_RC {
+        return;
+    }
+    (*header).refcount.fetch_add(1, Ordering::Relaxed);
+}
+
+/// release 核心：magic 不符 → 一次性警告后直接返回（宁泄漏不崩溃，铁律）；
+/// immortal → no-op；否则 refcount--，前值 == 1 时按 capacity 释放整个 buffer。
+///
+/// # Safety
+/// 同 [`retain_base`]。
+#[inline]
+unsafe fn release_base(base: *const u8) {
+    let header = header_of_mut(base);
+    if (*header).magic != QI_STR_MAGIC {
+        warn_non_rc_pointer_once();
+        return;
+    }
+    if (*header).refcount.load(Ordering::Relaxed) >= IMMORTAL_RC {
+        return;
+    }
+    let prev = (*header).refcount.fetch_sub(1, Ordering::AcqRel);
+    if prev == 1 {
+        // 最后一个引用，释放
+        let cap = (*header).capacity as usize;
+        let layout = buffer_layout(cap);
+        dealloc(header as *mut u8, layout);
+    }
+}
+
+/// 借引用：refcount++（如果 owned 且非 immortal），返回新的 QiStr 实例（共享同一 buffer）
 pub fn clone(s: QiStr) -> QiStr {
     if !s.base.is_null() {
         unsafe {
-            (*header_of(s.base))
-                .refcount
-                .fetch_add(1, Ordering::Relaxed);
+            retain_base(s.base);
         }
     }
     QiStr {
@@ -114,21 +190,84 @@ pub fn clone(s: QiStr) -> QiStr {
     }
 }
 
-/// 释放：refcount--（如果 owned），归零时 free buffer。literal/borrow 时 no-op
+/// 释放：refcount--（如果 owned 且非 immortal），归零时 free buffer。
+/// literal/borrow（base=null）与 immortal 时 no-op
 pub fn drop_str(s: QiStr) {
     if s.base.is_null() {
         return;
     }
     unsafe {
-        let header = header_of_mut(s.base);
-        let prev = (*header).refcount.fetch_sub(1, Ordering::Release);
-        if prev == 1 {
-            // 最后一个引用，释放
-            std::sync::atomic::fence(Ordering::Acquire);
-            let cap = (*header).capacity as usize;
-            let layout = buffer_layout(cap);
-            dealloc(header as *mut u8, layout);
-        }
+        release_base(s.base);
+    }
+}
+
+// ============================================================================
+// rc_cstr —— 隐藏 header 引用计数 C 字符串（`i8*` ABI 不变，ptr-24 藏 header）
+// ============================================================================
+
+/// 静态 immortal 空串 buffer —— rc_cstr_from_bytes(b"") 的返回目标。
+/// 布局与 BufHeader + data 完全一致（repr(C)，8 字节对齐），data 在偏移 24。
+#[repr(C)]
+struct StaticEmptyBuf {
+    magic: u64,
+    refcount: AtomicI64,
+    capacity: i64,
+    data: [u8; 1],
+}
+
+static RC_CSTR_EMPTY: StaticEmptyBuf = StaticEmptyBuf {
+    magic: QI_STR_MAGIC,
+    refcount: AtomicI64::new(IMMORTAL_RC),
+    capacity: 0,
+    data: [0u8],
+};
+
+/// 从字节切片分配一个 RC C 字符串，返回 data 指针（`*mut c_char` ABI）。
+///
+/// - 空输入 → 返回静态 immortal 空 buffer 的 data 指针（retain/release 皆 no-op）
+/// - 数据含内部 NUL 时照存（C 侧 strlen 语义自然截断，不 panic）
+/// - 返回的指针满足：ptr-24 处有合法 header，尾部带 NUL，可安全传给
+///   `qi_string_retain` / `qi_string_free` 系列
+pub fn rc_cstr_from_bytes(data: &[u8]) -> *mut c_char {
+    if data.is_empty() {
+        // 不走 alloc_owned 的 EMPTY 短路（那个 base=null 无 header）
+        return RC_CSTR_EMPTY.data.as_ptr() as *mut c_char;
+    }
+    alloc_owned(data).ptr as *mut c_char
+}
+
+/// 便利函数：从 &str 分配 RC C 字符串
+#[inline]
+pub fn rc_cstr_from_str(s: &str) -> *mut c_char {
+    rc_cstr_from_bytes(s.as_bytes())
+}
+
+/// 便利函数：从 String 分配 RC C 字符串（拷贝后丢弃原 String）
+#[inline]
+pub fn rc_cstr_from_string(s: String) -> *mut c_char {
+    rc_cstr_from_bytes(s.as_bytes())
+}
+
+/// 增引用（C ABI）：null / magic 不符 / immortal 皆 no-op
+#[no_mangle]
+pub extern "C" fn qi_string_retain(s: *const c_char) {
+    if s.is_null() {
+        return;
+    }
+    unsafe {
+        retain_base(s as *const u8);
+    }
+}
+
+/// 减引用：null → 返回；magic 不符 → 一次性防御日志后返回（宁泄漏不崩溃）；
+/// immortal → 返回；否则 refcount--，归零时释放整个 buffer（含 header）。
+/// 各模块的 `qi_*_free_string` 全部委托到这里。
+pub fn rc_cstr_release(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    unsafe {
+        release_base(s as *const u8);
     }
 }
 
@@ -248,6 +387,141 @@ mod tests {
         assert_eq!(EMPTY.len, 0);
         assert!(EMPTY.base.is_null());
         assert_eq!(unsafe { as_str_unchecked(&EMPTY) }, "");
+    }
+
+    #[test]
+    fn header_layout_is_24_bytes() {
+        assert_eq!(HEADER_SIZE, 24);
+        // 静态空 buffer 的 data 必须正好在偏移 HEADER_SIZE 处（与 alloc 布局一致）
+        let base = &RC_CSTR_EMPTY as *const StaticEmptyBuf as usize;
+        let data = RC_CSTR_EMPTY.data.as_ptr() as usize;
+        assert_eq!(data - base, HEADER_SIZE);
+        // 8 字节对齐
+        assert_eq!(base % 8, 0);
+    }
+
+    #[test]
+    fn alloc_owned_writes_magic() {
+        let s = from_str("magic-check");
+        unsafe {
+            let h = header_of(s.base);
+            assert_eq!((*h).magic, QI_STR_MAGIC);
+            assert_eq!((*h).capacity, 11);
+            assert_eq!((*h).refcount.load(Ordering::Relaxed), 1);
+        }
+        drop_str(s);
+    }
+
+    #[test]
+    fn rc_cstr_retain_release_roundtrip() {
+        let p = rc_cstr_from_bytes(b"hello rc");
+        assert!(!p.is_null());
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(p).to_str().unwrap(),
+                "hello rc"
+            );
+            let h = header_of(p as *const u8);
+            assert_eq!((*h).refcount.load(Ordering::Relaxed), 1);
+        }
+        qi_string_retain(p);
+        unsafe {
+            let h = header_of(p as *const u8);
+            assert_eq!((*h).refcount.load(Ordering::Relaxed), 2);
+        }
+        rc_cstr_release(p); // 2 → 1
+        unsafe {
+            assert_eq!(std::ffi::CStr::from_ptr(p).to_bytes(), b"hello rc");
+        }
+        rc_cstr_release(p); // 1 → 0，释放，不崩
+    }
+
+    #[test]
+    fn rc_cstr_empty_is_immortal() {
+        let p1 = rc_cstr_from_bytes(b"");
+        let p2 = rc_cstr_from_bytes(b"");
+        assert_eq!(p1, p2, "空串应返回同一个静态 buffer");
+        unsafe {
+            assert_eq!(*p1, 0, "空串 data 是单个 NUL");
+        }
+        // 任意次 retain/release 皆 no-op，refcount 不变
+        qi_string_retain(p1);
+        rc_cstr_release(p1);
+        rc_cstr_release(p1);
+        rc_cstr_release(p1);
+        assert_eq!(
+            RC_CSTR_EMPTY.refcount.load(Ordering::Relaxed),
+            IMMORTAL_RC
+        );
+        unsafe {
+            assert_eq!(*p1, 0, "释放后仍可读（immortal 永不释放）");
+        }
+    }
+
+    #[test]
+    fn rc_cstr_release_foreign_pointer_no_crash() {
+        // 用 CString::into_raw 造一个非 RC 指针 —— release/retain 只警告不崩不释放
+        let raw = std::ffi::CString::new("foreign").unwrap().into_raw();
+        qi_string_retain(raw);
+        rc_cstr_release(raw);
+        rc_cstr_release(raw);
+        unsafe {
+            // 指针未被释放、内容未被改动
+            assert_eq!(std::ffi::CStr::from_ptr(raw).to_bytes(), b"foreign");
+            // 归还给 CString 正常释放，避免测试泄漏
+            let _ = std::ffi::CString::from_raw(raw);
+        }
+    }
+
+    #[test]
+    fn rc_cstr_interior_nul_allocates_full_bytes() {
+        let p = rc_cstr_from_bytes(b"ab\0cd");
+        unsafe {
+            // C 侧 strlen 语义：在内部 NUL 处截断
+            assert_eq!(std::ffi::CStr::from_ptr(p).to_bytes(), b"ab");
+            // 但 buffer 完整存了 5 字节（capacity 是真实字节数）
+            let h = header_of(p as *const u8);
+            assert_eq!((*h).capacity, 5);
+            let full = std::slice::from_raw_parts(p as *const u8, 5);
+            assert_eq!(full, b"ab\0cd");
+            // 尾部 NUL 仍在
+            assert_eq!(*(p as *const u8).add(5), 0);
+        }
+        rc_cstr_release(p);
+    }
+
+    #[test]
+    fn immortal_refcount_never_changes() {
+        // 手工把一个 owned buffer 置成 immortal，clone/drop 皆 no-op
+        let s = from_str("immortal-test");
+        unsafe {
+            (*header_of_mut(s.base))
+                .refcount
+                .store(IMMORTAL_RC, Ordering::Relaxed);
+        }
+        let s2 = clone(s);
+        drop_str(s);
+        drop_str(s2);
+        drop_str(s2);
+        unsafe {
+            let h = header_of(s.base);
+            assert_eq!((*h).refcount.load(Ordering::Relaxed), IMMORTAL_RC);
+            // buffer 未被释放，数据仍可读
+            assert_eq!(as_str_unchecked(&s), "immortal-test");
+        }
+        // 故意泄漏（immortal 语义如此）
+    }
+
+    #[test]
+    fn rc_cstr_from_str_and_string() {
+        let p1 = rc_cstr_from_str("你好");
+        let p2 = rc_cstr_from_string(String::from("世界"));
+        unsafe {
+            assert_eq!(std::ffi::CStr::from_ptr(p1).to_str().unwrap(), "你好");
+            assert_eq!(std::ffi::CStr::from_ptr(p2).to_str().unwrap(), "世界");
+        }
+        rc_cstr_release(p1);
+        rc_cstr_release(p2);
     }
 
     #[test]

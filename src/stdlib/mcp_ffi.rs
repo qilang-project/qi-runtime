@@ -376,10 +376,7 @@ pub extern "C" fn qi_mcp_get_server_info(server_id: i64) -> *mut c_char {
     if let Some(服务器) = 服务器池.get(&server_id) {
         let 信息 = 服务器.获取服务器信息();
         let json_str = 信息.to_string();
-        match CString::new(json_str) {
-            Ok(c_str) => c_str.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_string(json_str)
     } else {
         std::ptr::null_mut()
     }
@@ -397,10 +394,7 @@ pub extern "C" fn qi_mcp_list_tools(server_id: i64) -> *mut c_char {
     if let Some(服务器) = 服务器池.get(&server_id) {
         let 工具列表 = 服务器.获取工具列表();
         let json_str = json!(工具列表).to_string();
-        match CString::new(json_str) {
-            Ok(c_str) => c_str.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_string(json_str)
     } else {
         std::ptr::null_mut()
     }
@@ -418,10 +412,7 @@ pub extern "C" fn qi_mcp_list_resources(server_id: i64) -> *mut c_char {
     if let Some(服务器) = 服务器池.get(&server_id) {
         let 资源列表 = 服务器.获取资源列表();
         let json_str = json!(资源列表).to_string();
-        match CString::new(json_str) {
-            Ok(c_str) => c_str.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_string(json_str)
     } else {
         std::ptr::null_mut()
     }
@@ -439,10 +430,7 @@ pub extern "C" fn qi_mcp_list_prompts(server_id: i64) -> *mut c_char {
     if let Some(服务器) = 服务器池.get(&server_id) {
         let 提示列表 = 服务器.获取提示列表();
         let json_str = json!(提示列表).to_string();
-        match CString::new(json_str) {
-            Ok(c_str) => c_str.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_string(json_str)
     } else {
         std::ptr::null_mut()
     }
@@ -481,10 +469,7 @@ pub extern "C" fn qi_mcp_call_tool(
             match 服务器.执行工具(&工具名, &参数) {
                 Ok(结果) => {
                     let 结果字符串 = 结果.to_string();
-                    match CString::new(结果字符串) {
-                        Ok(c_str) => c_str.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    }
+                    crate::stdlib::qi_str::rc_cstr_from_string(结果字符串)
                 }
                 Err(_) => std::ptr::null_mut(),
             }
@@ -526,10 +511,7 @@ pub extern "C" fn qi_mcp_get_prompt(
         if let Some(服务器) = 服务器池.get(&server_id) {
             match 服务器.获取提示(&提示名) {
                 Ok(提示) => match 提示.填充(&参数) {
-                    Ok(结果文本) => match CString::new(结果文本) {
-                        Ok(c_str) => c_str.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    },
+                    Ok(结果文本) => crate::stdlib::qi_str::rc_cstr_from_string(结果文本),
                     Err(_) => std::ptr::null_mut(),
                 },
                 Err(_) => std::ptr::null_mut(),
@@ -673,9 +655,7 @@ pub extern "C" fn qi_mcp_read_resource_text(
         let 服务器池 = 获取服务器池().lock().unwrap();
         if let Some(服务器) = 服务器池.get(&server_id) {
             match 服务器.读取资源文本(&uri) {
-                Ok(text) => CString::new(text)
-                    .unwrap_or_else(|_| CString::new("").unwrap())
-                    .into_raw(),
+                Ok(text) => crate::stdlib::qi_str::rc_cstr_from_str(text),
                 Err(_) => std::ptr::null_mut(),
             }
         } else {
@@ -709,9 +689,7 @@ pub extern "C" fn qi_mcp_read_resource_json(
             match 服务器.读取资源JSON(&uri) {
                 Ok(json) => {
                     let json_str = json.to_string();
-                    CString::new(json_str)
-                        .unwrap_or_else(|_| CString::new("{}").unwrap())
-                        .into_raw()
+                    crate::stdlib::qi_str::rc_cstr_from_string(json_str)
                 }
                 Err(_) => std::ptr::null_mut(),
             }
@@ -1667,13 +1645,13 @@ fn invoke_tool(server_id: i64, tool_name: &str, arguments: &JsonValue) -> Result
 ///
 /// 参数:
 /// - s: 由 MCP FFI 函数返回的字符串指针
+///
+/// 委托 rc_cstr_release：非 RC 指针（如 Qi 侧回调返回的、由 Qi
+/// GC/分配器管理的串 —— 见上方 tool 回调处 "Do NOT free" 注释）
+/// 一次性警告后静默泄漏，不崩溃、不重复释放。
 #[no_mangle]
 pub extern "C" fn qi_mcp_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

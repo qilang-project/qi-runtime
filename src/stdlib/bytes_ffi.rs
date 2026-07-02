@@ -6,7 +6,7 @@
 #![allow(non_snake_case)]
 
 use dashmap::DashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
@@ -101,9 +101,7 @@ pub extern "C" fn qi_bytes_to_string(handle: i64) -> *mut c_char {
         }
         None => String::new(),
     };
-    CString::new(s)
-        .unwrap_or_else(|_| CString::new("").unwrap())
-        .into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(s)
 }
 
 /// 字节长度
@@ -258,9 +256,7 @@ pub extern "C" fn qi_bytes_to_hex(handle: i64) -> *mut c_char {
         Some(v) => v.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
         None => String::new(),
     };
-    CString::new(hex)
-        .unwrap_or_else(|_| CString::new("").unwrap())
-        .into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(hex)
 }
 
 /// 从十六进制字符串构造字节切片；非法字符返回 -1
@@ -300,9 +296,7 @@ pub extern "C" fn qi_bytes_to_base64(handle: i64) -> *mut c_char {
         None => Vec::new(),
     };
     let s = encode_base64(&bytes);
-    CString::new(s)
-        .unwrap_or_else(|_| CString::new("").unwrap())
-        .into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(s)
 }
 
 /// 从 Base64 解码；非法返回 -1
@@ -329,15 +323,10 @@ pub extern "C" fn qi_bytes_free(handle: i64) -> i64 {
     0
 }
 
-/// 释放由 to_string / to_hex / to_base64 返回的 C 字符串
+/// 释放由 to_string / to_hex / to_base64 返回的 C 字符串（header-aware rc_cstr）
 #[no_mangle]
 pub extern "C" fn qi_bytes_free_string(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 // ===== 内置 Base64 编解码 (RFC 4648) — 不引入新依赖 =====

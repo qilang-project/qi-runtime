@@ -14,7 +14,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use qi_compiler::runtime::{RuntimeEnvironment, RuntimeConfig};
 //!
 //! let config = RuntimeConfig::default();

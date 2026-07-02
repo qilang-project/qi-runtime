@@ -7,7 +7,7 @@
 use super::http::{NetworkInterface, TcpConnection, TcpConnectionConfig};
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
@@ -155,7 +155,7 @@ pub extern "C" fn qi_network_tcp_write(handle: i64, data: *const u8, data_size: 
 #[no_mangle]
 pub extern "C" fn qi_network_tcp_read_string(handle: i64, buffer_size: i64) -> *mut c_char {
     if buffer_size <= 0 {
-        return CString::new("").unwrap().into_raw();
+        return crate::stdlib::qi_str::rc_cstr_from_str("");
     }
 
     let mut 缓冲区 = vec![0u8; buffer_size as usize];
@@ -165,19 +165,15 @@ pub extern "C" fn qi_network_tcp_read_string(handle: i64, buffer_size: i64) -> *
         if let Ok(size) = 连接.read(&mut 缓冲区) {
             if size > 0 {
                 if let Ok(字符串) = String::from_utf8(缓冲区[..size].to_vec()) {
-                    if let Ok(c_str) = CString::new(字符串) {
-                        return c_str.into_raw();
-                    }
+                    return crate::stdlib::qi_str::rc_cstr_from_string(字符串);
                 }
                 let 字符串 = String::from_utf8_lossy(&缓冲区[..size]).to_string();
-                if let Ok(c_str) = CString::new(字符串) {
-                    return c_str.into_raw();
-                }
+                return crate::stdlib::qi_str::rc_cstr_from_string(字符串);
             }
         }
     }
 
-    CString::new("").unwrap().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_str("")
 }
 
 /// 向 TCP 连接写入字符串数据（高级版本）
@@ -274,7 +270,7 @@ pub extern "C" fn qi_network_resolve_host(host: *const c_char) -> *mut c_char {
             Ok(mut 地址列表) => {
                 if let Some(地址) = 地址列表.next() {
                     let ip字符串 = 地址.ip().to_string();
-                    CString::new(ip字符串).unwrap().into_raw()
+                    crate::stdlib::qi_str::rc_cstr_from_string(ip字符串)
                 } else {
                     std::ptr::null_mut()
                 }
@@ -308,24 +304,21 @@ pub extern "C" fn qi_network_get_local_ip() -> *mut c_char {
             Ok(_) => match socket.local_addr() {
                 Ok(addr) => {
                     let ip = addr.ip().to_string();
-                    CString::new(ip).unwrap().into_raw()
+                    crate::stdlib::qi_str::rc_cstr_from_string(ip)
                 }
-                Err(_) => CString::new("127.0.0.1").unwrap().into_raw(),
+                Err(_) => crate::stdlib::qi_str::rc_cstr_from_str("127.0.0.1"),
             },
-            Err(_) => CString::new("127.0.0.1").unwrap().into_raw(),
+            Err(_) => crate::stdlib::qi_str::rc_cstr_from_str("127.0.0.1"),
         },
-        Err(_) => CString::new("127.0.0.1").unwrap().into_raw(),
+        Err(_) => crate::stdlib::qi_str::rc_cstr_from_str("127.0.0.1"),
     }
 }
 
 /// 释放网络模块分配的字符串内存
+/// （委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_network_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 // ============================================================================
@@ -605,7 +598,7 @@ pub extern "C" fn qi_network_udp_recv_from(
                 if !sender_host.is_null() {
                     let ip字符串 = 地址.ip().to_string();
                     unsafe {
-                        *sender_host = CString::new(ip字符串).unwrap().into_raw();
+                        *sender_host = crate::stdlib::qi_str::rc_cstr_from_string(ip字符串);
                     }
                 }
                 if !sender_port.is_null() {
@@ -627,7 +620,7 @@ pub extern "C" fn qi_network_udp_recv_from(
 #[no_mangle]
 pub extern "C" fn qi_network_udp_recv_string(handle: i64, buffer_size: i64) -> *mut c_char {
     if buffer_size <= 0 {
-        return CString::new("").unwrap().into_raw();
+        return crate::stdlib::qi_str::rc_cstr_from_str("");
     }
 
     let mut 缓冲区 = vec![0u8; buffer_size as usize];
@@ -638,9 +631,7 @@ pub extern "C" fn qi_network_udp_recv_string(handle: i64, buffer_size: i64) -> *
             Ok((size, _sender_addr)) => {
                 if size > 0 {
                     if let Ok(字符串) = String::from_utf8(缓冲区[..size].to_vec()) {
-                        if let Ok(c_str) = CString::new(字符串) {
-                            return c_str.into_raw();
-                        }
+                        return crate::stdlib::qi_str::rc_cstr_from_string(字符串);
                     }
                 }
             }
@@ -648,7 +639,7 @@ pub extern "C" fn qi_network_udp_recv_string(handle: i64, buffer_size: i64) -> *
         }
     }
 
-    CString::new("").unwrap().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_str("")
 }
 
 /// 关闭 UDP Socket

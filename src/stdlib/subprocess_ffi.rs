@@ -3,8 +3,9 @@
 //! 长存的流式子进程：stdin/stdout 走管道，按行读写（MCP stdio = 换行分隔 JSON-RPC）。
 //! 后台读线程持续读 stdout 放入队列；读取行/读取行超时从队列弹出。
 
+use crate::stdlib::qi_str::{rc_cstr_from_str, rc_cstr_from_string};
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::io::{BufRead, BufReader, Write};
 use std::os::raw::c_char;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -127,7 +128,7 @@ pub extern "C" fn qi_subprocess_write_line(handle: i64, line: *const c_char) -> 
 /// 使用后台读线程队列：轮询直到有行或 EOF。
 #[no_mangle]
 pub extern "C" fn qi_subprocess_read_line(handle: i64) -> *mut c_char {
-    let empty = || CString::new("").unwrap().into_raw();
+    let empty = || rc_cstr_from_str("");
 
     // 取出 lines/eof Arc 引用（短暂持锁，不在 poll 期间持锁）
     let (lines, eof) = {
@@ -150,18 +151,14 @@ pub extern "C" fn qi_subprocess_read_line(handle: i64) -> *mut c_char {
                 Err(_) => return empty(),
             };
             if let Some(line) = q.pop_front() {
-                return CString::new(line)
-                    .unwrap_or_else(|_| CString::new("").unwrap())
-                    .into_raw();
+                return rc_cstr_from_string(line);
             }
         }
         if eof.load(Ordering::SeqCst) {
             // 再检查一次队列（EOF 设置时可能还有残余行）
             if let Ok(mut q) = lines.lock() {
                 if let Some(line) = q.pop_front() {
-                    return CString::new(line)
-                        .unwrap_or_else(|_| CString::new("").unwrap())
-                        .into_raw();
+                    return rc_cstr_from_string(line);
                 }
             }
             return empty();
@@ -173,7 +170,7 @@ pub extern "C" fn qi_subprocess_read_line(handle: i64) -> *mut c_char {
 /// 带超时读一行 stdout。timeout_ms 内有行则返回，否则返回 ""。EOF 也返回 ""。
 #[no_mangle]
 pub extern "C" fn qi_subprocess_read_line_timeout(handle: i64, timeout_ms: i64) -> *mut c_char {
-    let empty = || CString::new("").unwrap().into_raw();
+    let empty = || rc_cstr_from_str("");
 
     let (lines, eof) = {
         let cell = match get_child(handle) {
@@ -196,18 +193,14 @@ pub extern "C" fn qi_subprocess_read_line_timeout(handle: i64, timeout_ms: i64) 
                 Err(_) => return empty(),
             };
             if let Some(line) = q.pop_front() {
-                return CString::new(line)
-                    .unwrap_or_else(|_| CString::new("").unwrap())
-                    .into_raw();
+                return rc_cstr_from_string(line);
             }
         }
         if eof.load(Ordering::SeqCst) {
             // drain any last lines
             if let Ok(mut q) = lines.lock() {
                 if let Some(line) = q.pop_front() {
-                    return CString::new(line)
-                        .unwrap_or_else(|_| CString::new("").unwrap())
-                        .into_raw();
+                    return rc_cstr_from_string(line);
                 }
             }
             return empty();
@@ -253,19 +246,17 @@ pub extern "C" fn qi_subprocess_terminate(handle: i64) -> i32 {
     1
 }
 
-/// 释放 read_line 返回的字符串。
+/// 释放 read_line 返回的字符串（委托 rc_cstr_release：
+/// 非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_subprocess_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn test_spawn_write_read_roundtrip() {

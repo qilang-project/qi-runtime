@@ -383,8 +383,7 @@ pub extern "C" fn qi_runtime_get_metrics() -> *const c_char {
             if let Ok(runtime) = runtime_mutex.read() {
                 let snap = runtime.get_metrics().snapshot();
                 if let Ok(json) = serde_json::to_string(&snap) {
-                    let c_string = std::ffi::CString::new(json).unwrap();
-                    return c_string.into_raw();
+                    return crate::stdlib::qi_str::rc_cstr_from_string(json);
                 }
             }
         }
@@ -393,13 +392,10 @@ pub extern "C" fn qi_runtime_get_metrics() -> *const c_char {
 }
 
 /// Free a string allocated by the runtime
+/// （委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_runtime_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = std::ffi::CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 // ============================================================================
@@ -431,9 +427,7 @@ pub extern "C" fn qi_runtime_string_concat(s1: *const c_char, s2: *const c_char)
     unsafe {
         if let (Ok(str1), Ok(str2)) = (CStr::from_ptr(s1).to_str(), CStr::from_ptr(s2).to_str()) {
             let result = format!("{}{}", str1, str2);
-            if let Ok(c_string) = std::ffi::CString::new(result) {
-                return c_string.into_raw();
-            }
+            return crate::stdlib::qi_str::rc_cstr_from_string(result);
         }
         std::ptr::null_mut()
     }
@@ -454,9 +448,7 @@ pub extern "C" fn qi_runtime_string_slice(s: *const c_char, start: i64, end: i64
 
             if start_idx < end_idx && end_idx <= chars.len() {
                 let substring: String = chars[start_idx..end_idx].iter().collect();
-                if let Ok(c_string) = std::ffi::CString::new(substring) {
-                    return c_string.into_raw();
-                }
+                return crate::stdlib::qi_str::rc_cstr_from_string(substring);
             }
         }
         std::ptr::null_mut()
@@ -664,9 +656,7 @@ pub extern "C" fn qi_runtime_file_read_string(path: *const c_char) -> *mut c_cha
             // Use standard library to read file
             match std::fs::read_to_string(path_str) {
                 Ok(content) => {
-                    if let Ok(c_string) = std::ffi::CString::new(content) {
-                        return c_string.into_raw();
-                    }
+                    return crate::stdlib::qi_str::rc_cstr_from_string(content);
                 }
                 Err(e) => {
                     eprintln!("读取文件内容失败: {}", e);
@@ -724,16 +714,14 @@ pub extern "C" fn qi_runtime_http_get(url: *const c_char) -> *mut c_char {
             let mock_response =
                 r#"{"message": "Mock HTTP response from Qi runtime", "status": "success"}"#;
 
-            if let Ok(c_string) = std::ffi::CString::new(mock_response) {
-                // Update I/O operation count
-                if let Some(runtime_mutex) = RUNTIME.as_ref() {
-                    if let Ok(runtime) = runtime_mutex.read() {
-                        runtime.increment_io_operations();
-                    }
+            // Update I/O operation count
+            if let Some(runtime_mutex) = RUNTIME.as_ref() {
+                if let Ok(runtime) = runtime_mutex.read() {
+                    runtime.increment_io_operations();
                 }
-
-                return c_string.into_raw();
             }
+
+            return crate::stdlib::qi_str::rc_cstr_from_str(mock_response);
         } else {
             eprintln!("HTTP请求失败: 无效的UTF-8 URL字符串");
         }
@@ -759,16 +747,14 @@ pub extern "C" fn qi_runtime_http_post(url: *const c_char, data: *const c_char) 
                 data_str
             );
 
-            if let Ok(c_string) = std::ffi::CString::new(mock_response) {
-                // Update I/O operation count
-                if let Some(runtime_mutex) = RUNTIME.as_ref() {
-                    if let Ok(runtime) = runtime_mutex.read() {
-                        runtime.increment_io_operations();
-                    }
+            // Update I/O operation count
+            if let Some(runtime_mutex) = RUNTIME.as_ref() {
+                if let Ok(runtime) = runtime_mutex.read() {
+                    runtime.increment_io_operations();
                 }
-
-                return c_string.into_raw();
             }
+
+            return crate::stdlib::qi_str::rc_cstr_from_string(mock_response);
         } else {
             eprintln!("HTTP POST请求失败: 无效的UTF-8字符串");
         }
@@ -864,22 +850,14 @@ pub extern "C" fn qi_runtime_array_length(array: *const u8) -> i64 {
 #[no_mangle]
 pub extern "C" fn qi_runtime_int_to_string(value: i64) -> *mut c_char {
     let string = value.to_string();
-    if let Ok(c_string) = std::ffi::CString::new(string) {
-        c_string.into_raw()
-    } else {
-        std::ptr::null_mut()
-    }
+    crate::stdlib::qi_str::rc_cstr_from_string(string)
 }
 
 /// Convert float to string (caller must free the result)
 #[no_mangle]
 pub extern "C" fn qi_runtime_float_to_string(value: f64) -> *mut c_char {
     let string = value.to_string();
-    if let Ok(c_string) = std::ffi::CString::new(string) {
-        c_string.into_raw()
-    } else {
-        std::ptr::null_mut()
-    }
+    crate::stdlib::qi_str::rc_cstr_from_string(string)
 }
 
 /// Convert string to integer

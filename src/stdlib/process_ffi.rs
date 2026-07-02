@@ -2,7 +2,7 @@
 //!
 //! 提供进程执行和管理功能
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::process::Command;
 
@@ -39,10 +39,7 @@ pub extern "C" fn qi_process_execute(
                 });
 
                 match serde_json::to_string(&result) {
-                    Ok(json) => match CString::new(json) {
-                        Ok(c_str) => c_str.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    },
+                    Ok(json) => crate::stdlib::qi_str::rc_cstr_from_string(json),
                     Err(_) => std::ptr::null_mut(),
                 }
             }
@@ -54,10 +51,7 @@ pub extern "C" fn qi_process_execute(
                 });
 
                 match serde_json::to_string(&error) {
-                    Ok(json) => match CString::new(json) {
-                        Ok(c_str) => c_str.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    },
+                    Ok(json) => crate::stdlib::qi_str::rc_cstr_from_string(json),
                     Err(_) => std::ptr::null_mut(),
                 }
             }
@@ -77,14 +71,10 @@ pub extern "C" fn qi_process_exit(code: i32) {
     std::process::exit(code);
 }
 
-/// 释放字符串
+/// 释放字符串（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_process_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

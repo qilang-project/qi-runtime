@@ -4,7 +4,7 @@
 
 use super::http::{HttpClient, HttpMethod, HttpRequest};
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::os::raw::c_char;
 use std::sync::Mutex;
@@ -61,10 +61,7 @@ fn 执行HTTP请求(
 
 #[allow(non_snake_case)]
 fn 转为C字符串(文本: String) -> *mut c_char {
-    match CString::new(文本.replace('\0', "")) {
-        Ok(c) => c.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    crate::stdlib::qi_str::rc_cstr_from_string(文本)
 }
 
 /// HTTP GET 请求
@@ -154,10 +151,7 @@ pub extern "C" fn qi_http_head(url: *const c_char) -> *mut c_char {
             Ok(响应) => {
                 // HEAD 请求返回状态码和响应头信息
                 let 状态信息 = format!("Status: {}", 响应.status_code);
-                match CString::new(状态信息) {
-                    Ok(c_str) => c_str.into_raw(),
-                    Err(_) => std::ptr::null_mut(),
-                }
+                crate::stdlib::qi_str::rc_cstr_from_string(状态信息)
             }
             Err(_) => std::ptr::null_mut(),
         }
@@ -380,7 +374,7 @@ pub extern "C" fn qi_http_request_execute(handle: i64) -> *mut c_char {
         let 客户端 = 获取HTTP客户端().lock().unwrap();
         match 客户端.execute(请求) {
             Ok(响应) => match 响应.body_as_string() {
-                Ok(响应体) => CString::new(响应体).unwrap().into_raw(),
+                Ok(响应体) => crate::stdlib::qi_str::rc_cstr_from_string(响应体),
                 Err(_) => std::ptr::null_mut(),
             },
             Err(_) => std::ptr::null_mut(),
@@ -409,14 +403,10 @@ pub extern "C" fn qi_http_get_status(url: *const c_char) -> i64 {
     }
 }
 
-/// 释放 HTTP 响应字符串
+/// 释放 HTTP 响应字符串（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_http_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]
@@ -535,9 +525,7 @@ pub extern "C" fn qi_http_server_accept(server_handle: i64) -> *mut c_char {
                         if 大小 > 0 {
                             if let Ok(请求文本) = String::from_utf8(缓冲[..大小].to_vec()) {
                                 // 返回完整的HTTP请求文本
-                                if let Ok(c_str) = CString::new(请求文本) {
-                                    return c_str.into_raw();
-                                }
+                                return crate::stdlib::qi_str::rc_cstr_from_string(请求文本);
                             }
                         }
                     }
@@ -631,9 +619,7 @@ pub extern "C" fn qi_http_server_handle_request(
 
                 // 返回请求信息
                 if let Some(信息) = 请求信息 {
-                    if let Ok(c_str) = CString::new(信息) {
-                        return c_str.into_raw();
-                    }
+                    return crate::stdlib::qi_str::rc_cstr_from_string(信息);
                 }
             }
             Err(_) => {}

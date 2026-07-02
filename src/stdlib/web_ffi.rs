@@ -730,10 +730,8 @@ pub extern "C" fn qi_web_build_request_id(prefix_ptr: *const c_char, ms: i64) ->
     buf.extend_from_slice(prefix);
     buf.push(b'-');
     let _ = std::io::Write::write_fmt(&mut buf, format_args!("{}", ms));
-    match CString::new(buf) {
-        Ok(c) => c.into_raw(),
-        Err(_) => CString::new("qi").unwrap().into_raw(),
-    }
+    // prefix/ms 均不含内部 NUL；rc_cstr 分配（带隐藏 header，qi_string_free 可释放）
+    crate::stdlib::qi_str::rc_cstr_from_bytes(&buf)
 }
 
 fn fallback_500() -> *const c_char {
@@ -746,7 +744,7 @@ fn fallback_500() -> *const c_char {
         body.len(),
         body
     );
-    // intentional leak — returned as a static-like C string for the qi runtime
-    let cstr = CString::new(response).unwrap();
-    cstr.into_raw() as *const c_char
+    // rc_cstr 分配：qi 侧若走 qi_string_free 正常回收；不 free 也只是原有的
+    // "intentional leak" 语义（错误路径，非热路径）
+    crate::stdlib::qi_str::rc_cstr_from_string(response) as *const c_char
 }

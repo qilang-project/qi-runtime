@@ -14,7 +14,7 @@ use std::os::raw::c_char;
 /// 败，拼接结果也跟直觉一致。
 #[inline]
 fn empty_c_string() -> *mut c_char {
-    CString::new("").unwrap().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_str("")
 }
 
 /// Find the position of a substring in a string
@@ -100,20 +100,13 @@ pub extern "C" fn qi_string_substring(
         let length = length as usize;
 
         if start >= text.len() {
-            // Return empty string
-            return match CString::new("") {
-                Ok(s) => s.into_raw(),
-                Err(_) => empty_c_string(),
-            };
+            return empty_c_string();
         }
 
         let end = std::cmp::min(start + length, text.len());
         let substring = &text[start..end];
 
-        match CString::new(substring) {
-            Ok(s) => s.into_raw(),
-            Err(_) => empty_c_string(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_str(substring)
     }
 }
 
@@ -134,19 +127,12 @@ pub extern "C" fn qi_string_substring_from(text_ptr: *const c_char, start: i64) 
         let start = start as usize;
 
         if start >= text.len() {
-            // Return empty string
-            return match CString::new("") {
-                Ok(s) => s.into_raw(),
-                Err(_) => empty_c_string(),
-            };
+            return empty_c_string();
         }
 
         let substring = &text[start..];
 
-        match CString::new(substring) {
-            Ok(s) => s.into_raw(),
-            Err(_) => empty_c_string(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_str(substring)
     }
 }
 
@@ -210,10 +196,7 @@ pub extern "C" fn qi_string_replace(
 
         let result = text.replace(search, replace);
 
-        match CString::new(result) {
-            Ok(s) => s.into_raw(),
-            Err(_) => empty_c_string(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_string(result)
     }
 }
 
@@ -233,10 +216,7 @@ pub extern "C" fn qi_string_trim(text_ptr: *const c_char) -> *mut c_char {
 
         let trimmed = text.trim();
 
-        match CString::new(trimmed) {
-            Ok(s) => s.into_raw(),
-            Err(_) => empty_c_string(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_str(trimmed)
     }
 }
 
@@ -256,10 +236,7 @@ pub extern "C" fn qi_string_to_upper(text_ptr: *const c_char) -> *mut c_char {
 
         let upper = text.to_uppercase();
 
-        match CString::new(upper) {
-            Ok(s) => s.into_raw(),
-            Err(_) => empty_c_string(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_string(upper)
     }
 }
 
@@ -279,10 +256,7 @@ pub extern "C" fn qi_string_to_lower(text_ptr: *const c_char) -> *mut c_char {
 
         let lower = text.to_lowercase();
 
-        match CString::new(lower) {
-            Ok(s) => s.into_raw(),
-            Err(_) => empty_c_string(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_string(lower)
     }
 }
 

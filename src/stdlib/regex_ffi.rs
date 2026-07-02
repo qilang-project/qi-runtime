@@ -3,7 +3,7 @@
 //! 提供正则表达式匹配、查找、替换等功能
 
 use regex::Regex;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 
 /// 匹配正则表达式
@@ -44,15 +44,9 @@ pub extern "C" fn qi_regex_find(pattern: *const c_char, text: *const c_char) -> 
         match Regex::new(&pattern_str) {
             Ok(re) => {
                 if let Some(mat) = re.find(&text_str) {
-                    match CString::new(mat.as_str()) {
-                        Ok(c_str) => c_str.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    }
+                    crate::stdlib::qi_str::rc_cstr_from_str(mat.as_str())
                 } else {
-                    match CString::new("") {
-                        Ok(c_str) => c_str.into_raw(),
-                        Err(_) => std::ptr::null_mut(),
-                    }
+                    crate::stdlib::qi_str::rc_cstr_from_str("")
                 }
             }
             Err(_) => std::ptr::null_mut(),
@@ -79,10 +73,7 @@ pub extern "C" fn qi_regex_find_all(pattern: *const c_char, text: *const c_char)
                     .collect();
 
                 let json = serde_json::to_string(&matches).unwrap_or_else(|_| "[]".to_string());
-                match CString::new(json) {
-                    Ok(c_str) => c_str.into_raw(),
-                    Err(_) => std::ptr::null_mut(),
-                }
+                crate::stdlib::qi_str::rc_cstr_from_string(json)
             }
             Err(_) => std::ptr::null_mut(),
         }
@@ -110,10 +101,7 @@ pub extern "C" fn qi_regex_replace_all(
                 let result = re
                     .replace_all(&text_str, replacement_str.as_ref())
                     .to_string();
-                match CString::new(result) {
-                    Ok(c_str) => c_str.into_raw(),
-                    Err(_) => std::ptr::null_mut(),
-                }
+                crate::stdlib::qi_str::rc_cstr_from_string(result)
             }
             Err(_) => std::ptr::null_mut(),
         }
@@ -136,24 +124,17 @@ pub extern "C" fn qi_regex_split(pattern: *const c_char, text: *const c_char) ->
                 let parts: Vec<String> = re.split(&text_str).map(|s| s.to_string()).collect();
 
                 let json = serde_json::to_string(&parts).unwrap_or_else(|_| "[]".to_string());
-                match CString::new(json) {
-                    Ok(c_str) => c_str.into_raw(),
-                    Err(_) => std::ptr::null_mut(),
-                }
+                crate::stdlib::qi_str::rc_cstr_from_string(json)
             }
             Err(_) => std::ptr::null_mut(),
         }
     }
 }
 
-/// 释放字符串
+/// 释放字符串（header-aware：本模块返回的都是 rc_cstr）
 #[no_mangle]
 pub extern "C" fn qi_regex_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@
 
 #![allow(non_snake_case)]
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -172,12 +172,12 @@ pub extern "C" fn qi_future_value_bool(fut: *mut Future) -> i32 {
 #[no_mangle]
 pub extern "C" fn qi_future_value_string(fut: *mut Future) -> *mut c_char {
     if fut.is_null() {
-        return CString::new("").unwrap().into_raw();
+        return crate::stdlib::qi_str::rc_cstr_from_str("");
     }
     unsafe {
         match (*fut).value.lock().unwrap().clone() {
-            Some(FutureValue::String(s)) => CString::new(s).unwrap_or_default().into_raw(),
-            _ => CString::new("").unwrap().into_raw(),
+            Some(FutureValue::String(s)) => crate::stdlib::qi_str::rc_cstr_from_string(s),
+            _ => crate::stdlib::qi_str::rc_cstr_from_str(""),
         }
     }
 }
@@ -303,7 +303,7 @@ pub extern "C" fn qi_async_state_machine_metrics() -> *mut c_char {
         "{{\"frames_allocated\":{},\"frames_freed\":{},\"frames_live\":{},\"spawn_poll_calls\":{}}}",
         alloc, freed, live, spawn
     );
-    CString::new(s).unwrap_or_default().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(s)
 }
 
 // ============================================================================

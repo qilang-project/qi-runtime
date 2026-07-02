@@ -3,7 +3,6 @@
 //! 提供随机数生成功能
 
 use rand::Rng;
-use std::ffi::CString;
 use std::os::raw::c_char;
 use uuid::Uuid;
 
@@ -54,10 +53,7 @@ pub extern "C" fn qi_random_string(length: i64) -> *mut c_char {
         .map(|_| rng.sample(Alphanumeric) as char)
         .collect();
 
-    match CString::new(random_string) {
-        Ok(c_str) => c_str.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    crate::stdlib::qi_str::rc_cstr_from_string(random_string)
 }
 
 /// 生成 UUID
@@ -65,20 +61,13 @@ pub extern "C" fn qi_random_string(length: i64) -> *mut c_char {
 pub extern "C" fn qi_random_uuid() -> *mut c_char {
     let uuid = Uuid::new_v4().to_string();
 
-    match CString::new(uuid) {
-        Ok(c_str) => c_str.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    crate::stdlib::qi_str::rc_cstr_from_string(uuid)
 }
 
-/// 释放字符串
+/// 释放字符串（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_random_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

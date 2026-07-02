@@ -5,7 +5,7 @@
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::raw::c_char;
@@ -108,10 +108,7 @@ pub extern "C" fn qi_compress_gzip_string(data: *const c_char) -> *mut c_char {
                 use base64::{engine::general_purpose, Engine as _};
                 let encoded = general_purpose::STANDARD.encode(&compressed);
 
-                match CString::new(encoded) {
-                    Ok(c_str) => c_str.into_raw(),
-                    Err(_) => std::ptr::null_mut(),
-                }
+                crate::stdlib::qi_str::rc_cstr_from_string(encoded)
             }
             Err(_) => std::ptr::null_mut(),
         }
@@ -142,23 +139,16 @@ pub extern "C" fn qi_compress_gunzip_string(data: *const c_char) -> *mut c_char 
         }
 
         match String::from_utf8(buffer) {
-            Ok(s) => match CString::new(s) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            },
+            Ok(s) => crate::stdlib::qi_str::rc_cstr_from_string(s),
             Err(_) => std::ptr::null_mut(),
         }
     }
 }
 
-/// 释放字符串
+/// 释放字符串（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_compress_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 /// 二进制安全的 gzip 压缩：输入字节切片句柄 -> 输出新字节切片句柄。

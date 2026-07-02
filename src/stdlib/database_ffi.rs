@@ -4,7 +4,7 @@
 
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::Mutex;
 
@@ -107,10 +107,9 @@ pub extern "C" fn qi_db_query(conn_id: i64, sql: *const c_char) -> *mut c_char {
                             }
 
                             match serde_json::to_string(&results) {
-                                Ok(json) => match CString::new(json) {
-                                    Ok(c_str) => return c_str.into_raw(),
-                                    Err(_) => return std::ptr::null_mut(),
-                                },
+                                Ok(json) => {
+                                    return crate::stdlib::qi_str::rc_cstr_from_string(json)
+                                }
                                 Err(_) => return std::ptr::null_mut(),
                             }
                         }
@@ -178,14 +177,10 @@ pub extern "C" fn qi_db_rollback(conn_id: i64) -> i32 {
     }
 }
 
-/// 释放字符串
+/// 释放字符串（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_db_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

@@ -9,8 +9,8 @@
 #![allow(non_snake_case)]
 
 use super::qi_str::{
-    alloc_owned, as_bytes, as_str_unchecked, clone, drop_str, from_bytes_lossy, from_str, QiStr,
-    EMPTY,
+    alloc_owned, as_bytes, as_str_unchecked, clone, drop_str, from_bytes_lossy, from_str,
+    rc_cstr_from_bytes, QiStr, EMPTY,
 };
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -43,20 +43,14 @@ pub extern "C" fn qi_str_from_bytes(ptr: *const u8, len: i64) -> QiStr {
     }
 }
 
-/// 把 QiStr 转换成 C 字符串（new alloc + null-terminated；调用方 qi_string_free 释放）
+/// 把 QiStr 转换成 C 字符串（RC 分配 + null-terminated；调用方 qi_string_free 释放）
 /// 用于跟期望 *const c_char 的旧 FFI / printf 之类的 interop
+///
+/// 返回的指针带隐藏 RC header（ptr-24），可 qi_string_retain / qi_string_free。
+/// 内嵌 NUL 照存，C 侧 strlen 语义自然截断。
 #[no_mangle]
 pub extern "C" fn qi_str_to_cstring(s: QiStr) -> *mut c_char {
-    let bytes = as_bytes(&s);
-    // 按 lossy 路径：内嵌 NUL 字节替换为空格（C 字符串不能含 NUL）
-    let safe: Vec<u8> = bytes
-        .iter()
-        .map(|b| if *b == 0 { b' ' } else { *b })
-        .collect();
-    match CString::new(safe) {
-        Ok(c) => c.into_raw(),
-        Err(_) => CString::new("").unwrap().into_raw(),
-    }
+    rc_cstr_from_bytes(as_bytes(&s))
 }
 
 /// 增引用：refcount++（如果 owned），返回新 QiStr（共享同一 buffer）
@@ -471,9 +465,8 @@ mod tests {
         assert_eq!(unsafe { as_str_unchecked(&s2) }, "test");
         drop_str(s);
         drop_str(s2);
-        unsafe {
-            let _ = CString::from_raw(c);
-        }
+        // qi_str_to_cstring 现在返回 RC 指针，用 rc_cstr_release 释放
+        crate::stdlib::qi_str::rc_cstr_release(c);
     }
 
     #[test]

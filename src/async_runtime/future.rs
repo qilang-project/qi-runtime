@@ -363,9 +363,8 @@ pub extern "C" fn qi_future_await_string(future: *mut Future) -> *const c_char {
         let future_ref = &*future;
         match future_ref.await_value() {
             Ok(FutureValue::String(s)) => {
-                // Allocate C string that caller must free
-                let c_string = std::ffi::CString::new(s).unwrap_or_default();
-                c_string.into_raw()
+                // Allocate RC C string that caller must free (qi_string_free)
+                crate::stdlib::qi_str::rc_cstr_from_string(s)
             }
             _ => std::ptr::null(),
         }
@@ -392,13 +391,12 @@ pub extern "C" fn qi_future_await_ptr(future: *mut Future) -> *mut u8 {
 
 /// Free a C string returned by qi_future_await_string
 /// FFI: qi_string_free(str_ptr: *mut c_char)
+///
+/// 委托 rc_cstr_release：只释放带 RC header 的运行时分配串；
+/// 非 RC 指针（历史 CString::into_raw / 外部串）一次性警告后静默泄漏，不崩溃。
 #[no_mangle]
 pub extern "C" fn qi_string_free(str_ptr: *mut c_char) {
-    if !str_ptr.is_null() {
-        unsafe {
-            let _ = std::ffi::CString::from_raw(str_ptr);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(str_ptr);
 }
 
 /// Check if a future is completed

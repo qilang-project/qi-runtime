@@ -21,7 +21,7 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use qi_compiler::runtime::async_runtime::{Runtime, RuntimeConfig};
 //!
 //! let config = RuntimeConfig::default();

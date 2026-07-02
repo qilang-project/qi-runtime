@@ -10,7 +10,7 @@
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::raw::c_char;
@@ -260,10 +260,7 @@ pub extern "C" fn qi_tls_read_string(handle: i64, buffer_size: i64) -> *mut c_ch
     let slice = &buf[..n];
     // 转成有效 UTF-8 字符串（lossy 处理非法字节）
     let text = String::from_utf8_lossy(slice).into_owned();
-    match CString::new(text) {
-        Ok(c) => c.into_raw(),
-        Err(_) => CString::new("").unwrap().into_raw(),
-    }
+    crate::stdlib::qi_str::rc_cstr_from_string(text)
 }
 
 /// 向 TLS 连接写入 C 字符串
@@ -307,12 +304,8 @@ pub extern "C" fn qi_tls_server_close(server_handle: i64) -> i64 {
 }
 
 /// 释放由 qi_tls_read_string 返回的字符串
+/// （委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_tls_free_string(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }

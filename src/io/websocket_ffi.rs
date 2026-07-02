@@ -5,7 +5,7 @@
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::raw::c_char;
@@ -289,7 +289,7 @@ pub extern "C" fn qi_websocket_is_upgrade_request(request_headers: *const c_char
 #[no_mangle]
 pub extern "C" fn qi_websocket_get_client_key(request_headers: *const c_char) -> *mut c_char {
     if request_headers.is_null() {
-        return CString::new("").unwrap().into_raw();
+        return crate::stdlib::qi_str::rc_cstr_from_str("");
     }
 
     let headers = unsafe { CStr::from_ptr(request_headers).to_string_lossy() };
@@ -298,11 +298,11 @@ pub extern "C" fn qi_websocket_get_client_key(request_headers: *const c_char) ->
         let line_lower = line.to_lowercase();
         if line_lower.starts_with("sec-websocket-key:") {
             let key = line[18..].trim();
-            return CString::new(key).unwrap().into_raw();
+            return crate::stdlib::qi_str::rc_cstr_from_str(key);
         }
     }
 
-    CString::new("").unwrap().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_str("")
 }
 
 /// 服务器端: 生成 WebSocket 升级响应
@@ -310,7 +310,7 @@ pub extern "C" fn qi_websocket_get_client_key(request_headers: *const c_char) ->
 #[no_mangle]
 pub extern "C" fn qi_websocket_create_upgrade_response(client_key: *const c_char) -> *mut c_char {
     if client_key.is_null() {
-        return CString::new("").unwrap().into_raw();
+        return crate::stdlib::qi_str::rc_cstr_from_str("");
     }
 
     let key = unsafe { CStr::from_ptr(client_key).to_string_lossy() };
@@ -324,7 +324,7 @@ pub extern "C" fn qi_websocket_create_upgrade_response(client_key: *const c_char
         accept_key
     );
 
-    CString::new(response).unwrap().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(response)
 }
 
 /// 服务器端: 接受 WebSocket 连接
@@ -656,14 +656,14 @@ pub extern "C" fn qi_websocket_recv_text(handle: i64) -> *mut c_char {
 
                     if frame.opcode == WebSocketOpcode::Text {
                         if let Ok(text) = String::from_utf8(frame.payload) {
-                            return CString::new(text).unwrap().into_raw();
+                            return crate::stdlib::qi_str::rc_cstr_from_string(text);
                         }
                     }
 
                     // 收到关闭帧
                     if frame.opcode == WebSocketOpcode::Close {
                         conn.is_connected = false;
-                        return CString::new("").unwrap().into_raw();
+                        return crate::stdlib::qi_str::rc_cstr_from_str("");
                     }
                 }
                 Err(_) => {
@@ -675,7 +675,7 @@ pub extern "C" fn qi_websocket_recv_text(handle: i64) -> *mut c_char {
         }
     }
 
-    CString::new("").unwrap().into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_str("")
 }
 
 /// 发送 ping
@@ -712,14 +712,10 @@ pub extern "C" fn qi_websocket_close(handle: i64, code: u16, reason: *const c_ch
     }
 }
 
-/// 释放字符串内存
+/// 释放字符串内存（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_websocket_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 /// 检查连接是否仍然有效

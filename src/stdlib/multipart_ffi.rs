@@ -6,7 +6,7 @@
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::{Mutex, OnceLock};
 
@@ -173,9 +173,7 @@ pub extern "C" fn qi_multipart_extract_boundary(content_type: *const c_char) -> 
             break;
         }
     }
-    CString::new(found)
-        .unwrap_or_else(|_| CString::new("").unwrap())
-        .into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(found)
 }
 
 #[no_mangle]
@@ -200,9 +198,7 @@ fn part_field(handle: i64, idx: i64, f: impl Fn(&Part) -> String) -> *mut c_char
         }
         None => String::new(),
     };
-    CString::new(s)
-        .unwrap_or_else(|_| CString::new("").unwrap())
-        .into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(s)
 }
 
 #[no_mangle]

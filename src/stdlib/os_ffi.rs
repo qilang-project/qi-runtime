@@ -2,8 +2,9 @@
 //!
 //! 为 Qi 语言提供跨平台的操作系统功能
 
+use crate::stdlib::qi_str::{rc_cstr_from_str, rc_cstr_from_string};
 use std::env;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 
 /// 获取环境变量
@@ -22,16 +23,10 @@ pub extern "C" fn qi_os_getenv(name: *const c_char) -> *mut c_char {
         let name_str = CStr::from_ptr(name).to_string_lossy().to_string();
 
         match env::var(&name_str) {
-            Ok(value) => {
-                if let Ok(c_str) = CString::new(value) {
-                    c_str.into_raw()
-                } else {
-                    std::ptr::null_mut()
-                }
-            }
+            Ok(value) => rc_cstr_from_string(value),
             Err(_) => {
                 // 返回空字符串而不是 null
-                CString::new("").unwrap().into_raw()
+                rc_cstr_from_str("")
             }
         }
     }
@@ -84,14 +79,7 @@ pub extern "C" fn qi_os_unsetenv(name: *const c_char) -> i64 {
 #[no_mangle]
 pub extern "C" fn qi_os_getcwd() -> *mut c_char {
     match env::current_dir() {
-        Ok(path) => {
-            let path_str = path.to_string_lossy().to_string();
-            if let Ok(c_str) = CString::new(path_str) {
-                c_str.into_raw()
-            } else {
-                std::ptr::null_mut()
-            }
-        }
+        Ok(path) => rc_cstr_from_str(path.to_string_lossy().as_ref()),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -137,7 +125,7 @@ pub extern "C" fn qi_os_type() -> *mut c_char {
         "unknown"
     };
 
-    CString::new(os_type).unwrap().into_raw()
+    rc_cstr_from_str(os_type)
 }
 
 /// 获取操作系统架构
@@ -157,7 +145,7 @@ pub extern "C" fn qi_os_arch() -> *mut c_char {
         env::consts::ARCH
     };
 
-    CString::new(arch).unwrap().into_raw()
+    rc_cstr_from_str(arch)
 }
 
 /// 获取操作系统家族
@@ -166,7 +154,7 @@ pub extern "C" fn qi_os_arch() -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn qi_os_family() -> *mut c_char {
     let family = env::consts::FAMILY;
-    CString::new(family).unwrap().into_raw()
+    rc_cstr_from_str(family)
 }
 
 /// 获取主机名
@@ -193,14 +181,8 @@ pub extern "C" fn qi_os_hostname() -> *mut c_char {
     };
 
     match hostname {
-        Some(name) => {
-            if let Ok(c_str) = CString::new(name) {
-                c_str.into_raw()
-            } else {
-                CString::new("unknown").unwrap().into_raw()
-            }
-        }
-        None => CString::new("unknown").unwrap().into_raw(),
+        Some(name) => rc_cstr_from_string(name),
+        None => rc_cstr_from_str("unknown"),
     }
 }
 
@@ -213,7 +195,7 @@ pub extern "C" fn qi_os_username() -> *mut c_char {
         .or_else(|_| env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".to_string());
 
-    CString::new(username).unwrap().into_raw()
+    rc_cstr_from_string(username)
 }
 
 /// 获取用户主目录
@@ -225,7 +207,7 @@ pub extern "C" fn qi_os_homedir() -> *mut c_char {
         .or_else(|_| env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
 
-    CString::new(home).unwrap().into_raw()
+    rc_cstr_from_string(home)
 }
 
 /// 获取临时目录
@@ -236,7 +218,7 @@ pub extern "C" fn qi_os_tempdir() -> *mut c_char {
     let temp = env::temp_dir();
     let temp_str = temp.to_string_lossy().to_string();
 
-    CString::new(temp_str).unwrap().into_raw()
+    rc_cstr_from_string(temp_str)
 }
 
 /// 获取CPU核心数
@@ -275,7 +257,7 @@ pub extern "C" fn qi_os_environ() -> *mut c_char {
         result.push_str(&format!("{}={}\n", key, value));
     }
 
-    CString::new(result).unwrap().into_raw()
+    rc_cstr_from_string(result)
 }
 
 /// 从 .env 文件加载环境变量
@@ -344,20 +326,20 @@ pub extern "C" fn qi_os_load_env(path: *const c_char) -> i64 {
 #[no_mangle]
 pub extern "C" fn qi_os_list_dir(path: *const c_char) -> *mut c_char {
     if path.is_null() {
-        return CString::new("").unwrap().into_raw();
+        return rc_cstr_from_str("");
     }
 
     unsafe {
         let path_str = match CStr::from_ptr(path).to_str() {
             Ok(s) => s,
-            Err(_) => return CString::new("").unwrap().into_raw(),
+            Err(_) => return rc_cstr_from_str(""),
         };
 
         let dir_path = std::path::Path::new(path_str);
 
         let entries = match std::fs::read_dir(dir_path) {
             Ok(entries) => entries,
-            Err(_) => return CString::new("").unwrap().into_raw(),
+            Err(_) => return rc_cstr_from_str(""),
         };
 
         let mut result = String::new();
@@ -370,7 +352,7 @@ pub extern "C" fn qi_os_list_dir(path: *const c_char) -> *mut c_char {
             }
         }
 
-        CString::new(result).unwrap().into_raw()
+        rc_cstr_from_string(result)
     }
 }
 
@@ -434,11 +416,8 @@ pub extern "C" fn qi_os_is_file(path: *const c_char) -> i64 {
 /// - s: 字符串指针
 #[no_mangle]
 pub extern "C" fn qi_os_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    // 委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

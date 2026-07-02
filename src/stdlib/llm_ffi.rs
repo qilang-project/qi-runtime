@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::io::Read;
 use std::os::raw::c_char;
 use std::sync::{Mutex, OnceLock};
@@ -416,9 +416,11 @@ impl LLM流 {
 }
 
 fn 转为C字符串指针(文本: String) -> *mut c_char {
-    match CString::new(文本.replace('\0', "")) {
-        Ok(c_str) => c_str.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+    // 去掉内部 NUL（与旧 CString 语义一致，避免 C 侧 strlen 截断歧义）
+    if 文本.contains('\0') {
+        crate::stdlib::qi_str::rc_cstr_from_string(文本.replace('\0', ""))
+    } else {
+        crate::stdlib::qi_str::rc_cstr_from_string(文本)
     }
 }
 
@@ -1104,11 +1106,8 @@ pub extern "C" fn qi_llm_close_session(session_handle: i64) -> i64 {
 /// - s: 字符串指针
 #[no_mangle]
 pub extern "C" fn qi_llm_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    // 委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 // ============================================================================

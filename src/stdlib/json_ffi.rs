@@ -5,7 +5,7 @@
 
 use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -246,7 +246,7 @@ pub extern "C" fn qi_json_get_string(obj_id: i64, key: *const c_char) -> *mut c_
     if let Some(ref map) = *storage {
         if let Some(Value::Object(ref obj)) = map.get(&(obj_id as u64)) {
             if let Some(Value::String(ref s)) = obj.get(key_str) {
-                return CString::new(s.as_str()).unwrap().into_raw();
+                return crate::stdlib::qi_str::rc_cstr_from_str(s);
             }
         }
     }
@@ -540,7 +540,7 @@ pub extern "C" fn qi_json_array_get_string(array_id: i64, index: i64) -> *mut c_
     if let Some(ref map) = *storage {
         if let Some(Value::Array(ref array)) = map.get(&(array_id as u64)) {
             if let Some(Value::String(ref s)) = array.get(index as usize) {
-                return CString::new(s.as_str()).unwrap().into_raw();
+                return crate::stdlib::qi_str::rc_cstr_from_str(s);
             }
         }
     }
@@ -696,7 +696,7 @@ pub extern "C" fn qi_json_to_string(json_id: i64) -> *mut c_char {
     if let Some(ref map) = *storage {
         if let Some(value) = map.get(&(json_id as u64)) {
             if let Ok(json_str) = serde_json::to_string(value) {
-                return CString::new(json_str).unwrap().into_raw();
+                return crate::stdlib::qi_str::rc_cstr_from_string(json_str);
             }
         }
     }
@@ -714,7 +714,7 @@ pub extern "C" fn qi_json_to_string_pretty(json_id: i64) -> *mut c_char {
     if let Some(ref map) = *storage {
         if let Some(value) = map.get(&(json_id as u64)) {
             if let Ok(json_str) = serde_json::to_string_pretty(value) {
-                return CString::new(json_str).unwrap().into_raw();
+                return crate::stdlib::qi_str::rc_cstr_from_string(json_str);
             }
         }
     }
@@ -759,7 +759,7 @@ pub extern "C" fn qi_json_encode(json_str: *const c_char) -> *mut c_char {
 
     unsafe {
         match CStr::from_ptr(json_str).to_str() {
-            Ok(s) => CString::new(s).unwrap().into_raw(),
+            Ok(s) => crate::stdlib::qi_str::rc_cstr_from_str(s),
             Err(_) => std::ptr::null_mut(),
         }
     }
@@ -795,9 +795,7 @@ pub extern "C" fn qi_json_from_pairs(pairs: *const c_char) -> *mut c_char {
             对象.insert("结果".to_string(), Value::String(文本));
         }
 
-        CString::new(Value::Object(对象).to_string())
-            .unwrap()
-            .into_raw()
+        crate::stdlib::qi_str::rc_cstr_from_string(Value::Object(对象).to_string())
     }
 }
 
@@ -812,9 +810,7 @@ pub extern "C" fn qi_json_from_text(text: *const c_char) -> *mut c_char {
         let 文本 = CStr::from_ptr(text).to_string_lossy().to_string();
         let mut 对象 = Map::new();
         对象.insert("结果".to_string(), Value::String(文本));
-        CString::new(Value::Object(对象).to_string())
-            .unwrap()
-            .into_raw()
+        crate::stdlib::qi_str::rc_cstr_from_string(Value::Object(对象).to_string())
     }
 }
 
@@ -837,6 +833,7 @@ pub extern "C" fn qi_json_free(json_id: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn test_json_object_creation() {

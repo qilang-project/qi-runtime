@@ -14,7 +14,7 @@
 #![allow(non_snake_case)]
 
 use std::cell::RefCell;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 
 // jmp_buf 在 macOS arm64 上是 192 字节；预留 256 给所有平台对齐
@@ -102,9 +102,7 @@ pub extern "C-unwind" fn qi_exc_throw(msg: *const c_char) -> ! {
 #[no_mangle]
 pub extern "C" fn qi_exc_message() -> *mut c_char {
     let msg = LAST_ERROR.with(|e| e.borrow().clone());
-    CString::new(msg)
-        .unwrap_or_else(|_| CString::new("").unwrap())
-        .into_raw()
+    crate::stdlib::qi_str::rc_cstr_from_string(msg)
 }
 
 /// 清空当前线程的异常消息（catch 处理完 后调用，避免污染下次）
@@ -113,13 +111,9 @@ pub extern "C" fn qi_exc_clear() {
     LAST_ERROR.with(|e| e.borrow_mut().clear());
 }
 
-/// 释放 qi_exc_message 返回的字符串
+/// 释放 qi_exc_message 返回的字符串（委托 rc_cstr_release：
+/// 非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_exc_free_message(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }

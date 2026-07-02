@@ -2,8 +2,9 @@
 //!
 //! 提供环境变量操作功能
 
+use crate::stdlib::qi_str::{rc_cstr_from_str, rc_cstr_from_string};
 use std::env;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 
 /// 获取环境变量
@@ -17,14 +18,8 @@ pub extern "C" fn qi_env_get(key: *const c_char) -> *mut c_char {
         let key_str = CStr::from_ptr(key).to_string_lossy();
 
         match env::var(key_str.as_ref()) {
-            Ok(value) => match CString::new(value) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            },
-            Err(_) => match CString::new("") {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            },
+            Ok(value) => rc_cstr_from_string(value),
+            Err(_) => rc_cstr_from_str(""),
         }
     }
 }
@@ -63,10 +58,7 @@ pub extern "C" fn qi_env_remove(key: *const c_char) -> i32 {
 #[no_mangle]
 pub extern "C" fn qi_env_current_dir() -> *mut c_char {
     match env::current_dir() {
-        Ok(path) => match CString::new(path.to_string_lossy().as_ref()) {
-            Ok(c_str) => c_str.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        },
+        Ok(path) => rc_cstr_from_str(path.to_string_lossy().as_ref()),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -92,10 +84,7 @@ pub extern "C" fn qi_env_set_current_dir(path: *const c_char) -> i32 {
 #[no_mangle]
 pub extern "C" fn qi_env_home_dir() -> *mut c_char {
     if let Some(home) = dirs::home_dir() {
-        match CString::new(home.to_string_lossy().as_ref()) {
-            Ok(c_str) => c_str.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        rc_cstr_from_str(home.to_string_lossy().as_ref())
     } else {
         std::ptr::null_mut()
     }
@@ -109,22 +98,15 @@ pub extern "C" fn qi_env_all() -> *mut c_char {
     let vars: HashMap<String, String> = env::vars().collect();
 
     match serde_json::to_string(&vars) {
-        Ok(json) => match CString::new(json) {
-            Ok(c_str) => c_str.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        },
+        Ok(json) => rc_cstr_from_string(json),
         Err(_) => std::ptr::null_mut(),
     }
 }
 
-/// 释放字符串
+/// 释放字符串（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_env_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

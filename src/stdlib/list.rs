@@ -4,7 +4,7 @@
 //! Provides dynamic array (list) functionality for integers, floats, and strings
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -351,9 +351,7 @@ pub extern "C" fn qi_list_string_get(list_id: i64, index: i64) -> *mut c_char {
     if let Some(ref map) = *lists {
         if let Some(ListValue::String(ref list)) = map.get(&(list_id as u64)) {
             if (index as usize) < list.len() {
-                return CString::new(list[index as usize].clone())
-                    .unwrap()
-                    .into_raw();
+                return crate::stdlib::qi_str::rc_cstr_from_str(&list[index as usize]);
             }
         }
     }
@@ -483,15 +481,10 @@ pub extern "C" fn qi_list_free(list_id: i64) -> i64 {
     0
 }
 
-/// 释放字符串
+/// 释放字符串（header-aware：qi_list_string_get 返回的是 rc_cstr）
 #[no_mangle]
 pub extern "C" fn qi_list_free_string(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

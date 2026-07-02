@@ -4,7 +4,7 @@
 
 use super::file::{文件操作, 文件模块};
 use crate::stdlib::StdlibValue;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
@@ -28,7 +28,7 @@ pub extern "C" fn qi_io_init() {
 /// `字符串::字节长度(...) == 0` 检测失败。
 #[no_mangle]
 pub extern "C" fn qi_io_read_file(path: *const c_char) -> *mut c_char {
-    let empty = || CString::new("").unwrap().into_raw();
+    let empty = || crate::stdlib::qi_str::rc_cstr_from_str("");
     if path.is_null() {
         return empty();
     }
@@ -39,9 +39,7 @@ pub extern "C" fn qi_io_read_file(path: *const c_char) -> *mut c_char {
 
         let 模块 = 获取文件模块();
         match 模块.执行操作(文件操作::读取, &参数) {
-            Ok(StdlibValue::String(内容)) => CString::new(内容)
-                .unwrap_or_else(|_| CString::new("").unwrap())
-                .into_raw(),
+            Ok(StdlibValue::String(内容)) => crate::stdlib::qi_str::rc_cstr_from_string(内容),
             _ => empty(),
         }
     }
@@ -233,14 +231,10 @@ pub extern "C" fn qi_io_delete_dir(path: *const c_char) -> i64 {
     }
 }
 
-/// 释放字符串内存
+/// 释放字符串内存（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_io_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]

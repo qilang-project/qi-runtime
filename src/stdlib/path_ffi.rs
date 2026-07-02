@@ -2,7 +2,7 @@
 //!
 //! 提供文件路径操作功能
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::path::Path;
 
@@ -19,10 +19,7 @@ pub extern "C" fn qi_path_join(path1: *const c_char, path2: *const c_char) -> *m
 
         let joined = Path::new(p1.as_ref()).join(p2.as_ref());
 
-        match CString::new(joined.to_string_lossy().as_ref()) {
-            Ok(c_str) => c_str.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        }
+        crate::stdlib::qi_str::rc_cstr_from_str(joined.to_string_lossy().as_ref())
     }
 }
 
@@ -38,15 +35,9 @@ pub extern "C" fn qi_path_filename(path: *const c_char) -> *mut c_char {
         let p = Path::new(path_str.as_ref());
 
         if let Some(filename) = p.file_name() {
-            match CString::new(filename.to_string_lossy().as_ref()) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+            crate::stdlib::qi_str::rc_cstr_from_str(filename.to_string_lossy().as_ref())
         } else {
-            match CString::new("") {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+            crate::stdlib::qi_str::rc_cstr_from_str("")
         }
     }
 }
@@ -63,15 +54,9 @@ pub extern "C" fn qi_path_parent(path: *const c_char) -> *mut c_char {
         let p = Path::new(path_str.as_ref());
 
         if let Some(parent) = p.parent() {
-            match CString::new(parent.to_string_lossy().as_ref()) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+            crate::stdlib::qi_str::rc_cstr_from_str(parent.to_string_lossy().as_ref())
         } else {
-            match CString::new("") {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+            crate::stdlib::qi_str::rc_cstr_from_str("")
         }
     }
 }
@@ -88,15 +73,9 @@ pub extern "C" fn qi_path_extension(path: *const c_char) -> *mut c_char {
         let p = Path::new(path_str.as_ref());
 
         if let Some(ext) = p.extension() {
-            match CString::new(ext.to_string_lossy().as_ref()) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+            crate::stdlib::qi_str::rc_cstr_from_str(ext.to_string_lossy().as_ref())
         } else {
-            match CString::new("") {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+            crate::stdlib::qi_str::rc_cstr_from_str("")
         }
     }
 }
@@ -113,16 +92,10 @@ pub extern "C" fn qi_path_absolute(path: *const c_char) -> *mut c_char {
         let p = Path::new(path_str.as_ref());
 
         if let Ok(abs_path) = p.canonicalize() {
-            match CString::new(abs_path.to_string_lossy().as_ref()) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+            crate::stdlib::qi_str::rc_cstr_from_str(abs_path.to_string_lossy().as_ref())
         } else {
-            // 如果无法规范化，返回原路径
-            match CString::new(path_str.as_ref()) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+            // 如果无法规范化，返回原路径（新分配的拷贝）
+            crate::stdlib::qi_str::rc_cstr_from_str(path_str.as_ref())
         }
     }
 }
@@ -184,14 +157,10 @@ pub extern "C" fn qi_path_is_file(path: *const c_char) -> i32 {
     }
 }
 
-/// 释放字符串
+/// 释放字符串（header-aware：本模块返回的都是 rc_cstr）
 #[no_mangle]
 pub extern "C" fn qi_path_free_string(s: *mut c_char) {
-    if !s.is_null() {
-        unsafe {
-            let _ = CString::from_raw(s);
-        }
-    }
+    crate::stdlib::qi_str::rc_cstr_release(s);
 }
 
 #[cfg(test)]
