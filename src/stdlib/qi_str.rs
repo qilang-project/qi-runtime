@@ -135,6 +135,8 @@ fn warn_non_rc_pointer_once() {
 
 /// retain 核心：base 指向 data 起点（header 在 base-24）。
 /// magic 不符 → 一次性警告后 no-op；immortal → no-op；否则 refcount++。
+/// OBJ magic（rc_obj 结构体/数组本体，header 同形）→ 委托对象 retain
+/// —— 数组<指针>/类型混淆路径下串与对象互认，计数始终平衡。
 ///
 /// # Safety
 /// base 非 null，且 base-24 起 24 字节可读（RC buffer 天然满足；
@@ -143,6 +145,10 @@ fn warn_non_rc_pointer_once() {
 unsafe fn retain_base(base: *const u8) {
     let header = header_of(base);
     if (*header).magic != QI_STR_MAGIC {
+        if (*header).magic == super::rc_obj::QI_OBJ_MAGIC {
+            super::rc_obj::obj_retain_raw(base);
+            return;
+        }
         warn_non_rc_pointer_once();
         return;
     }
@@ -154,6 +160,7 @@ unsafe fn retain_base(base: *const u8) {
 
 /// release 核心：magic 不符 → 一次性警告后直接返回（宁泄漏不崩溃，铁律）；
 /// immortal → no-op；否则 refcount--，前值 == 1 时按 capacity 释放整个 buffer。
+/// OBJ magic → 委托对象**浅**释放（归零只回收本体，字段泄漏 —— 宁泄漏不崩）。
 ///
 /// # Safety
 /// 同 [`retain_base`]。
@@ -161,6 +168,10 @@ unsafe fn retain_base(base: *const u8) {
 unsafe fn release_base(base: *const u8) {
     let header = header_of_mut(base);
     if (*header).magic != QI_STR_MAGIC {
+        if (*header).magic == super::rc_obj::QI_OBJ_MAGIC {
+            super::rc_obj::obj_release_shallow(base);
+            return;
+        }
         warn_non_rc_pointer_once();
         return;
     }

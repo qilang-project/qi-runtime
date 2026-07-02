@@ -34,6 +34,7 @@ pub mod process_ffi;
 pub mod qi_str;
 pub mod qi_str_ffi;
 pub mod random_ffi;
+pub mod rc_obj;
 pub mod regex_ffi;
 pub mod signal_ffi;
 pub mod string;
