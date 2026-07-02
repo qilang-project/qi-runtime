@@ -77,6 +77,8 @@ pub extern "C" fn qi_config_read_ini(path: *const c_char) -> *mut c_char {
 
         match conf.load(path_str.as_ref()) {
             Ok(_) => {
+                // configparser 开了 indexmap feature：map 按文件出现序迭代，
+                // JSON 输出键序确定（原为 HashMap，每次运行乱序）
                 let map = conf.get_map_ref();
 
                 match serde_json::to_string(&map) {
@@ -101,9 +103,10 @@ pub extern "C" fn qi_config_write_ini(path: *const c_char, json: *const c_char) 
         let json_str = CStr::from_ptr(json).to_string_lossy();
 
         use configparser::ini::Ini;
-        use std::collections::HashMap;
+        use indexmap::IndexMap;
 
-        match serde_json::from_str::<HashMap<String, HashMap<String, String>>>(&json_str) {
+        // IndexMap：段/键按 JSON 文档出现序写入 —— 输出文件跨运行逐字节一致
+        match serde_json::from_str::<IndexMap<String, IndexMap<String, String>>>(&json_str) {
             Ok(map) => {
                 let mut conf = Ini::new();
 

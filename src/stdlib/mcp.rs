@@ -5,6 +5,7 @@
 
 #![allow(non_snake_case)]
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -467,12 +468,12 @@ impl Default for MCP服务器配置 {
 pub struct MCP服务器 {
     /// 服务器配置
     配置: MCP服务器配置,
-    /// 注册的工具
-    工具表: HashMap<String, MCP工具>,
-    /// 注册的资源
-    资源表: HashMap<String, MCP资源>,
-    /// 注册的提示
-    提示表: HashMap<String, MCP提示>,
+    /// 注册的工具（IndexMap：迭代序 = 注册序，tools/list 输出跨运行确定）
+    工具表: IndexMap<String, MCP工具>,
+    /// 注册的资源（同上，resources/list 按注册序）
+    资源表: IndexMap<String, MCP资源>,
+    /// 注册的提示（同上，prompts/list 按注册序）
+    提示表: IndexMap<String, MCP提示>,
     /// 是否正在运行
     运行中: bool,
     /// 当前日志级别（logging/setLevel 设置）
@@ -484,9 +485,9 @@ impl MCP服务器 {
     pub fn 创建(配置: MCP服务器配置) -> Self {
         Self {
             配置,
-            工具表: HashMap::new(),
-            资源表: HashMap::new(),
-            提示表: HashMap::new(),
+            工具表: IndexMap::new(),
+            资源表: IndexMap::new(),
+            提示表: IndexMap::new(),
             运行中: false,
             日志级别: "info".to_string(),
         }

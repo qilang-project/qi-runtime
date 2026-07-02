@@ -50,6 +50,7 @@ pub extern "C" fn qi_runtime_initialize() -> c_int {
 /// Shutdown the Qi runtime
 #[no_mangle]
 pub extern "C" fn qi_runtime_shutdown() -> c_int {
+    qi_runtime_flush_stdout(); // 刷出所有线程未完的打印行
     unsafe {
         if let Some(runtime_mutex) = RUNTIME.take() {
             if let Ok(mut runtime) = runtime_mutex.write() {
@@ -102,6 +103,88 @@ pub extern "C" fn qi_runtime_execute(program_data: *const u8, data_len: usize) -
     }
 }
 
+// ============================================================================
+// 行级原子打印
+//
+// 问题：一行输出常由多个 打印() FFI 调用拼成（前缀、数字、后缀…），每个调用
+// 独立 write，多协程（多 OS 线程）并发时行内交错：
+//   "协程计算: 协程计算: 50 + 60 = 110"
+// 方案：无换行的段先积攒到 *线程本地* 行缓冲；遇到换行把整行（含换行）用
+// stdout lock + write_all **一次** 写出。任何时刻屏幕上每行要么完整要么没有。
+// 未完行在进程退出（atexit）时统一刷出，不丢输出。
+// ============================================================================
+
+/// 所有线程行缓冲的全局注册表 —— atexit 时能刷到非主线程的未完行
+static PRINT_LINE_BUFFERS: Mutex<Vec<std::sync::Arc<Mutex<String>>>> = Mutex::new(Vec::new());
+static PRINT_ATEXIT_ONCE: Once = Once::new();
+
+thread_local! {
+    /// 本线程的行缓冲（首次使用时注册到全局表）
+    static THREAD_LINE_BUF: std::sync::Arc<Mutex<String>> = {
+        let buf = std::sync::Arc::new(Mutex::new(String::new()));
+        if let Ok(mut reg) = PRINT_LINE_BUFFERS.lock() {
+            reg.push(buf.clone());
+        }
+        buf
+    };
+}
+
+extern "C" fn print_flush_at_exit() {
+    qi_runtime_flush_stdout();
+}
+
+/// 追加一段打印内容；`换行` 为真或内容含 '\n' 时整个缓冲一次 write_all 刷出。
+fn 行级打印段(args: std::fmt::Arguments<'_>, 换行: bool) {
+    PRINT_ATEXIT_ONCE.call_once(|| unsafe {
+        libc::atexit(print_flush_at_exit);
+    });
+
+    THREAD_LINE_BUF.with(|cell| {
+        // 先在缓冲锁内拼完、取出（take），释放缓冲锁后再拿 stdout 锁写 ——
+        // 两把锁不嵌套，与 flush_stdout 无死锁风险
+        let 完整行: Option<String> = {
+            let mut buf = cell.lock().unwrap_or_else(|e| e.into_inner());
+            use std::fmt::Write as _;
+            let _ = buf.write_fmt(args);
+            if 换行 {
+                buf.push('\n');
+            }
+            if 换行 || buf.contains('\n') {
+                Some(std::mem::take(&mut *buf))
+            } else {
+                None
+            }
+        };
+        if let Some(行) = 完整行 {
+            use std::io::Write as _;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(行.as_bytes()); // 单次 write：行级原子
+            let _ = out.flush();
+        }
+    });
+}
+
+/// 刷出所有线程的未完行（atexit / 运行时关闭时调用）
+#[no_mangle]
+pub extern "C" fn qi_runtime_flush_stdout() {
+    // 先各自取出内容再统一写，锁不嵌套
+    let mut 待写 = String::new();
+    if let Ok(reg) = PRINT_LINE_BUFFERS.lock() {
+        for buf in reg.iter() {
+            let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+            if !b.is_empty() {
+                待写.push_str(&std::mem::take(&mut *b));
+            }
+        }
+    }
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    if !待写.is_empty() {
+        let _ = out.write_all(待写.as_bytes());
+    }
+    let _ = out.flush();
+}
+
 /// Print a string (UTF-8)
 #[no_mangle]
 pub extern "C" fn qi_runtime_print(s: *const c_char) -> c_int {
@@ -111,9 +194,7 @@ pub extern "C" fn qi_runtime_print(s: *const c_char) -> c_int {
 
     unsafe {
         if let Ok(rust_str) = CStr::from_ptr(s).to_str() {
-            print!("{}", rust_str);
-            // Force flush to ensure output appears immediately
-            std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
+            行级打印段(format_args!("{}", rust_str), false);
 
             if let Some(runtime_mutex) = RUNTIME.as_ref() {
                 if let Ok(runtime) = runtime_mutex.read() {
@@ -137,9 +218,7 @@ pub extern "C" fn qi_runtime_println(s: *const c_char) -> c_int {
 
     unsafe {
         if let Ok(rust_str) = CStr::from_ptr(s).to_str() {
-            println!("{}", rust_str);
-            // Ensure output is flushed (println! should flush, but let's be explicit)
-            std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
+            行级打印段(format_args!("{}", rust_str), true);
 
             if let Some(runtime_mutex) = RUNTIME.as_ref() {
                 if let Ok(runtime) = runtime_mutex.read() {
@@ -157,28 +236,21 @@ pub extern "C" fn qi_runtime_println(s: *const c_char) -> c_int {
 /// Print an integer
 #[no_mangle]
 pub extern "C" fn qi_runtime_print_int(value: i64) -> c_int {
-    print!("{}", value);
-    // Force flush to ensure output appears immediately
-    std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
-
+    行级打印段(format_args!("{}", value), false);
     0
 }
 
 /// Print an integer with newline
 #[no_mangle]
 pub extern "C" fn qi_runtime_println_int(value: i64) -> c_int {
-    println!("{}", value);
-
+    行级打印段(format_args!("{}", value), true);
     0
 }
 
 /// Print a float
 #[no_mangle]
 pub extern "C" fn qi_runtime_print_float(value: f64) -> c_int {
-    print!("{}", value);
-    // Force flush to ensure output appears immediately
-    std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
-
+    行级打印段(format_args!("{}", value), false);
     0
 }
 
@@ -187,11 +259,10 @@ pub extern "C" fn qi_runtime_print_float(value: f64) -> c_int {
 pub extern "C" fn qi_runtime_println_float(value: f64) -> c_int {
     // Format to always show decimal point for float values
     if value.fract() == 0.0 {
-        println!("{:.1}", value); // Show one decimal place for whole numbers
+        行级打印段(format_args!("{:.1}", value), true); // Show one decimal place for whole numbers
     } else {
-        println!("{}", value); // Show normal format for fractions
+        行级打印段(format_args!("{}", value), true); // Show normal format for fractions
     }
-
     0
 }
 
@@ -199,10 +270,7 @@ pub extern "C" fn qi_runtime_println_float(value: f64) -> c_int {
 #[no_mangle]
 pub extern "C" fn qi_runtime_print_bool(value: i32) -> c_int {
     let text = if value != 0 { "真" } else { "假" };
-    print!("{}", text);
-    // Force flush to ensure output appears immediately
-    std::io::Write::flush(&mut std::io::stdout()).unwrap_or(());
-
+    行级打印段(format_args!("{}", text), false);
     0
 }
 
@@ -210,8 +278,7 @@ pub extern "C" fn qi_runtime_print_bool(value: i32) -> c_int {
 #[no_mangle]
 pub extern "C" fn qi_runtime_println_bool(value: i32) -> c_int {
     let text = if value != 0 { "真" } else { "假" };
-    println!("{}", text);
-
+    行级打印段(format_args!("{}", text), true);
     0
 }
 

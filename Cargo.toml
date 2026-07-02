@@ -18,7 +18,12 @@ cc = "1.0"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.107"
+# preserve_order：JSON 对象保持插入序（parse→stringify 往返不打乱原文档键序，
+# 输出跨运行确定）。底层 IndexMap。
+serde_json = { version = "1.0.107", features = ["preserve_order"] }
+# MCP 工具/资源/提示注册表按注册序迭代；serde feature 顺带给 configparser 的
+# IndexMap 提供 Serialize/Deserialize（feature 统一）
+indexmap = { version = "2", features = ["serde"] }
 
 # HTTP/TLS —— 纯 Rust（rustls），无系统 openssl/Security.framework
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "charset", "http2"] }
@@ -57,7 +62,8 @@ rand = "0.8"
 clap = { version = "4.5.50", features = ["derive"] }
 toml = "0.8.8"
 ini = "1.3"
-configparser = "3.1"
+# indexmap feature：INI 段/键保持文件出现序 —— 读回 JSON 键序确定且忠实原文档
+configparser = { version = "3.1", features = ["indexmap"] }
 flate2 = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 log = "0.4.20"
