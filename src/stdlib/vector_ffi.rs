@@ -1,295 +1,287 @@
-//! 向量模块 FFI 接口
+//! 向量模块 FFI —— 直接按 **Qi 数组内存布局** 收发，Qi 侧零出参缓冲。
 //!
-//! 为 Qi 语言提供 C 接口的向量计算函数
+//! Qi 数组布局（见 qi/src/codegen/inkwell_gen/数组.rs）：
+//! ```text
+//! ptr → [长度:i64][elem0:8字节][elem1:8字节]...
+//! ```
+//! 浮点数组元素槽存 f64 位模式。本模块所有入参数组按 f64 元素解读
+//! （整数数组误入会算出垃圾值 —— 调用方须传浮点数组，如 `[1.0, 2.0]`）。
+//!
+//! 约定：
+//! - 入参数组一律**借用读**（不私藏指针、不释放）；
+//! - 返回数组一律经 [`qi_obj_alloc`] 分配（带 RC header，rc=1 交出），
+//!   QI_ARC=1 时 codegen 的 `qi.release.arr.v` 可正确回收；QI_ARC=0 时
+//!   与 codegen 自身的 qi_runtime_alloc 数组同样不回收（该模式常态）；
+//! - 维度不匹配 / 空指针 / 零向量归一化 → 返回 0.0 或零向量，并发一次性
+//!   防御日志（宁保守，绝不崩）。
 
-use super::vector::{向量, 向量模块};
-use std::sync::OnceLock;
+// FFI 入口按 C ABI 收裸指针（codegen 直接 call），内部对空指针/坏长度头
+// 自防御，无法也不应标 unsafe（LLVM 侧不认识 Rust 的 unsafe）。
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-// 全局向量模块实例
-static 全局向量模块: OnceLock<向量模块> = OnceLock::new();
+use super::rc_obj::qi_obj_alloc;
+use super::vector::向量;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-fn 获取向量模块() -> &'static 向量模块 {
-    全局向量模块.get_or_init(|| 向量模块::创建())
-}
+/// 防御长度上限：长度头超出此值视为坏指针/类型混淆（不是浮点数组）。
+const 最大长度: i64 = 1 << 32;
 
-/// 初始化向量模块
-#[no_mangle]
-pub extern "C" fn qi_vector_init() {
-    let _ = 获取向量模块();
-}
+/// 一次性防御日志（进程级，首次异常入参提示后静默）。
+static 已警告: AtomicBool = AtomicBool::new(false);
 
-/// 创建向量 - 从数组创建
-/// 参数: 数据指针, 长度
-/// 返回: 向量ID (用于后续操作)
-#[no_mangle]
-pub extern "C" fn qi_vector_create(data: *const f64, length: i64) -> i64 {
-    if data.is_null() || length <= 0 {
-        return -1;
+#[cold]
+fn 防御警告(msg: &str) {
+    if !已警告.swap(true, Ordering::Relaxed) {
+        eprintln!("[qi-vector] {}（后续同类情况将静默处理，不再重复警告）", msg);
     }
+}
 
+/// 按 Qi 数组布局借用读一个 f64 切片。空指针 / 长度头异常 → None。
+unsafe fn 读浮点数组<'a>(p: *const u8) -> Option<&'a [f64]> {
+    if p.is_null() {
+        return None;
+    }
+    let len = *(p as *const i64);
+    if !(0..=最大长度).contains(&len) {
+        return None;
+    }
+    Some(std::slice::from_raw_parts((p as *const f64).add(1), len as usize))
+}
+
+/// 按 Qi 数组布局分配返回数组（qi_obj_alloc：RC header + 长度头 + 元素）。
+fn 新建返回数组(元素: &[f64]) -> *mut u8 {
+    let n = 元素.len();
+    // (n+1) 槽：0 号长度头，其余元素，每槽 8 字节（与 codegen 数组字面量同构）
+    let p = qi_obj_alloc(((n + 1) * 8) as i64);
     unsafe {
-        let 数据切片 = std::slice::from_raw_parts(data, length as usize);
-        let 元素 = 数据切片.to_vec();
-
-        // 简化实现：返回向量长度作为标识
-        // 实际实现需要向量池管理
-        元素.len() as i64
+        *(p as *mut i64) = n as i64;
+        std::ptr::copy_nonoverlapping(元素.as_ptr(), (p as *mut f64).add(1), n);
     }
+    p
 }
 
-/// 向量点积
-/// 参数: v1数据, v1长度, v2数据, v2长度, 结果指针
-/// 返回: 0成功, -1失败
+/// 向量点积：`向量.点积(数组, 数组) : 浮点数`。
+/// 空指针 / 维度不匹配 → 0.0（一次性防御日志）。
 #[no_mangle]
-pub extern "C" fn qi_vector_dot(
-    v1_data: *const f64,
-    v1_len: i64,
-    v2_data: *const f64,
-    v2_len: i64,
-    result: *mut f64,
-) -> i64 {
-    if v1_data.is_null() || v2_data.is_null() || result.is_null() {
-        return -1;
-    }
-
-    if v1_len != v2_len {
-        return -1; // 维度不匹配
-    }
-
+pub extern "C" fn qi_vector_dot(a: *const u8, b: *const u8) -> f64 {
     unsafe {
-        let v1 = std::slice::from_raw_parts(v1_data, v1_len as usize);
-        let v2 = std::slice::from_raw_parts(v2_data, v2_len as usize);
-
-        let 向量1 = 向量 {
-            元素: v1.to_vec()
-        };
-        let 向量2 = 向量 {
-            元素: v2.to_vec()
-        };
-
-        match 向量1.点积(&向量2) {
-            Ok(点积结果) => {
-                *result = 点积结果;
-                0
+        let (甲, 乙) = match (读浮点数组(a), 读浮点数组(b)) {
+            (Some(x), Some(y)) => (x, y),
+            _ => {
+                防御警告("点积: 无效数组指针，返回 0.0");
+                return 0.0;
             }
-            Err(_) => -1,
+        };
+        match 向量::从数组(甲).点积(&向量::从数组(乙)) {
+            Ok(v) => v,
+            Err(_) => {
+                防御警告("点积: 向量维度不匹配，返回 0.0");
+                0.0
+            }
         }
     }
 }
 
-/// 向量加法
-/// 参数: v1数据, v1长度, v2数据, v2长度, 结果数据, 结果长度
-/// 返回: 0成功, -1失败
+/// 向量加法：`向量.加(数组, 数组) : 数组`（返回新数组，rc=1 交出）。
+/// 空指针 / 维度不匹配 → 零长度数组（一次性防御日志）。
 #[no_mangle]
-pub extern "C" fn qi_vector_add(
-    v1_data: *const f64,
-    v1_len: i64,
-    v2_data: *const f64,
-    v2_len: i64,
-    result_data: *mut f64,
-    result_len: i64,
-) -> i64 {
-    if v1_data.is_null() || v2_data.is_null() || result_data.is_null() {
-        return -1;
-    }
-
-    if v1_len != v2_len || result_len < v1_len {
-        return -1;
-    }
-
+pub extern "C" fn qi_vector_add(a: *const u8, b: *const u8) -> *mut u8 {
     unsafe {
-        let v1 = std::slice::from_raw_parts(v1_data, v1_len as usize);
-        let v2 = std::slice::from_raw_parts(v2_data, v2_len as usize);
-
-        let 向量1 = 向量 {
-            元素: v1.to_vec()
-        };
-        let 向量2 = 向量 {
-            元素: v2.to_vec()
-        };
-
-        match 向量1.加(&向量2) {
-            Ok(结果向量) => {
-                let result_slice = std::slice::from_raw_parts_mut(result_data, v1_len as usize);
-                result_slice.copy_from_slice(&结果向量.元素);
-                0
+        let (甲, 乙) = match (读浮点数组(a), 读浮点数组(b)) {
+            (Some(x), Some(y)) => (x, y),
+            _ => {
+                防御警告("加: 无效数组指针，返回空数组");
+                return 新建返回数组(&[]);
             }
-            Err(_) => -1,
+        };
+        match 向量::从数组(甲).加(&向量::从数组(乙)) {
+            Ok(v) => 新建返回数组(&v.元素),
+            Err(_) => {
+                防御警告("加: 向量维度不匹配，返回空数组");
+                新建返回数组(&[])
+            }
         }
     }
 }
 
-/// 向量长度(模)
-/// 参数: 数据指针, 长度, 结果指针
-/// 返回: 0成功, -1失败
+/// 向量长度（模）：`向量.长度(数组) : 浮点数`。空指针 → 0.0。
 #[no_mangle]
-pub extern "C" fn qi_vector_magnitude(data: *const f64, length: i64, result: *mut f64) -> i64 {
-    if data.is_null() || result.is_null() || length <= 0 {
-        return -1;
-    }
-
+pub extern "C" fn qi_vector_magnitude(a: *const u8) -> f64 {
     unsafe {
-        let 数据切片 = std::slice::from_raw_parts(data, length as usize);
-        let 向量 = 向量 {
-            元素: 数据切片.to_vec(),
-        };
-
-        *result = 向量.长度();
-        0
-    }
-}
-
-/// 向量归一化
-/// 参数: 输入数据, 长度, 输出数据
-/// 返回: 0成功, -1失败
-#[no_mangle]
-pub extern "C" fn qi_vector_normalize(
-    input_data: *const f64,
-    length: i64,
-    output_data: *mut f64,
-) -> i64 {
-    if input_data.is_null() || output_data.is_null() || length <= 0 {
-        return -1;
-    }
-
-    unsafe {
-        let 输入 = std::slice::from_raw_parts(input_data, length as usize);
-        let 向量 = 向量 {
-            元素: 输入.to_vec(),
-        };
-
-        match 向量.归一化() {
-            Ok(结果) => {
-                let output_slice = std::slice::from_raw_parts_mut(output_data, length as usize);
-                output_slice.copy_from_slice(&结果.元素);
-                0
+        match 读浮点数组(a) {
+            Some(x) => 向量::从数组(x).长度(),
+            None => {
+                防御警告("长度: 无效数组指针，返回 0.0");
+                0.0
             }
-            Err(_) => -1,
         }
     }
 }
 
-/// 余弦相似度 (使用夹角计算: cos = dot / (|v1| * |v2|))
-/// 参数: v1数据, v1长度, v2数据, v2长度, 结果指针
-/// 返回: 0成功, -1失败
+/// 向量归一化：`向量.归一化(数组) : 数组`（返回新数组，rc=1 交出）。
+/// 零向量 → 同长度零向量；空指针 → 零长度数组（一次性防御日志）。
 #[no_mangle]
-pub extern "C" fn qi_vector_cosine_similarity(
-    v1_data: *const f64,
-    v1_len: i64,
-    v2_data: *const f64,
-    v2_len: i64,
-    result: *mut f64,
-) -> i64 {
-    if v1_data.is_null() || v2_data.is_null() || result.is_null() {
-        return -1;
-    }
-
-    if v1_len != v2_len {
-        return -1;
-    }
-
+pub extern "C" fn qi_vector_normalize(a: *const u8) -> *mut u8 {
     unsafe {
-        let v1 = std::slice::from_raw_parts(v1_data, v1_len as usize);
-        let v2 = std::slice::from_raw_parts(v2_data, v2_len as usize);
-
-        let 向量1 = 向量 {
-            元素: v1.to_vec()
-        };
-        let 向量2 = 向量 {
-            元素: v2.to_vec()
-        };
-
-        // 余弦相似度 = 点积 / (模1 * 模2)
-        match 向量1.点积(&向量2) {
-            Ok(点积) => {
-                let 模1 = 向量1.长度();
-                let 模2 = 向量2.长度();
-                if 模1 == 0.0 || 模2 == 0.0 {
-                    return -1;
-                }
-                *result = 点积 / (模1 * 模2);
-                0
+        let 甲 = match 读浮点数组(a) {
+            Some(x) => x,
+            None => {
+                防御警告("归一化: 无效数组指针，返回空数组");
+                return 新建返回数组(&[]);
             }
-            Err(_) => -1,
+        };
+        match 向量::从数组(甲).归一化() {
+            Ok(v) => 新建返回数组(&v.元素),
+            Err(_) => {
+                防御警告("归一化: 零向量，返回同长度零向量");
+                新建返回数组(&vec![0.0; 甲.len()])
+            }
         }
     }
 }
 
-/// 向量数乘
-/// 参数: 输入数据, 长度, 标量, 输出数据
-/// 返回: 0成功, -1失败
+/// 向量数乘：`向量.数乘(数组, 浮点数) : 数组`（返回新数组，rc=1 交出）。
 #[no_mangle]
-pub extern "C" fn qi_vector_scale(
-    input_data: *const f64,
-    length: i64,
-    scalar: f64,
-    output_data: *mut f64,
-) -> i64 {
-    if input_data.is_null() || output_data.is_null() || length <= 0 {
-        return -1;
-    }
-
+pub extern "C" fn qi_vector_scale(a: *const u8, 标量: f64) -> *mut u8 {
     unsafe {
-        let 输入 = std::slice::from_raw_parts(input_data, length as usize);
-        let 向量 = 向量 {
-            元素: 输入.to_vec(),
-        };
+        match 读浮点数组(a) {
+            Some(x) => 新建返回数组(&向量::从数组(x).数乘(标量).元素),
+            None => {
+                防御警告("数乘: 无效数组指针，返回空数组");
+                新建返回数组(&[])
+            }
+        }
+    }
+}
 
-        let 结果 = 向量.数乘(scalar);
-        let output_slice = std::slice::from_raw_parts_mut(output_data, length as usize);
-        output_slice.copy_from_slice(&结果.元素);
-        0
+/// 余弦相似度：`向量.余弦相似度(数组, 数组) : 浮点数`。
+/// 空指针 / 维度不匹配 / 任一零向量 → 0.0（一次性防御日志）。
+#[no_mangle]
+pub extern "C" fn qi_vector_cosine_similarity(a: *const u8, b: *const u8) -> f64 {
+    unsafe {
+        let (甲, 乙) = match (读浮点数组(a), 读浮点数组(b)) {
+            (Some(x), Some(y)) => (x, y),
+            _ => {
+                防御警告("余弦相似度: 无效数组指针，返回 0.0");
+                return 0.0;
+            }
+        };
+        let (v1, v2) = (向量::从数组(甲), 向量::从数组(乙));
+        let 点积 = match v1.点积(&v2) {
+            Ok(v) => v,
+            Err(_) => {
+                防御警告("余弦相似度: 向量维度不匹配，返回 0.0");
+                return 0.0;
+            }
+        };
+        let 模积 = v1.长度() * v2.长度();
+        if 模积 == 0.0 {
+            防御警告("余弦相似度: 含零向量，返回 0.0");
+            return 0.0;
+        }
+        点积 / 模积
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::rc_obj::{qi_obj_dec, qi_obj_free};
 
-    #[test]
-    fn test_vector_dot_ffi() {
-        let v1 = vec![1.0, 2.0, 3.0];
-        let v2 = vec![4.0, 5.0, 6.0];
-        let mut result: f64 = 0.0;
+    /// 按 Qi 数组布局造一个测试数组（[len][f64 位模式...]）。
+    fn qi数组(vals: &[f64]) -> Vec<i64> {
+        let mut v = vec![vals.len() as i64];
+        v.extend(vals.iter().map(|f| f.to_bits() as i64));
+        v
+    }
 
-        let ret = qi_vector_dot(
-            v1.as_ptr(),
-            v1.len() as i64,
-            v2.as_ptr(),
-            v2.len() as i64,
-            &mut result,
-        );
+    fn 指针(buf: &[i64]) -> *const u8 {
+        buf.as_ptr() as *const u8
+    }
 
-        assert_eq!(ret, 0);
-        assert_eq!(result, 32.0); // 1*4 + 2*5 + 3*6 = 32
+    /// 读返回数组内容并按 RC 约定释放（rc=1 交出 → dec 到 0 后 free）。
+    fn 取回并释放(p: *mut u8) -> Vec<f64> {
+        assert!(!p.is_null());
+        let out = unsafe { 读浮点数组(p).expect("返回数组布局非法").to_vec() };
+        assert_eq!(qi_obj_dec(p), 1, "返回数组必须 rc=1 交出");
+        qi_obj_free(p);
+        out
     }
 
     #[test]
-    fn test_vector_magnitude_ffi() {
-        let v = vec![3.0, 4.0];
-        let mut result: f64 = 0.0;
-
-        let ret = qi_vector_magnitude(v.as_ptr(), v.len() as i64, &mut result);
-
-        assert_eq!(ret, 0);
-        assert_eq!(result, 5.0); // sqrt(9 + 16) = 5
+    fn dot_qi_layout() {
+        let a = qi数组(&[1.0, 2.0, 3.0]);
+        let b = qi数组(&[4.0, 5.0, 6.0]);
+        assert_eq!(qi_vector_dot(指针(&a), 指针(&b)), 32.0);
     }
 
     #[test]
-    fn test_vector_cosine_similarity_ffi() {
-        let v1 = vec![1.0, 0.0];
-        let v2 = vec![0.0, 1.0];
-        let mut result: f64 = 0.0;
+    fn dot_mismatch_returns_zero() {
+        let a = qi数组(&[1.0, 2.0]);
+        let b = qi数组(&[1.0, 2.0, 3.0]);
+        assert_eq!(qi_vector_dot(指针(&a), 指针(&b)), 0.0);
+        assert_eq!(qi_vector_dot(std::ptr::null(), 指针(&b)), 0.0);
+    }
 
-        let ret = qi_vector_cosine_similarity(
-            v1.as_ptr(),
-            v1.len() as i64,
-            v2.as_ptr(),
-            v2.len() as i64,
-            &mut result,
-        );
+    #[test]
+    fn add_returns_new_rc_array() {
+        let a = qi数组(&[1.0, 2.0]);
+        let b = qi数组(&[3.0, 4.5]);
+        let out = 取回并释放(qi_vector_add(指针(&a), 指针(&b)));
+        assert_eq!(out, vec![4.0, 6.5]);
+    }
 
-        assert_eq!(ret, 0);
-        assert!((result - 0.0).abs() < 1e-10); // 垂直向量相似度为0
+    #[test]
+    fn add_mismatch_returns_empty() {
+        let a = qi数组(&[1.0]);
+        let b = qi数组(&[1.0, 2.0]);
+        let out = 取回并释放(qi_vector_add(指针(&a), 指针(&b)));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn magnitude_3_4_5() {
+        let a = qi数组(&[3.0, 4.0]);
+        assert_eq!(qi_vector_magnitude(指针(&a)), 5.0);
+        assert_eq!(qi_vector_magnitude(std::ptr::null()), 0.0);
+    }
+
+    #[test]
+    fn normalize_unit_length() {
+        let a = qi数组(&[3.0, 4.0]);
+        let out = 取回并释放(qi_vector_normalize(指针(&a)));
+        assert_eq!(out, vec![0.6, 0.8]);
+        // 零向量 → 同长度零向量，不崩
+        let z = qi数组(&[0.0, 0.0, 0.0]);
+        let out = 取回并释放(qi_vector_normalize(指针(&z)));
+        assert_eq!(out, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn scale_by_scalar() {
+        let a = qi数组(&[1.5, -2.0, 0.0]);
+        let out = 取回并释放(qi_vector_scale(指针(&a), 2.0));
+        assert_eq!(out, vec![3.0, -4.0, 0.0]);
+    }
+
+    #[test]
+    fn cosine_parallel_and_orthogonal() {
+        let a = qi数组(&[2.0, 0.0]);
+        let b = qi数组(&[7.5, 0.0]);
+        assert!((qi_vector_cosine_similarity(指针(&a), 指针(&b)) - 1.0).abs() < 1e-10);
+        let c = qi数组(&[0.0, 3.0]);
+        assert!(qi_vector_cosine_similarity(指针(&a), 指针(&c)).abs() < 1e-10);
+        // 零向量 → 0.0
+        let z = qi数组(&[0.0, 0.0]);
+        assert_eq!(qi_vector_cosine_similarity(指针(&a), 指针(&z)), 0.0);
+    }
+
+    #[test]
+    fn bogus_length_header_rejected() {
+        // 长度头是垃圾（负数 / 天文数字）→ 按无效数组处理，不越界读
+        let bad = vec![-3i64, 0, 0];
+        assert_eq!(qi_vector_magnitude(指针(&bad)), 0.0);
+        let bad2 = vec![i64::MAX, 0, 0];
+        assert_eq!(qi_vector_dot(指针(&bad2), 指针(&bad2)), 0.0);
     }
 }
