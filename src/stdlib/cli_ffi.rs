@@ -480,7 +480,7 @@ pub extern "C" fn qi_cli_print_help(app_id: i64) -> i64 {
 
     let mut apps = APPS.lock().unwrap();
     if let Some(app) = apps.get_mut(&(app_id as usize)) {
-        match app.command.clone().print_help() {
+        match qi_cli_localize(app.command.clone()).print_help() {
             Ok(_) => {
                 println!();
                 1
@@ -490,6 +490,107 @@ pub extern "C" fn qi_cli_print_help(app_id: i64) -> i64 {
     } else {
         -1
     }
+}
+
+// ==================== 帮助信息本地化 ====================
+//
+// clap 默认输出英文的段落标题（Usage/Commands/Options/Arguments）、自动
+// 生成的 -h/--help、-V/--version 说明，以及内置的 help 子命令说明。这里
+// 在解析/打印帮助前对整棵命令树做一次本地化，让所有 Qi CLI 程序的帮助
+// 都显示中文。
+//
+// 说明：clap 的用法行占位符 `[OPTIONS]` 和默认值注解 `[default: ...]`
+// 是 clap 内部硬编码的英文，无法通过公开 API 翻译，保持原样。
+
+/// 根据命令实际拥有的段落动态生成中文帮助模板，避免出现空标题。
+fn qi_cli_help_template(cmd: &Command) -> String {
+    let has_sub = cmd.get_subcommands().next().is_some();
+    let has_pos = cmd.get_positionals().next().is_some();
+    let mut t = String::from("{about-with-newline}\n用法：{usage}\n");
+    if has_sub {
+        t.push_str("\n命令：\n{subcommands}\n");
+    }
+    if has_pos {
+        t.push_str("\n参数：\n{positionals}\n");
+    }
+    t.push_str("\n选项：\n{options}{after-help}");
+    t
+}
+
+/// 递归地把一棵命令树的帮助信息本地化为中文。
+fn qi_cli_localize(mut cmd: Command) -> Command {
+    // 用中文说明替换自动生成的 -h/--help
+    let has_help_arg = cmd.get_arguments().any(|a| a.get_id() == "help");
+    if !has_help_arg {
+        cmd = cmd.disable_help_flag(true).arg(
+            Arg::new("help")
+                .long("help")
+                .short('h')
+                .help("打印帮助信息")
+                .action(ArgAction::Help),
+        );
+    }
+    // 仅在设置了版本时才有 -V/--version
+    if cmd.get_version().is_some() {
+        let has_version_arg = cmd.get_arguments().any(|a| a.get_id() == "version");
+        if !has_version_arg {
+            cmd = cmd.disable_version_flag(true).arg(
+                Arg::new("version")
+                    .long("version")
+                    .short('V')
+                    .help("打印版本信息")
+                    .action(ArgAction::Version),
+            );
+        }
+    }
+    // 先本地化已有子命令
+    let names: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+    for name in names {
+        cmd = cmd.mut_subcommand(&name, qi_cli_localize);
+    }
+    // 用中文 help 子命令替换 clap 的英文自动 help 子命令
+    // （派发逻辑在 qi_cli_parse 中重新实现）
+    if cmd.get_subcommands().next().is_some() && cmd.find_subcommand("help").is_none() {
+        let help_sub = qi_cli_localize(
+            Command::new("help")
+                .about("打印本消息或指定子命令的帮助信息")
+                .arg(
+                    Arg::new("子命令")
+                        .help("要查看帮助的子命令")
+                        .num_args(0..),
+                ),
+        );
+        cmd = cmd
+            .disable_help_subcommand(true)
+            .subcommand_value_name("命令")
+            .subcommand(help_sub);
+    }
+    let tmpl = qi_cli_help_template(&cmd);
+    cmd.help_template(tmpl)
+}
+
+/// 重新实现 `<程序> help [子命令...]` 的派发：沿命令链走到目标命令并打印其帮助。
+fn qi_cli_dispatch_help(root: &mut Command, sub_matches: &ArgMatches) {
+    let path: Vec<String> = sub_matches
+        .get_many::<String>("子命令")
+        .map(|values| values.map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+
+    let mut current: &mut Command = root;
+    for name in &path {
+        match current.find_subcommand_mut(name) {
+            Some(next) => current = next,
+            None => {
+                eprintln!("未找到子命令：{}", name);
+                return;
+            }
+        }
+    }
+    let _ = current.print_help();
+    println!();
 }
 
 // ==================== 参数解析 ====================
@@ -507,9 +608,17 @@ pub extern "C" fn qi_cli_parse(app_id: i64) -> i64 {
         // 获取命令行参数
         let args: Vec<String> = std::env::args().collect();
 
+        // 本地化整棵命令树，让帮助输出为中文
+        let mut command = qi_cli_localize(app.command.clone());
+
         // 解析
-        match app.command.clone().try_get_matches_from(args) {
+        match command.clone().try_get_matches_from(args) {
             Ok(matches) => {
+                // 处理中文 help 子命令：打印目标命令的帮助后退出
+                if let Some(("help", sub_matches)) = matches.subcommand() {
+                    qi_cli_dispatch_help(&mut command, sub_matches);
+                    std::process::exit(0);
+                }
                 let matches_wrapper = QiCliMatches { matches };
                 let id = next_id();
                 MATCHES.lock().unwrap().insert(id, matches_wrapper);
