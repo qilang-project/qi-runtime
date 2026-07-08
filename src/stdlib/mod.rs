@@ -31,6 +31,7 @@ pub mod multipart_ffi;
 pub mod os_ffi;
 pub mod path_ffi;
 pub mod process_ffi;
+pub mod profiler;
 pub mod qi_str;
 pub mod qi_str_ffi;
 pub mod random_ffi;
