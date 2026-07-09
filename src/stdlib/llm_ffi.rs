@@ -50,6 +50,8 @@ struct LLM会话 {
     工具名称映射: HashMap<String, String>,
     /// 配置参数
     配置: HashMap<String, String>,
+    /// 最近一次**非流式**请求的 token 用量 (prompt, completion, total)；未知/未请求为 0。
+    最近用量: (i64, i64, i64),
 }
 
 impl LLM会话 {
@@ -71,6 +73,37 @@ impl LLM会话 {
             工具列表: Vec::new(),
             工具名称映射: HashMap::new(),
             配置: HashMap::new(),
+            最近用量: (0, 0, 0),
+        }
+    }
+
+    /// 从响应体的 usage 字段提取 (prompt, completion, total) token 数；缺失为 0。
+    fn 提取用量(响应体: &Value) -> (i64, i64, i64) {
+        let u = 响应体.get("usage");
+        let 取 = |k: &str| {
+            u.and_then(|u| u.get(k))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+        };
+        (取("prompt_tokens"), 取("completion_tokens"), 取("total_tokens"))
+    }
+
+    /// 结构化输出：按配置注入 response_format。
+    /// 配置值 "json"/"json_object" → JSON 模式；以 `{` 开头 → 当作完整 response_format 对象
+    /// （如 {"type":"json_schema","json_schema":{...}}，供支持 strict schema 的 provider）。
+    fn 注入响应格式(&self, 请求体: &mut Value) {
+        if let Some(rf) = self.配置.get("response_format") {
+            let rf = rf.trim();
+            if rf.is_empty() {
+                return;
+            }
+            if rf == "json" || rf == "json_object" {
+                请求体["response_format"] = json!({"type": "json_object"});
+            } else if rf.starts_with('{') {
+                if let Ok(v) = serde_json::from_str::<Value>(rf) {
+                    请求体["response_format"] = v;
+                }
+            }
         }
     }
 
@@ -119,6 +152,7 @@ impl LLM会话 {
             请求体["tools"] = Value::Array(self.工具列表.clone());
             请求体["tool_choice"] = json!("auto");
         }
+        self.注入响应格式(&mut 请求体);
 
         请求体
     }
@@ -141,6 +175,7 @@ impl LLM会话 {
             请求体["tools"] = Value::Array(self.工具列表.clone());
             请求体["tool_choice"] = json!("auto");
         }
+        self.注入响应格式(&mut 请求体);
 
         请求体
     }
@@ -190,37 +225,40 @@ impl LLM会话 {
             .to_string())
     }
 
-    /// 发送HTTP请求到LLM API
-    fn 调用API(&self, 提示: &str) -> Result<String, String> {
+    /// 发送HTTP请求到LLM API（&mut：顺带记录本次 token 用量）
+    fn 调用API(&mut self, 提示: &str) -> Result<String, String> {
         let 请求体 = self.构建请求体(提示, false, false);
         let 响应体: Value = self
             .发送请求体(请求体)?
             .json()
             .map_err(|e| format!("解析响应失败: {}", e))?;
 
+        self.最近用量 = Self::提取用量(&响应体);
         let 消息 = Self::提取消息(&响应体)?;
         Self::提取文本(&消息)
     }
 
-    /// 带工具定义发送请求，返回完整 assistant message JSON
-    fn 调用工具API(&self, 提示: &str) -> Result<Value, String> {
+    /// 带工具定义发送请求，返回完整 assistant message JSON（&mut：记录用量）
+    fn 调用工具API(&mut self, 提示: &str) -> Result<Value, String> {
         let 请求体 = self.构建请求体(提示, false, true);
         let 响应体: Value = self
             .发送请求体(请求体)?
             .json()
             .map_err(|e| format!("解析响应失败: {}", e))?;
 
+        self.最近用量 = Self::提取用量(&响应体);
         Self::提取消息(&响应体)
     }
 
-    /// 继续工具对话，通常在添加 tool 结果后调用
-    fn 继续工具API(&self) -> Result<Value, String> {
+    /// 继续工具对话，通常在添加 tool 结果后调用（&mut：记录用量）
+    fn 继续工具API(&mut self) -> Result<Value, String> {
         let 请求体 = self.构建继续请求体(true);
         let 响应体: Value = self
             .发送请求体(请求体)?
             .json()
             .map_err(|e| format!("解析响应失败: {}", e))?;
 
+        self.最近用量 = Self::提取用量(&响应体);
         Self::提取消息(&响应体)
     }
 
@@ -1133,6 +1171,19 @@ pub extern "C" fn qi_llm_set_history_json(
     }
 }
 
+/// 最近一次非流式请求的 token 用量，返回 JSON 串 {"prompt":..,"completion":..,"total":..}。
+/// 会话不存在或尚无请求 → 全 0。用于成本/预算统计（span 里记真实 tokens）。
+#[no_mangle]
+pub extern "C" fn qi_llm_last_usage(session_handle: i64) -> *mut c_char {
+    let 会话池 = 获取会话池().lock().unwrap();
+    let (p, c, t) = 会话池
+        .get(&session_handle)
+        .map(|s| s.最近用量)
+        .unwrap_or((0, 0, 0));
+    let 文本 = json!({"prompt": p, "completion": c, "total": t}).to_string();
+    crate::stdlib::qi_str::rc_cstr_from_string(文本)
+}
+
 /// 关闭LLM会话
 ///
 /// 参数:
@@ -1184,7 +1235,7 @@ pub extern "C" fn qi_llm_chat_async(session_handle: i64, prompt: *const c_char) 
         let 提示 = CStr::from_ptr(prompt).to_string_lossy().to_string();
 
         // 获取会话的克隆
-        let 会话克隆 = {
+        let mut 会话克隆 = {
             let 会话池 = 获取会话池().lock().unwrap();
             match 会话池.get(&session_handle) {
                 Some(会话) => 会话.clone(),
