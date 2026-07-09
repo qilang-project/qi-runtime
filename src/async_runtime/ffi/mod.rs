@@ -22,7 +22,10 @@ pub type TaskHandle = *mut c_void;
 static TASK_STORE: OnceLock<
     Mutex<HashMap<u64, Pin<Box<dyn Future<Output = *mut c_void> + Send + 'static>>>>,
 > = OnceLock::new();
-static mut NEXT_TASK_ID: u64 = 1;
+// 全局单调 ID 计数器：外部宿主的多个 OS 线程可能并发调 create_task /
+// create_channel / timer_create（反向 FFI 重入），必须原子自增。旧版是
+// `static mut u64 += 1`（非原子），并发下丢更新 / ID 撞车 / TSan 数据竞争。
+static NEXT_TASK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static RUNTIME_INIT: OnceLock<()> = OnceLock::new();
 
 /// 全局 tokio runtime —— 所有 `启动` 派发的 goroutine 都跑在这里。
@@ -106,11 +109,7 @@ pub extern "C" fn qi_runtime_create_task(
         eprintln!("DEBUG: create_task called");
     }
 
-    let task_id = unsafe {
-        let id = NEXT_TASK_ID;
-        NEXT_TASK_ID += 1;
-        id
-    };
+    let task_id = NEXT_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if debug_enabled() {
         eprintln!("DEBUG: task_id = {}", task_id);
     }
@@ -471,11 +470,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Global channel registry
 static CHANNEL_REGISTRY: OnceLock<Mutex<HashMap<u64, Arc<ChannelInstance>>>> = OnceLock::new();
-static mut NEXT_CHANNEL_ID: u64 = 1;
+// 原子（见 NEXT_TASK_ID）—— 多外部线程并发 create_channel 时 ID 不撞车。
+static NEXT_CHANNEL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Global timer registry
 static TIMER_REGISTRY: OnceLock<Mutex<HashMap<u64, Arc<Mutex<TimerInstance>>>>> = OnceLock::new();
-static mut NEXT_TIMER_ID: u64 = 1;
+// 原子（见 NEXT_TASK_ID）—— 多外部线程并发 timer_create 时 ID 不撞车。
+static NEXT_TIMER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Channel instance for runtime
 struct ChannelInstance {
@@ -515,11 +516,7 @@ pub extern "C" fn qi_runtime_create_channel(buffer_size: i64) -> *mut c_void {
         buffer_size: buffer_size as i32,
     });
 
-    let channel_id = unsafe {
-        let id = NEXT_CHANNEL_ID;
-        NEXT_CHANNEL_ID += 1;
-        id
-    };
+    let channel_id = NEXT_CHANNEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     if let Some(registry) = CHANNEL_REGISTRY.get() {
         if let Ok(mut registry_guard) = registry.lock() {
@@ -834,11 +831,7 @@ pub extern "C" fn qi_runtime_timer_create(deadline_ms: i64) -> *mut c_void {
         stopped: false,
     }));
 
-    let timer_id = unsafe {
-        let id = NEXT_TIMER_ID;
-        NEXT_TIMER_ID += 1;
-        id
-    };
+    let timer_id = NEXT_TIMER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     if let Some(registry) = TIMER_REGISTRY.get() {
         if let Ok(mut registry_guard) = registry.lock() {
