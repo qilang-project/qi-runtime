@@ -365,22 +365,45 @@ pub extern "C" fn qi_http_request_set_timeout(handle: i64, timeout_ms: i64) -> i
     }
 }
 
-/// 执行 HTTP 请求
-/// 返回响应体字符串（需要调用 qi_http_free_string 释放）
+/// 执行 HTTP 请求（真 reqwest —— 带上 set_header 设的自定义头 + body + timeout）。
+/// 返回响应**体**字符串（需要调用 qi_http_free_string 释放）。
+///
+/// 之前这里走的是 http.rs 的桩 `HttpClient::execute`，恒返回 "Hello, World!"，
+/// 于是 创建请求/设置请求头/执行请求 这条 builder 路径根本发不出真请求
+/// （Authorization 之类的自定义头也就无从谈起）。改为直接用 reqwest 阻塞客户端，
+/// 与 qi_http_request 同一实现，把请求池里的 method/url/headers/body/timeout 全部带上。
 #[no_mangle]
 pub extern "C" fn qi_http_request_execute(handle: i64) -> *mut c_char {
-    let mut 请求池 = 获取请求池().lock().unwrap();
-    if let Some(请求) = 请求池.remove(&handle) {
-        let 客户端 = 获取HTTP客户端().lock().unwrap();
-        match 客户端.execute(请求) {
-            Ok(响应) => match 响应.body_as_string() {
-                Ok(响应体) => crate::stdlib::qi_str::rc_cstr_from_string(响应体),
-                Err(_) => std::ptr::null_mut(),
-            },
-            Err(_) => std::ptr::null_mut(),
+    let 请求 = {
+        let mut 请求池 = 获取请求池().lock().unwrap();
+        请求池.remove(&handle)
+    };
+    let 请求 = match 请求 {
+        Some(r) => r,
+        None => return std::ptr::null_mut(),
+    };
+
+    let 结果 = (|| -> Result<String, String> {
+        let 客户端 = reqwest::blocking::Client::builder()
+            .timeout(请求.timeout)
+            .build()
+            .map_err(|e| format!("构建客户端失败: {}", e))?;
+        let 方法 = reqwest::Method::from_bytes(请求.method.as_str().as_bytes())
+            .unwrap_or(reqwest::Method::GET);
+        let mut 构建器 = 客户端.request(方法, &请求.url);
+        for (k, v) in 请求.headers.iter() {
+            构建器 = 构建器.header(k, v);
         }
-    } else {
-        std::ptr::null_mut()
+        if let Some(体) = 请求.body {
+            构建器 = 构建器.body(体);
+        }
+        let 响应 = 构建器.send().map_err(|e| format!("请求失败: {}", e))?;
+        响应.text().map_err(|e| format!("读取响应失败: {}", e))
+    })();
+
+    match 结果 {
+        Ok(响应体) => crate::stdlib::qi_str::rc_cstr_from_string(响应体),
+        Err(错误) => crate::stdlib::qi_str::rc_cstr_from_string(format!("HTTP错误: {}", 错误)),
     }
 }
 

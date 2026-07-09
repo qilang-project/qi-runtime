@@ -1083,6 +1083,56 @@ pub extern "C" fn qi_llm_get_history_count(session_handle: i64) -> i64 {
     -1
 }
 
+/// 获取整段对话历史（OpenAI 消息数组的 JSON 字符串）。
+///
+/// 历史里每条是 {"role":..,"content":..[, "tool_calls"/"tool_call_id"..]}。
+/// 上下文窗口管理（qi-harness 上下文 模块）靠它把历史读到 Qi 侧，数 token、
+/// 决定丢哪些/摘要哪些，再用 qi_llm_set_history_json 写回。
+///
+/// 会话不存在返回空数组 "[]"。返回串需 qi_llm_free_string 释放。
+#[no_mangle]
+pub extern "C" fn qi_llm_get_history_json(session_handle: i64) -> *mut c_char {
+    let 会话池 = 获取会话池().lock().unwrap();
+    let 文本 = if let Some(会话) = 会话池.get(&session_handle) {
+        Value::Array(会话.历史.clone()).to_string()
+    } else {
+        "[]".to_string()
+    };
+    crate::stdlib::qi_str::rc_cstr_from_string(文本)
+}
+
+/// 用一个 JSON 数组字符串**整体替换**对话历史。
+///
+/// 入参必须是消息对象数组（[{"role":..,"content":..}, ...]）。解析失败或不是
+/// 数组则不改动、返回 -1。成功返回替换后历史条数（>=0）。这是上下文压缩的写回口：
+/// Qi 侧构造「1 条摘要 system 消息 + 最近 M 条」的新数组塞回来即可。
+#[no_mangle]
+pub extern "C" fn qi_llm_set_history_json(
+    session_handle: i64,
+    history_json: *const c_char,
+) -> i64 {
+    if history_json.is_null() {
+        return -1;
+    }
+    let 文本 = unsafe { CStr::from_ptr(history_json) }.to_string_lossy().to_string();
+    let 解析: Value = match serde_json::from_str(&文本) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    let 新历史 = match 解析 {
+        Value::Array(a) => a,
+        _ => return -1,
+    };
+    let mut 会话池 = 获取会话池().lock().unwrap();
+    if let Some(会话) = 会话池.get_mut(&session_handle) {
+        let 条数 = 新历史.len() as i64;
+        会话.历史 = 新历史;
+        条数
+    } else {
+        -1
+    }
+}
+
 /// 关闭LLM会话
 ///
 /// 参数:
