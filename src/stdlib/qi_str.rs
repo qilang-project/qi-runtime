@@ -32,6 +32,7 @@
 #![allow(non_snake_case)]
 
 use std::alloc::{alloc, dealloc, Layout};
+use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
@@ -267,6 +268,25 @@ pub fn rc_cstr_from_str(s: &str) -> *mut c_char {
 #[inline]
 pub fn rc_cstr_from_string(s: String) -> *mut c_char {
     rc_cstr_from_bytes(s.as_bytes())
+}
+
+/// C FFI 边界：把一个裸 C 字符串（`*const c_char`，来自外部 C 库如 getenv）
+/// **拷贝**进一条 Qi 拥有的 RC 堆串，返回 data 指针（ptr-24 带 magic header，rc=1）。
+///
+/// 语义与安全：Qi 只拥有这份拷贝，按正常 ARC 释放；**原 C 内存一概不碰**
+/// （不 free、不改），因此 getenv 之类静态/借来的内存安全，C `malloc` 出来的原串
+/// 所有权仍归 C（用户用 `指针` 绑定 + 外部 free 手动回收）。null → immortal 空串。
+/// UTF-8 非法字节按 lossy 替换（U+FFFD），保证 QiStr 的 UTF-8 公约。
+#[no_mangle]
+pub extern "C" fn qi_string_from_cstr(p: *const c_char) -> *mut c_char {
+    if p.is_null() {
+        return rc_cstr_from_str("");
+    }
+    let bytes = unsafe { CStr::from_ptr(p).to_bytes() };
+    match std::str::from_utf8(bytes) {
+        Ok(s) => rc_cstr_from_str(s),
+        Err(_) => rc_cstr_from_string(String::from_utf8_lossy(bytes).into_owned()),
+    }
 }
 
 /// 增引用（C ABI）：null / magic 不符 / immortal 皆 no-op
