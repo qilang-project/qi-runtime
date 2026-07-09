@@ -48,6 +48,7 @@ pub mod system;
 pub mod test_ffi;
 pub mod vector;
 pub mod vector_ffi;
+pub mod vindex_ffi;
 pub mod web_ffi;
 
 // Re-export main components
