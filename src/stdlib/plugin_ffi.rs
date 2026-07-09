@@ -43,8 +43,19 @@ pub extern "C" fn qi_plugin_load(path: *const c_char) -> i64 {
     if path.is_null() {
         return 0;
     }
+    #[cfg(unix)]
     let handle = unsafe { libc::dlopen(path, libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    #[cfg(windows)]
+    let handle = unsafe { LoadLibraryA(path as *const u8) };
     handle as i64
+}
+
+// Windows 动态加载 API(kernel32)—— Unix dlopen/dlsym/dlclose 的对应。
+#[cfg(windows)]
+extern "system" {
+    fn LoadLibraryA(name: *const u8) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn FreeLibrary(module: *mut c_void) -> i32;
 }
 
 /// dlsym 取一个导出符号（函数）的地址，返回函数指针位模式（i64，0 = 失败）。
@@ -53,7 +64,10 @@ pub extern "C" fn qi_plugin_sym(handle: i64, name: *const c_char) -> i64 {
     if handle == 0 || name.is_null() {
         return 0;
     }
+    #[cfg(unix)]
     let sym = unsafe { libc::dlsym(handle as *mut c_void, name) };
+    #[cfg(windows)]
+    let sym = unsafe { GetProcAddress(handle as *mut c_void, name as *const u8) };
     sym as i64
 }
 
@@ -112,16 +126,37 @@ pub extern "C" fn qi_plugin_unload(handle: i64) -> i64 {
     if handle == 0 {
         return 0;
     }
-    unsafe { libc::dlclose(handle as *mut c_void) as i64 }
+    #[cfg(unix)]
+    unsafe {
+        libc::dlclose(handle as *mut c_void) as i64
+    }
+    #[cfg(windows)]
+    unsafe {
+        // FreeLibrary 成功返回非 0;转成"0=成功"与 dlclose 一致
+        if FreeLibrary(handle as *mut c_void) != 0 {
+            0
+        } else {
+            1
+        }
+    }
 }
 
 /// 最近一次 dl* 操作的错误文本（无错误返回空串）。诊断加载失败用。
 #[no_mangle]
 pub extern "C" fn qi_plugin_error() -> *mut c_char {
-    let e = unsafe { libc::dlerror() };
-    if e.is_null() {
-        return rc_cstr_from_str("");
+    #[cfg(unix)]
+    {
+        let e = unsafe { libc::dlerror() };
+        if e.is_null() {
+            return rc_cstr_from_str("");
+        }
+        let msg = unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned();
+        rc_cstr_from_str(&msg)
     }
-    let msg = unsafe { CStr::from_ptr(e) }.to_string_lossy().into_owned();
-    rc_cstr_from_str(&msg)
+    // Windows 无 dlerror 等价的线程级错误串;GetLastError 是错误码,
+    // 加载失败诊断走返回值(句柄 0)即可,错误文本返回空串。
+    #[cfg(windows)]
+    {
+        rc_cstr_from_str("")
+    }
 }
