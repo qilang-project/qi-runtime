@@ -20,6 +20,7 @@ pub mod exception_ffi;
 pub mod gui_ffi;
 pub mod hashmap;
 pub mod json_ffi;
+pub mod lexical_ffi;
 pub mod list;
 pub mod llm;
 pub mod llm_ffi;
