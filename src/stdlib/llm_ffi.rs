@@ -554,7 +554,7 @@ pub extern "C" fn qi_llm_create_session(
 #[no_mangle]
 pub extern "C" fn qi_llm_chat(session_handle: i64, prompt: *const c_char) -> *mut c_char {
     if prompt.is_null() {
-        return std::ptr::null_mut();
+        return 转为C字符串指针("LLM调用失败: 提示为空".to_string());
     }
 
     let mut 会话池 = 获取会话池().lock().unwrap();
@@ -585,7 +585,7 @@ pub extern "C" fn qi_llm_chat(session_handle: i64, prompt: *const c_char) -> *mu
         }
     }
 
-    std::ptr::null_mut()
+    转为C字符串指针("LLM调用失败: 无效会话句柄".to_string())
 }
 
 /// 打开流式 LLM 对话。
@@ -703,7 +703,7 @@ pub extern "C" fn qi_llm_stream_next(stream_handle: i64) -> *mut c_char {
         }
     }
 
-    std::ptr::null_mut()
+    转为C字符串指针("".to_string())
 }
 
 /// 关闭流式对话，并把已经收到的内容写入会话历史。
@@ -785,7 +785,7 @@ pub extern "C" fn qi_llm_chat_with_tools(
     prompt: *const c_char,
 ) -> *mut c_char {
     if prompt.is_null() {
-        return std::ptr::null_mut();
+        return 转为C字符串指针("LLM调用失败: 提示为空".to_string());
     }
 
     let mut 会话池 = 获取会话池().lock().unwrap();
@@ -806,7 +806,7 @@ pub extern "C" fn qi_llm_chat_with_tools(
         }
     }
 
-    std::ptr::null_mut()
+    转为C字符串指针("LLM调用失败: 无效会话句柄".to_string())
 }
 
 /// 添加工具结果后继续模型推理，返回 assistant message JSON。
@@ -823,7 +823,7 @@ pub extern "C" fn qi_llm_continue_with_tools(session_handle: i64) -> *mut c_char
         }
     }
 
-    std::ptr::null_mut()
+    转为C字符串指针("LLM调用失败: 无效会话句柄".to_string())
 }
 
 fn 解析工具调用(assistant_message_json: *const c_char) -> Option<Value> {
