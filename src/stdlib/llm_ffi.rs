@@ -52,6 +52,9 @@ struct LLM会话 {
     配置: HashMap<String, String>,
     /// 最近一次**非流式**请求的 token 用量 (prompt, completion, total)；未知/未请求为 0。
     最近用量: (i64, i64, i64),
+    /// 会话预算：token 上限（0 = 不限）与累计已用 total。超限后再调用直接拒绝（不打 API）。
+    预算上限: i64,
+    累计用量: i64,
 }
 
 impl LLM会话 {
@@ -74,7 +77,25 @@ impl LLM会话 {
             工具名称映射: HashMap::new(),
             配置: HashMap::new(),
             最近用量: (0, 0, 0),
+            预算上限: 0,
+            累计用量: 0,
         }
+    }
+
+    /// 预算闸：超限返回 Err（不打 API）。每次非流式调用前查。
+    fn 预算检查(&self) -> Result<(), String> {
+        if self.预算上限 > 0 && self.累计用量 >= self.预算上限 {
+            return Err(format!(
+                "预算超限: 已用 {} / 上限 {} tokens",
+                self.累计用量, self.预算上限
+            ));
+        }
+        Ok(())
+    }
+
+    /// 调用后记账：最近用量.total 累进 累计用量。
+    fn 预算记账(&mut self) {
+        self.累计用量 += self.最近用量.2;
     }
 
     /// 从响应体的 usage 字段提取 (prompt, completion, total) token 数；缺失为 0。
@@ -227,6 +248,7 @@ impl LLM会话 {
 
     /// 发送HTTP请求到LLM API（&mut：顺带记录本次 token 用量）
     fn 调用API(&mut self, 提示: &str) -> Result<String, String> {
+        self.预算检查()?;
         let 请求体 = self.构建请求体(提示, false, false);
         let 响应体: Value = self
             .发送请求体(请求体)?
@@ -234,12 +256,14 @@ impl LLM会话 {
             .map_err(|e| format!("解析响应失败: {}", e))?;
 
         self.最近用量 = Self::提取用量(&响应体);
+        self.预算记账();
         let 消息 = Self::提取消息(&响应体)?;
         Self::提取文本(&消息)
     }
 
     /// 带工具定义发送请求，返回完整 assistant message JSON（&mut：记录用量）
     fn 调用工具API(&mut self, 提示: &str) -> Result<Value, String> {
+        self.预算检查()?;
         let 请求体 = self.构建请求体(提示, false, true);
         let 响应体: Value = self
             .发送请求体(请求体)?
@@ -247,11 +271,13 @@ impl LLM会话 {
             .map_err(|e| format!("解析响应失败: {}", e))?;
 
         self.最近用量 = Self::提取用量(&响应体);
+        self.预算记账();
         Self::提取消息(&响应体)
     }
 
     /// 继续工具对话，通常在添加 tool 结果后调用（&mut：记录用量）
     fn 继续工具API(&mut self) -> Result<Value, String> {
+        self.预算检查()?;
         let 请求体 = self.构建继续请求体(true);
         let 响应体: Value = self
             .发送请求体(请求体)?
@@ -259,6 +285,7 @@ impl LLM会话 {
             .map_err(|e| format!("解析响应失败: {}", e))?;
 
         self.最近用量 = Self::提取用量(&响应体);
+        self.预算记账();
         Self::提取消息(&响应体)
     }
 
@@ -1169,6 +1196,29 @@ pub extern "C" fn qi_llm_set_history_json(
     } else {
         -1
     }
+}
+
+/// 设置会话 token 预算上限（0 = 取消限制）。设置后每次非流式调用自动累计 usage.total，
+/// 累计达到上限 → 后续调用**直接拒绝**（返回 "LLM调用失败: 预算超限..."，不打 API）。
+/// 返回 1 成功 / -1 会话不存在。
+#[no_mangle]
+pub extern "C" fn qi_llm_set_budget(session_handle: i64, limit: i64) -> i64 {
+    let mut 会话池 = 获取会话池().lock().unwrap();
+    if let Some(会话) = 会话池.get_mut(&session_handle) {
+        会话.预算上限 = limit.max(0);
+        return 1;
+    }
+    -1
+}
+
+/// 会话累计已用 token（预算记账值）。会话不存在 → 0。
+#[no_mangle]
+pub extern "C" fn qi_llm_budget_used(session_handle: i64) -> i64 {
+    let 会话池 = 获取会话池().lock().unwrap();
+    会话池
+        .get(&session_handle)
+        .map(|s| s.累计用量)
+        .unwrap_or(0)
 }
 
 /// 最近一次非流式请求的 token 用量，返回 JSON 串 {"prompt":..,"completion":..,"total":..}。
