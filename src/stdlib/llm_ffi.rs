@@ -1320,16 +1320,19 @@ pub extern "C" fn qi_llm_chat_async(session_handle: i64, prompt: *const c_char) 
             }
         };
 
-        // 创建一个 pending Future
-        let future_state = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::async_runtime::future::FutureState::Pending,
-        ));
-        let future_value = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let future_error = std::sync::Arc::new(std::sync::Mutex::new(None));
-
-        let state_clone = future_state.clone();
-        let value_clone = future_value.clone();
-        let error_clone = future_error.clone();
+        // 创建一个 pending Future。
+        // 完成/失败必须走 complete()/fail() —— 它们会 fire notify + sm_wakers。
+        // （旧实现手工翻 state/value Arc，notify 在 spawn 之后另建、没传进线程：
+        //   HTTP 完成时无人被唤醒，等待 只要在完成前开始就永远 park —— lost wakeup。
+        //   并行扇出「先发后等」必踩。）
+        let future = Box::new(Future::pending());
+        let 完成端 = Future {
+            state: future.state.clone(),
+            value: future.value.clone(),
+            error: future.error.clone(),
+            notify: future.notify.clone(),
+            sm_wakers: future.sm_wakers.clone(),
+        };
 
         // 在后台线程中执行 HTTP 请求
         thread::spawn(move || {
@@ -1350,29 +1353,14 @@ pub extern "C" fn qi_llm_chat_async(session_handle: i64, prompt: *const c_char) 
                         }
                     }
 
-                    // 更新 Future 状态
-                    *value_clone.lock().unwrap() = Some(
-                        crate::async_runtime::future::FutureValue::String(响应),
-                    );
-                    *state_clone.lock().unwrap() =
-                        crate::async_runtime::future::FutureState::Completed;
+                    完成端.complete(crate::async_runtime::future::FutureValue::String(响应));
                 }
                 Err(错误) => {
-                    *error_clone.lock().unwrap() = Some(format!("LLM异步调用失败: {}", 错误));
-                    *state_clone.lock().unwrap() =
-                        crate::async_runtime::future::FutureState::Failed;
+                    完成端.fail(format!("LLM异步调用失败: {}", 错误));
                 }
             }
         });
 
-        // 返回 Future 指针
-        let future = Box::new(Future {
-            state: future_state,
-            value: future_value,
-            error: future_error,
-            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-            sm_wakers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        });
         Box::into_raw(future)
     }
 }
