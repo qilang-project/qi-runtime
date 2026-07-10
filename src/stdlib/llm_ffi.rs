@@ -246,14 +246,47 @@ impl LLM会话 {
             .to_string())
     }
 
-    /// 发送HTTP请求到LLM API（&mut：顺带记录本次 token 用量）
-    fn 调用API(&mut self, 提示: &str) -> Result<String, String> {
-        self.预算检查()?;
-        let 请求体 = self.构建请求体(提示, false, false);
+    /// 请求→响应体 Value，中间夹一层**磁带（录制/回放）**：
+    /// - QI_LLM_REPLAY=1：不打 API，按请求哈希从磁带取缓存响应（miss → Err）。
+    ///   让 agent 代码可确定性、离线、免费地跑测试/CI。
+    /// - QI_LLM_CACHE=1：命中磁带则直接返回（省重复计费），未命中真调 API 并写回磁带。
+    /// - QI_LLM_RECORD=1：总是真调 API，把 请求→响应 落磁带（供日后回放）。
+    /// 磁带文件路径由 QI_LLM_TAPE 指定（默认 ./llm_tape.json）。流式不走此路（另说明）。
+    fn 请求响应(&self, 请求体: Value) -> Result<Value, String> {
+        let 键 = 磁带::请求键(&请求体);
+        let 回放 = 环境开(&["QI_LLM_REPLAY"]);
+        let 缓存 = 环境开(&["QI_LLM_CACHE"]);
+        let 录制 = 环境开(&["QI_LLM_RECORD"]);
+
+        if 回放 || 缓存 {
+            if let Some(v) = 磁带::取(&键) {
+                return Ok(v);
+            }
+            if 回放 {
+                return Err(format!(
+                    "磁带回放未命中(QI_LLM_REPLAY)：无此请求的录制。键={}。先用 QI_LLM_RECORD=1 录制。",
+                    &键[..键.len().min(16)]
+                ));
+            }
+            // 缓存模式 miss：继续真调，下面会写回
+        }
+
         let 响应体: Value = self
             .发送请求体(请求体)?
             .json()
             .map_err(|e| format!("解析响应失败: {}", e))?;
+
+        if 录制 || 缓存 {
+            磁带::存(&键, &响应体);
+        }
+        Ok(响应体)
+    }
+
+    /// 发送HTTP请求到LLM API（&mut：顺带记录本次 token 用量）
+    fn 调用API(&mut self, 提示: &str) -> Result<String, String> {
+        self.预算检查()?;
+        let 请求体 = self.构建请求体(提示, false, false);
+        let 响应体 = self.请求响应(请求体)?;
 
         self.最近用量 = Self::提取用量(&响应体);
         self.预算记账();
@@ -265,10 +298,7 @@ impl LLM会话 {
     fn 调用工具API(&mut self, 提示: &str) -> Result<Value, String> {
         self.预算检查()?;
         let 请求体 = self.构建请求体(提示, false, true);
-        let 响应体: Value = self
-            .发送请求体(请求体)?
-            .json()
-            .map_err(|e| format!("解析响应失败: {}", e))?;
+        let 响应体 = self.请求响应(请求体)?;
 
         self.最近用量 = Self::提取用量(&响应体);
         self.预算记账();
@@ -279,10 +309,7 @@ impl LLM会话 {
     fn 继续工具API(&mut self) -> Result<Value, String> {
         self.预算检查()?;
         let 请求体 = self.构建继续请求体(true);
-        let 响应体: Value = self
-            .发送请求体(请求体)?
-            .json()
-            .map_err(|e| format!("解析响应失败: {}", e))?;
+        let 响应体 = self.请求响应(请求体)?;
 
         self.最近用量 = Self::提取用量(&响应体);
         self.预算记账();
@@ -1347,5 +1374,74 @@ pub extern "C" fn qi_llm_chat_async(session_handle: i64, prompt: *const c_char) 
             sm_wakers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         });
         Box::into_raw(future)
+    }
+}
+
+// ───────────────── LLM 磁带（录制 / 回放 / 缓存） ─────────────────
+//
+// 把 请求→响应 落到一个 JSON 文件，键 = 规范化请求体的哈希。核心价值：
+// LLM 的非确定性让 agent 代码没法测；回放模式下同一请求返回同一录制响应 ——
+// 测试可断言、CI 可跑、离线免费。零语法改动，全靠环境变量开关（见 请求响应）。
+
+/// 环境变量任一为 "1"/"true"/"yes"（大小写不敏感）则视为开。
+fn 环境开(名单: &[&str]) -> bool {
+    名单.iter().any(|k| {
+        std::env::var(k)
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes" || v == "on"
+            })
+            .unwrap_or(false)
+    })
+}
+
+mod 磁带 {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::sync::OnceLock;
+
+    static 磁带内容: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
+
+    fn 路径() -> String {
+        std::env::var("QI_LLM_TAPE").unwrap_or_else(|_| "llm_tape.json".to_string())
+    }
+
+    /// 首次访问时从磁带文件加载到内存（文件不存在 → 空表）。
+    fn 内容() -> &'static Mutex<HashMap<String, Value>> {
+        磁带内容.get_or_init(|| {
+            let map = std::fs::read_to_string(路径())
+                .ok()
+                .and_then(|s| serde_json::from_str::<HashMap<String, Value>>(&s).ok())
+                .unwrap_or_default();
+            Mutex::new(map)
+        })
+    }
+
+    /// 规范化请求体 → 稳定键。序列化后哈希（serde_json 默认 Map 有序，故稳定）；
+    /// 剔除 stream 字段（录制走非流式，避免流式/非流式互相污染键空间）。
+    pub fn 请求键(请求体: &Value) -> String {
+        let mut v = 请求体.clone();
+        if let Value::Object(ref mut m) = v {
+            m.remove("stream");
+        }
+        let s = serde_json::to_string(&v).unwrap_or_default();
+        let mut h = DefaultHasher::new();
+        s.hash(&mut h);
+        format!("{:016x}", h.finish())
+    }
+
+    pub fn 取(键: &str) -> Option<Value> {
+        内容().lock().unwrap().get(键).cloned()
+    }
+
+    /// 存入内存并即时落盘（测试量级下整写没问题；漂亮打印方便人读 diff）。
+    pub fn 存(键: &str, 响应体: &Value) {
+        let mut m = 内容().lock().unwrap();
+        m.insert(键.to_string(), 响应体.clone());
+        if let Ok(s) = serde_json::to_string_pretty(&*m) {
+            let _ = std::fs::write(路径(), s);
+        }
     }
 }
