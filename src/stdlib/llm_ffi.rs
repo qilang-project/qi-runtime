@@ -6,8 +6,8 @@
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::ffi::CStr;
 use std::error::Error as _;
+use std::ffi::CStr;
 use std::io::Read;
 use std::os::raw::c_char;
 use std::sync::{Mutex, OnceLock};
@@ -607,13 +607,13 @@ impl LLM会话 {
             }
         }
 
-        let 响应 = 请求构建器
-            .json(&请求体)
-            .send()
-            .map_err(|e| {
-                let 根因 = e.source().map(|s| format!("（根因: {}）", s)).unwrap_or_default();
-                format!("HTTP请求失败: {}{}", e, 根因)
-            })?;
+        let 响应 = 请求构建器.json(&请求体).send().map_err(|e| {
+            let 根因 = e
+                .source()
+                .map(|s| format!("（根因: {}）", s))
+                .unwrap_or_default();
+            format!("HTTP请求失败: {}{}", e, 根因)
+        })?;
 
         if !响应.status().is_success() {
             let 状态码 = 响应.status();
@@ -730,7 +730,8 @@ impl LLM会话 {
     ///   让 agent 代码可确定性、离线、免费地跑测试/CI。
     /// - QI_LLM_CACHE=1：命中磁带则直接返回（省重复计费），未命中真调 API 并写回磁带。
     /// - QI_LLM_RECORD=1：总是真调 API，把 请求→响应 落磁带（供日后回放）。
-    /// 磁带文件路径由 QI_LLM_TAPE 指定（默认 ./llm_tape.json）。流式不走此路（另说明）。
+    /// 磁带文件路径由 QI_LLM_TAPE 指定（默认 ./llm_tape.json）。流式走同一磁带文件，
+    /// 但键加 "stream:" 前缀、值存内容块列表（见 打开流带磁带 / 流式磁带落盘）。
     fn 请求响应(&self, 请求体: Value) -> Result<Value, String> {
         let 键 = 磁带::请求键(&请求体);
         let 回放 = 环境开(&["QI_LLM_REPLAY"]);
@@ -815,31 +816,13 @@ impl LLM会话 {
         self.预算记账();
         self.提取消息(&响应体)
     }
-
-    /// 打开流式响应
-    fn 打开流(&self, 提示: &str) -> Result<reqwest::blocking::Response, String> {
-        let 请求体 = self.构建请求体(提示, true, false);
-        self.发送请求体(请求体)
-    }
-
-    /// 流式 + 工具：流式请求里带上 tools，模型可在流中吐 tool_calls。
-    fn 打开流带工具(&self, 提示: &str) -> Result<reqwest::blocking::Response, String> {
-        let 请求体 = self.构建请求体(提示, true, true);
-        self.发送请求体(请求体)
-    }
-
-    /// 工具结果回写后，流式继续推理（仍带 tools，可继续调工具或给最终答复）。
-    fn 打开续传流(&self) -> Result<reqwest::blocking::Response, String> {
-        let mut 请求体 = self.构建继续请求体(true);
-        请求体["stream"] = json!(true);
-        self.发送请求体(请求体)
-    }
 }
 
 struct LLM流 {
     会话句柄: i64,
     提示: String,
-    响应: reqwest::blocking::Response,
+    /// 真流有 HTTP 响应；磁带回放流没有（None），块在创建时灌入 待返回。
+    响应: Option<reqwest::blocking::Response>,
     缓冲: String,
     待返回: VecDeque<String>,
     完成: bool,
@@ -849,13 +832,17 @@ struct LLM流 {
     带工具: bool,
     是续传: bool,
     工具分块: Vec<(String, String, String)>,
+    // 流式磁带：磁带键 Some = 录制中（RECORD/CACHE 真调路径），读出的每个内容片段
+    // 进 录制块，关流且读尽时整体落盘（见 流式磁带落盘）。回放流两者都不用。
+    磁带键: Option<String>,
+    录制块: Vec<String>,
 }
 
 impl LLM流 {
     fn 创建(
         会话句柄: i64,
         提示: String,
-        响应: reqwest::blocking::Response,
+        响应: Option<reqwest::blocking::Response>,
         带工具: bool,
         是续传: bool,
     ) -> Self {
@@ -870,13 +857,36 @@ impl LLM流 {
             带工具,
             是续传,
             工具分块: Vec::new(),
+            磁带键: None,
+            录制块: Vec::new(),
         }
+    }
+
+    /// 磁带回放流：不打 HTTP。录制的内容块整队灌入 待返回，工具分块直接恢复；
+    /// 完成 置真 → 读取下个片段 逐块 pop，队列见底返回 None（与真流行为一致），
+    /// 关流照常走 保存流历史（多轮课件的会话历史不断裂）。
+    fn 创建回放(
+        会话句柄: i64,
+        提示: String,
+        块列表: Vec<String>,
+        工具调用: Vec<(String, String, String)>,
+        带工具: bool,
+        是续传: bool,
+    ) -> Self {
+        let mut 流 = Self::创建(会话句柄, 提示, None, 带工具, 是续传);
+        流.待返回 = 块列表.into();
+        流.工具分块 = 工具调用;
+        流.完成 = true;
+        流
     }
 
     fn 读取下个片段(&mut self) -> Result<Option<String>, String> {
         loop {
             if let Some(片段) = self.待返回.pop_front() {
                 self.累计.push_str(&片段);
+                if self.磁带键.is_some() {
+                    self.录制块.push(片段.clone());
+                }
                 return Ok(Some(片段));
             }
 
@@ -884,9 +894,17 @@ impl LLM流 {
                 return Ok(None);
             }
 
+            let 响应 = match self.响应.as_mut() {
+                Some(响应) => 响应,
+                None => {
+                    // 回放流无 HTTP 响应；正常情况下 完成 已为真，不会走到这。
+                    self.完成 = true;
+                    return Ok(None);
+                }
+            };
+
             let mut 字节 = [0u8; 4096];
-            let 数量 = self
-                .响应
+            let 数量 = 响应
                 .read(&mut 字节)
                 .map_err(|e| format!("读取流失败: {}", e))?;
 
@@ -1059,6 +1077,130 @@ fn 保存流历史(流: &LLM流) {
     }
 }
 
+// ── 流式磁带（三个流式入口共用） ──
+
+/// 流式磁带键：请求键 已剔除 stream 字段，同一请求体的流式/非流式会同键——
+/// 加 "stream:" 前缀把两个键空间隔离（非流式存整响应 JSON，流式存块列表）。
+fn 流式磁带键(请求体: &Value) -> String {
+    format!("stream:{}", 磁带::请求键(请求体))
+}
+
+/// 磁带值 → (内容块列表, 工具分块)。两种形状：
+/// - 纯文本流：["块", ...]
+/// - 工具流：{"chunks": [...], "tool_calls": [OpenAI tool_call, ...]}
+fn 解析流式磁带值(值: &Value) -> (Vec<String>, Vec<(String, String, String)>) {
+    fn 取块(v: &Value) -> Vec<String> {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    match 值 {
+        Value::Array(_) => (取块(值), Vec::new()),
+        Value::Object(m) => {
+            let 块 = m.get("chunks").map(取块).unwrap_or_default();
+            let 调用 = m
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|c| {
+                            let 函数 = c.get("function");
+                            (
+                                c.get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                函数
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                函数
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (块, 调用)
+        }
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+/// 打开流的磁带闸（与非流式 请求响应 的开关语义一致）：
+/// - QI_LLM_REPLAY / QI_LLM_CACHE 命中 → 回放流，不打 HTTP；
+/// - QI_LLM_REPLAY 未命中 → Err（含"磁带回放未命中"）；
+/// - 否则真调 HTTP；QI_LLM_RECORD / QI_LLM_CACHE 下装上 磁带键，关流时落盘。
+fn 打开流带磁带(
+    会话: &LLM会话,
+    会话句柄: i64,
+    提示: String,
+    请求体: Value,
+    带工具: bool,
+    是续传: bool,
+) -> Result<LLM流, String> {
+    let 键 = 流式磁带键(&请求体);
+    let 回放 = 环境开(&["QI_LLM_REPLAY"]);
+    let 缓存 = 环境开(&["QI_LLM_CACHE"]);
+    let 录制 = 环境开(&["QI_LLM_RECORD"]);
+
+    if 回放 || 缓存 {
+        if let Some(值) = 磁带::取(&键) {
+            let (块列表, 工具调用) = 解析流式磁带值(&值);
+            return Ok(LLM流::创建回放(
+                会话句柄,
+                提示,
+                块列表,
+                工具调用,
+                带工具,
+                是续传,
+            ));
+        }
+        if 回放 {
+            return Err(format!(
+                "流式磁带回放未命中(QI_LLM_REPLAY)：无此请求的录制。键={}。先用 QI_LLM_RECORD=1 录制。",
+                &键[..键.len().min(23)]
+            ));
+        }
+        // 缓存模式 miss：继续真调，关流时写回
+    }
+
+    let 响应 = 会话.发送请求体(请求体)?;
+    let mut 流 = LLM流::创建(会话句柄, 提示, Some(响应), 带工具, 是续传);
+    if 录制 || 缓存 {
+        流.磁带键 = Some(键);
+    }
+    Ok(流)
+}
+
+/// 录制模式关流时把整条流落盘。只在流读尽（完成）时写——半途关流不录，
+/// 避免磁带里存下截断的回答。纯文本流存块数组；工具流连 tool_calls 一起存，
+/// 回放时 组装助手消息 / 保存流历史 才能复原完整 assistant 消息。
+fn 流式磁带落盘(流: &LLM流) {
+    let Some(键) = &流.磁带键 else { return };
+    if !流.完成 {
+        return;
+    }
+    let 值 = if 流.带工具 {
+        let mut 对象 = json!({ "chunks": 流.录制块 });
+        if let Some(调用) = 流.组装助手消息().get("tool_calls") {
+            对象["tool_calls"] = 调用.clone();
+        }
+        对象
+    } else {
+        json!(流.录制块)
+    };
+    磁带::存(键, &值);
+}
+
 /// 创建LLM会话
 ///
 /// 参数:
@@ -1192,9 +1334,9 @@ pub extern "C" fn qi_llm_chat_image(
     转为C字符串指针("LLM调用失败: 无效会话句柄".to_string())
 }
 
-/// 打开流式 LLM 对话。
+/// 打开流式 LLM 对话。走磁带闸（见 打开流带磁带）：回放/缓存命中不打 HTTP。
 ///
-/// 返回: 流句柄 (>0 成功, <0 失败)
+/// 返回: 流句柄 (>0 成功, <0 失败；失败原因打到 stderr)
 #[no_mangle]
 pub extern "C" fn qi_llm_stream_chat(session_handle: i64, prompt: *const c_char) -> i64 {
     if prompt.is_null() {
@@ -1212,9 +1354,14 @@ pub extern "C" fn qi_llm_stream_chat(session_handle: i64, prompt: *const c_char)
             }
         };
 
-        let 响应 = match 会话克隆.打开流(&提示) {
-            Ok(响应) => 响应,
-            Err(_) => return -1,
+        let 请求体 = 会话克隆.构建请求体(&提示, true, false);
+        let 流 = match 打开流带磁带(&会话克隆, session_handle, 提示, 请求体, false, false)
+        {
+            Ok(流) => 流,
+            Err(错误) => {
+                eprintln!("流式对话失败: {}", 错误);
+                return -1;
+            }
         };
 
         let mut 计数器 = 获取流计数器().lock().unwrap();
@@ -1222,10 +1369,7 @@ pub extern "C" fn qi_llm_stream_chat(session_handle: i64, prompt: *const c_char)
         let 流句柄 = *计数器;
 
         let mut 流池 = 获取流池().lock().unwrap();
-        流池.insert(
-            流句柄,
-            LLM流::创建(session_handle, 提示, 响应, false, false),
-        );
+        流池.insert(流句柄, 流);
 
         流句柄
     }
@@ -1247,9 +1391,14 @@ pub extern "C" fn qi_llm_stream_chat_with_tools(session_handle: i64, prompt: *co
                 None => return -1,
             }
         };
-        let 响应 = match 会话克隆.打开流带工具(&提示) {
-            Ok(响应) => 响应,
-            Err(_) => return -1,
+        let 请求体 = 会话克隆.构建请求体(&提示, true, true);
+        let 流 = match 打开流带磁带(&会话克隆, session_handle, 提示, 请求体, true, false)
+        {
+            Ok(流) => 流,
+            Err(错误) => {
+                eprintln!("流式工具对话失败: {}", 错误);
+                return -1;
+            }
         };
         let 流句柄 = {
             let mut 计数器 = 获取流计数器().lock().unwrap();
@@ -1257,7 +1406,7 @@ pub extern "C" fn qi_llm_stream_chat_with_tools(session_handle: i64, prompt: *co
             *计数器
         };
         let mut 流池 = 获取流池().lock().unwrap();
-        流池.insert(流句柄, LLM流::创建(session_handle, 提示, 响应, true, false));
+        流池.insert(流句柄, 流);
         流句柄
     }
 }
@@ -1272,9 +1421,15 @@ pub extern "C" fn qi_llm_stream_continue_with_tools(session_handle: i64) -> i64 
             None => return -1,
         }
     };
-    let 响应 = match 会话克隆.打开续传流() {
-        Ok(响应) => 响应,
-        Err(_) => return -1,
+    let mut 请求体 = 会话克隆.构建继续请求体(true);
+    请求体["stream"] = json!(true);
+    let 流 = match 打开流带磁带(&会话克隆, session_handle, String::new(), 请求体, true, true)
+    {
+        Ok(流) => 流,
+        Err(错误) => {
+            eprintln!("流式续传失败: {}", 错误);
+            return -1;
+        }
     };
     let 流句柄 = {
         let mut 计数器 = 获取流计数器().lock().unwrap();
@@ -1282,10 +1437,7 @@ pub extern "C" fn qi_llm_stream_continue_with_tools(session_handle: i64) -> i64 
         *计数器
     };
     let mut 流池 = 获取流池().lock().unwrap();
-    流池.insert(
-        流句柄,
-        LLM流::创建(session_handle, String::new(), 响应, true, true),
-    );
+    流池.insert(流句柄, 流);
     流句柄
 }
 
@@ -1317,6 +1469,7 @@ pub extern "C" fn qi_llm_stream_next(stream_handle: i64) -> *mut c_char {
 }
 
 /// 关闭流式对话，并把已经收到的内容写入会话历史。
+/// 录制模式（QI_LLM_RECORD/CACHE 真调路径）在此把整条流落盘到磁带。
 #[no_mangle]
 pub extern "C" fn qi_llm_stream_close(stream_handle: i64) -> i64 {
     let 流 = {
@@ -1325,6 +1478,7 @@ pub extern "C" fn qi_llm_stream_close(stream_handle: i64) -> i64 {
     };
 
     if let Some(流) = 流 {
+        流式磁带落盘(&流);
         保存流历史(&流);
         return 1;
     }
@@ -1964,7 +2118,8 @@ mod 磁带 {
     }
 
     /// 规范化请求体 → 稳定键。序列化后哈希（serde_json 默认 Map 有序，故稳定）；
-    /// 剔除 stream 字段（录制走非流式，避免流式/非流式互相污染键空间）。
+    /// 剔除 stream 字段（键只由内容决定）。流式录制/回放在此键上再加 "stream:"
+    /// 前缀（见 流式磁带键），与非流式键空间隔离——两者的值形状不同。
     pub fn 请求键(请求体: &Value) -> String {
         let mut v = 请求体.clone();
         if let Value::Object(ref mut m) = v {
@@ -2274,5 +2429,83 @@ mod tests {
             assert_eq!(池.get(&句柄).unwrap().提供商, "anthropic"); // 大小写归一
         }
         qi_llm_close_session(句柄);
+    }
+
+    // ── 流式磁带（录制/回放，不打网络） ──
+
+    #[test]
+    fn 流式磁带_键空间与非流式隔离() {
+        let 请求体 = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "打字机"}],
+            "stream": true
+        });
+        let 流键 = 流式磁带键(&请求体);
+        assert!(流键.starts_with("stream:"));
+        // 前缀之外与非流式键一致（请求键 已剔 stream 字段）
+        assert_eq!(&流键["stream:".len()..], 磁带::请求键(&请求体));
+        assert_ne!(流键, 磁带::请求键(&请求体));
+    }
+
+    #[test]
+    fn 流式磁带_录制回放_roundtrip() {
+        // 磁带指到临时文件，避免污染工作目录
+        let 临时 = std::env::temp_dir().join(format!(
+            "qi_llm_stream_tape_test_{}.json",
+            std::process::id()
+        ));
+        std::env::set_var("QI_LLM_TAPE", &临时);
+
+        let 请求体 = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "夸夸小朋友"}],
+            "stream": true
+        });
+        let 键 = 流式磁带键(&请求体);
+        // 手工「录制」：存一条流式块列表
+        磁带::存(&键, &json!(["你好", "，", "世界"]));
+
+        // 「回放」：取出 → 解析 → 回放流逐块吐出、尽头 None
+        let 值 = 磁带::取(&键).expect("磁带应命中");
+        let (块列表, 工具调用) = 解析流式磁带值(&值);
+        assert!(工具调用.is_empty());
+        let mut 流 = LLM流::创建回放(1, "夸夸小朋友".into(), 块列表, 工具调用, false, false);
+        assert_eq!(流.读取下个片段().unwrap(), Some("你好".to_string()));
+        assert_eq!(流.读取下个片段().unwrap(), Some("，".to_string()));
+        assert_eq!(流.读取下个片段().unwrap(), Some("世界".to_string()));
+        assert_eq!(流.读取下个片段().unwrap(), None);
+        assert_eq!(流.读取下个片段().unwrap(), None, "尽头应稳定返回 None");
+        // 累计 拼好完整内容（保存流历史 依赖它写会话历史）
+        assert_eq!(流.累计, "你好，世界");
+
+        let _ = std::fs::remove_file(&临时);
+    }
+
+    #[test]
+    fn 流式磁带_工具流回放_恢复tool_calls() {
+        let 值 = json!({
+            "chunks": ["我来查查"],
+            "tool_calls": [{
+                "id": "tc_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"东京\"}"}
+            }]
+        });
+        let (块列表, 工具调用) = 解析流式磁带值(&值);
+        assert_eq!(工具调用.len(), 1);
+        let mut 流 = LLM流::创建回放(1, "东京天气".into(), 块列表, 工具调用, true, false);
+        assert_eq!(流.读取下个片段().unwrap(), Some("我来查查".to_string()));
+        assert_eq!(流.读取下个片段().unwrap(), None);
+        let 消息 = 流.组装助手消息();
+        assert_eq!(消息["content"], json!("我来查查"));
+        assert_eq!(消息["tool_calls"][0]["id"], json!("tc_1"));
+        assert_eq!(
+            消息["tool_calls"][0]["function"]["name"],
+            json!("get_weather")
+        );
+        assert_eq!(
+            消息["tool_calls"][0]["function"]["arguments"],
+            json!("{\"city\":\"东京\"}")
+        );
     }
 }
