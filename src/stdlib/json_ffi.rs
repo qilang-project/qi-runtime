@@ -934,3 +934,71 @@ pub extern "C" fn qi_json_enum_tag(names: *const c_char, value: *const c_char) -
     }
     0
 }
+
+// ───────── JSON 数组 → Qi 原生数组（询问::<T> 数组字段反序列化用） ─────────
+//
+// Qi 数组布局（与 codegen 数组字面量同构）：ptr → [长度:i64][elem0:8B][elem1:8B]...
+// 本体 qi_obj_alloc(rc=1) 交出（OWNED）；字符串元素每个 rc_cstr(rc=1)，
+// 数组释放时按元素类型级联回收。缺键/非数组/元素类型不符 → 空数组(len=0)，绝不 null。
+
+fn 新建qi数组(槽: &[i64]) -> *mut std::os::raw::c_void {
+    let n = 槽.len();
+    let p = super::rc_obj::qi_obj_alloc(((n + 1) * 8) as i64);
+    unsafe {
+        *(p as *mut i64) = n as i64;
+        std::ptr::copy_nonoverlapping(槽.as_ptr(), (p as *mut i64).add(1), n);
+    }
+    p as *mut std::os::raw::c_void
+}
+
+fn 取字段数组(obj_id: i64, key: *const c_char) -> Option<Vec<Value>> {
+    if obj_id <= 0 || key.is_null() {
+        return None;
+    }
+    let key_str = unsafe { CStr::from_ptr(key) }.to_str().ok()?.to_string();
+    let storage = JSON_VALUES.lock().unwrap();
+    if let Some(ref map) = *storage {
+        if let Some(Value::Object(ref obj)) = map.get(&(obj_id as u64)) {
+            if let Some(Value::Array(ref a)) = obj.get(&key_str) {
+                return Some(a.clone());
+            }
+        }
+    }
+    None
+}
+
+/// 对象字段(JSON 数组) → Qi 字符串数组。非字符串元素按其 JSON 文本序列化。
+#[no_mangle]
+pub extern "C" fn qi_json_field_str_array(obj_id: i64, key: *const c_char) -> *mut std::os::raw::c_void {
+    let a = 取字段数组(obj_id, key).unwrap_or_default();
+    let 槽: Vec<i64> = a
+        .iter()
+        .map(|v| {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            crate::stdlib::qi_str::rc_cstr_from_str(&s) as i64
+        })
+        .collect();
+    新建qi数组(&槽)
+}
+
+/// 对象字段(JSON 数组) → Qi 整数数组。非整数元素按 0。
+#[no_mangle]
+pub extern "C" fn qi_json_field_int_array(obj_id: i64, key: *const c_char) -> *mut std::os::raw::c_void {
+    let a = 取字段数组(obj_id, key).unwrap_or_default();
+    let 槽: Vec<i64> = a.iter().map(|v| v.as_i64().unwrap_or(0)).collect();
+    新建qi数组(&槽)
+}
+
+/// 对象字段(JSON 数组) → Qi 浮点数组。非数字元素按 0.0。
+#[no_mangle]
+pub extern "C" fn qi_json_field_float_array(obj_id: i64, key: *const c_char) -> *mut std::os::raw::c_void {
+    let a = 取字段数组(obj_id, key).unwrap_or_default();
+    let 槽: Vec<i64> = a
+        .iter()
+        .map(|v| v.as_f64().unwrap_or(0.0).to_bits() as i64)
+        .collect();
+    新建qi数组(&槽)
+}
