@@ -7,6 +7,7 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
+use std::error::Error as _;
 use std::io::Read;
 use std::os::raw::c_char;
 use std::sync::{Mutex, OnceLock};
@@ -571,7 +572,18 @@ impl LLM会话 {
     fn 发送请求体(&self, 请求体: Value) -> Result<reqwest::blocking::Response, String> {
         use reqwest::blocking::Client;
 
-        let 客户端 = Client::new();
+        // reqwest blocking Client::new() 默认 30s 总超时 —— reasoning 模型答长问题
+        // 轻松超过（症状：error sending request）。默认放宽到 180s，可用
+        // 设置配置(会话, "timeout_secs", "N") 调整。
+        let 超时秒 = self
+            .配置
+            .get("timeout_secs")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(180);
+        let 客户端 = Client::builder()
+            .timeout(std::time::Duration::from_secs(超时秒))
+            .build()
+            .map_err(|e| format!("HTTP客户端构建失败: {}", e))?;
         let mut 请求构建器 = 客户端
             .post(self.请求端点())
             .header("Content-Type", "application/json");
@@ -598,7 +610,10 @@ impl LLM会话 {
         let 响应 = 请求构建器
             .json(&请求体)
             .send()
-            .map_err(|e| format!("HTTP请求失败: {}", e))?;
+            .map_err(|e| {
+                let 根因 = e.source().map(|s| format!("（根因: {}）", s)).unwrap_or_default();
+                format!("HTTP请求失败: {}{}", e, 根因)
+            })?;
 
         if !响应.status().is_success() {
             let 状态码 = 响应.status();
