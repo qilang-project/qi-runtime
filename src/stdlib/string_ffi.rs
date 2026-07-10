@@ -103,7 +103,20 @@ pub extern "C" fn qi_string_substring(
             return empty_c_string();
         }
 
-        let end = std::cmp::min(start + length, text.len());
+        let mut end = std::cmp::min(start + length, text.len());
+        // 防御：start/end 落在多字节字符中间时，直接 &text[start..end] 会 panic（
+        // non-unwinding，直接 abort 掉用户程序）。把边界向内收缩到最近的 UTF-8 字符边界，
+        // 保证切片安全（宁可少切一两个字节，也绝不 abort）。
+        let mut start = start;
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if start >= end {
+            return empty_c_string();
+        }
         let substring = &text[start..end];
 
         crate::stdlib::qi_str::rc_cstr_from_str(substring)

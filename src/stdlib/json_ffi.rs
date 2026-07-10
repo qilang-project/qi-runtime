@@ -913,3 +913,22 @@ mod tests {
         qi_json_free(obj_id);
     }
 }
+
+/// 枚举序号：在逗号分隔的候选名 `names` 里找 `value` 的下标（0 起）。
+/// 用于 `询问::<T>` 反序列化枚举字段——无载荷枚举的值就是变体序号(tag)。
+/// 找不到返回 0（默认落到第一个变体，比 -1 安全：-1 不是合法 tag）。
+#[no_mangle]
+pub extern "C" fn qi_json_enum_tag(names: *const c_char, value: *const c_char) -> i64 {
+    if names.is_null() || value.is_null() {
+        return 0;
+    }
+    let names = unsafe { CStr::from_ptr(names) }.to_string_lossy();
+    let value = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+    let v = value.trim();
+    for (i, n) in names.split(',').enumerate() {
+        if n.trim() == v {
+            return i as i64;
+        }
+    }
+    0
+}
