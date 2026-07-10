@@ -55,6 +55,41 @@ fn clo_layout(size: usize) -> Layout {
     Layout::from_size_align(HEADER_SIZE + size, 8).expect("invalid closure layout")
 }
 
+/// 无捕获顶层函数「取址为值」的**不朽单例**闭包缓存：fn_ptr → 闭包 data 指针。
+/// 顶层函数当值（存进指针列表 / 传参）无捕获无状态，本可全程序共享一个。每次引用都
+/// 新建会泄漏（存进列表无人释放，图/工具注册表踩过）；缓存 + 不朽(refcount=IMMORTAL)
+/// 解决：首次建一个不朽闭包并缓存，后续复用；不朽 → retain/release no-op、永不释放、
+/// **不计入 diag 泄漏计数**（等价 immortal 字符串字面量）。
+static 不朽闭包缓存: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
+    std::sync::OnceLock::new();
+
+#[no_mangle]
+pub extern "C" fn qi_closure_intern(fn_ptr: *const c_void) -> *mut c_void {
+    let 缓存 = 不朽闭包缓存.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = fn_ptr as usize;
+    let mut m = 缓存.lock().unwrap();
+    if let Some(&data) = m.get(&key) {
+        return data as *mut c_void;
+    }
+    let size = SLOT_SIZE * 2; // 0 捕获：fn_ptr 槽 + dtor 槽
+    let layout = clo_layout(size);
+    unsafe {
+        let raw = alloc_zeroed(layout);
+        if raw.is_null() {
+            return std::ptr::null_mut();
+        }
+        let h = raw as *mut CloHeader;
+        (*h).magic = QI_CLO_MAGIC;
+        (*h).refcount = AtomicI64::new(IMMORTAL_RC); // 不朽：永不释放、不计泄漏
+        (*h).size = size as i64;
+        let data = raw.add(HEADER_SIZE);
+        *(data as *mut *const c_void) = fn_ptr;
+        // 不调 diag_clo_alloc —— 不朽单例不算活跃对象（同 immortal 字面量）
+        m.insert(key, data as usize);
+        data as *mut c_void
+    }
+}
+
 /// 创建闭包对象（refcount=1）：写入函数指针，捕获槽 + dtor 槽零初始化待填。
 #[no_mangle]
 pub extern "C" fn qi_closure_create(fn_ptr: *const c_void, num_caps: i64) -> *mut c_void {
