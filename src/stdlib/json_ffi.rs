@@ -231,17 +231,18 @@ pub extern "C" fn qi_json_set_array(obj_id: i64, key: *const c_char, array_id: i
 /// 获取字符串字段
 #[no_mangle]
 pub extern "C" fn qi_json_get_string(obj_id: i64, key: *const c_char) -> *mut c_char {
+    // 缺键/无效句柄/非字符串一律返回**空 RC 串**（不是 null）：字符串在 Qi 里永不该为
+    // null，返 null 会让下游拼接/打印静默崩坏（询问 遇非法 JSON 就踩过）。空串是安全哨兵。
+    let 空 = || crate::stdlib::qi_str::rc_cstr_from_str("");
     if obj_id <= 0 || key.is_null() {
-        return std::ptr::null_mut();
+        return 空();
     }
-
     let key_str = unsafe {
         match CStr::from_ptr(key).to_str() {
             Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
+            Err(_) => return 空(),
         }
     };
-
     let storage = JSON_VALUES.lock().unwrap();
     if let Some(ref map) = *storage {
         if let Some(Value::Object(ref obj)) = map.get(&(obj_id as u64)) {
@@ -250,7 +251,7 @@ pub extern "C" fn qi_json_get_string(obj_id: i64, key: *const c_char) -> *mut c_
             }
         }
     }
-    std::ptr::null_mut()
+    空()
 }
 
 /// 获取整数字段
@@ -532,10 +533,11 @@ pub extern "C" fn qi_json_array_push_object(array_id: i64, obj_id: i64) -> i64 {
 /// 从数组获取字符串
 #[no_mangle]
 pub extern "C" fn qi_json_array_get_string(array_id: i64, index: i64) -> *mut c_char {
+    // 越界/无效/非字符串 → 空 RC 串（不是 null，防下游拼接/打印崩坏）。
+    let 空 = || crate::stdlib::qi_str::rc_cstr_from_str("");
     if array_id <= 0 || index < 0 {
-        return std::ptr::null_mut();
+        return 空();
     }
-
     let storage = JSON_VALUES.lock().unwrap();
     if let Some(ref map) = *storage {
         if let Some(Value::Array(ref array)) = map.get(&(array_id as u64)) {
@@ -544,7 +546,7 @@ pub extern "C" fn qi_json_array_get_string(array_id: i64, index: i64) -> *mut c_
             }
         }
     }
-    std::ptr::null_mut()
+    空()
 }
 
 /// 从数组获取整数
