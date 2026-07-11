@@ -32,7 +32,10 @@ static 已警告: AtomicBool = AtomicBool::new(false);
 #[cold]
 fn 防御警告(msg: &str) {
     if !已警告.swap(true, Ordering::Relaxed) {
-        eprintln!("[qi-vector] {}（后续同类情况将静默处理，不再重复警告）", msg);
+        eprintln!(
+            "[qi-vector] {}（后续同类情况将静默处理，不再重复警告）",
+            msg
+        );
     }
 }
 
@@ -45,7 +48,10 @@ unsafe fn 读浮点数组<'a>(p: *const u8) -> Option<&'a [f64]> {
     if !(0..=最大长度).contains(&len) {
         return None;
     }
-    Some(std::slice::from_raw_parts((p as *const f64).add(1), len as usize))
+    Some(std::slice::from_raw_parts(
+        (p as *const f64).add(1),
+        len as usize,
+    ))
 }
 
 /// 按 Qi 数组布局分配返回数组（qi_obj_alloc：RC header + 长度头 + 元素）。

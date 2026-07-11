@@ -60,8 +60,9 @@ fn clo_layout(size: usize) -> Layout {
 /// 新建会泄漏（存进列表无人释放，图/工具注册表踩过）；缓存 + 不朽(refcount=IMMORTAL)
 /// 解决：首次建一个不朽闭包并缓存，后续复用；不朽 → retain/release no-op、永不释放、
 /// **不计入 diag 泄漏计数**（等价 immortal 字符串字面量）。
-static 不朽闭包缓存: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
-    std::sync::OnceLock::new();
+static 不朽闭包缓存: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+> = std::sync::OnceLock::new();
 
 #[no_mangle]
 pub extern "C" fn qi_closure_intern(fn_ptr: *const c_void) -> *mut c_void {

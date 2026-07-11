@@ -557,11 +557,7 @@ fn qi_cli_localize(mut cmd: Command) -> Command {
         let help_sub = qi_cli_localize(
             Command::new("help")
                 .about("打印本消息或指定子命令的帮助信息")
-                .arg(
-                    Arg::new("子命令")
-                        .help("要查看帮助的子命令")
-                        .num_args(0..),
-                ),
+                .arg(Arg::new("子命令").help("要查看帮助的子命令").num_args(0..)),
         );
         cmd = cmd
             .disable_help_subcommand(true)

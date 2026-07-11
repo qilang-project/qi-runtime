@@ -969,7 +969,10 @@ fn 取字段数组(obj_id: i64, key: *const c_char) -> Option<Vec<Value>> {
 
 /// 对象字段(JSON 数组) → Qi 字符串数组。非字符串元素按其 JSON 文本序列化。
 #[no_mangle]
-pub extern "C" fn qi_json_field_str_array(obj_id: i64, key: *const c_char) -> *mut std::os::raw::c_void {
+pub extern "C" fn qi_json_field_str_array(
+    obj_id: i64,
+    key: *const c_char,
+) -> *mut std::os::raw::c_void {
     let a = 取字段数组(obj_id, key).unwrap_or_default();
     let 槽: Vec<i64> = a
         .iter()
@@ -986,7 +989,10 @@ pub extern "C" fn qi_json_field_str_array(obj_id: i64, key: *const c_char) -> *m
 
 /// 对象字段(JSON 数组) → Qi 整数数组。非整数元素按 0。
 #[no_mangle]
-pub extern "C" fn qi_json_field_int_array(obj_id: i64, key: *const c_char) -> *mut std::os::raw::c_void {
+pub extern "C" fn qi_json_field_int_array(
+    obj_id: i64,
+    key: *const c_char,
+) -> *mut std::os::raw::c_void {
     let a = 取字段数组(obj_id, key).unwrap_or_default();
     let 槽: Vec<i64> = a.iter().map(|v| v.as_i64().unwrap_or(0)).collect();
     新建qi数组(&槽)
@@ -994,7 +1000,10 @@ pub extern "C" fn qi_json_field_int_array(obj_id: i64, key: *const c_char) -> *m
 
 /// 对象字段(JSON 数组) → Qi 浮点数组。非数字元素按 0.0。
 #[no_mangle]
-pub extern "C" fn qi_json_field_float_array(obj_id: i64, key: *const c_char) -> *mut std::os::raw::c_void {
+pub extern "C" fn qi_json_field_float_array(
+    obj_id: i64,
+    key: *const c_char,
+) -> *mut std::os::raw::c_void {
     let a = 取字段数组(obj_id, key).unwrap_or_default();
     let 槽: Vec<i64> = a
         .iter()

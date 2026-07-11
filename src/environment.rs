@@ -10,9 +10,7 @@ use uuid::Uuid;
 use crate::error::ErrorHandler;
 use crate::io::{FileSystemInterface, NetworkManager};
 use crate::memory::MemoryManager;
-use crate::stdlib::{
-    ConversionModule, DebugModule, MathModule, StringModule, SystemModule,
-};
+use crate::stdlib::{ConversionModule, DebugModule, MathModule, StringModule, SystemModule};
 use crate::{RuntimeError, RuntimeResult};
 
 /// Runtime environment states

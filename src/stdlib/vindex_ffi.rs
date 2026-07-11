@@ -31,12 +31,11 @@ fn 解析向量(json_ptr: *const c_char) -> Vec<f32> {
     if json_ptr.is_null() {
         return Vec::new();
     }
-    let 文本 = unsafe { CStr::from_ptr(json_ptr) }.to_string_lossy().to_string();
+    let 文本 = unsafe { CStr::from_ptr(json_ptr) }
+        .to_string_lossy()
+        .to_string();
     match serde_json::from_str::<Value>(&文本) {
-        Ok(Value::Array(a)) => a
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect(),
+        Ok(Value::Array(a)) => a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect(),
         _ => Vec::new(),
     }
 }
@@ -102,7 +101,11 @@ pub extern "C" fn qi_vindex_search(键: i64, query_json: *const c_char, k: i64) 
     }
     // 降序取前 k（部分排序即可，这里数据量不大，全排序简单稳妥）
     打分.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let 取 = if k > 0 { (k as usize).min(打分.len()) } else { 打分.len() };
+    let 取 = if k > 0 {
+        (k as usize).min(打分.len())
+    } else {
+        打分.len()
+    };
 
     let 结果: Vec<Value> = 打分[..取]
         .iter()

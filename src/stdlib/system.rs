@@ -595,7 +595,7 @@ mod tests {
 
         // Timestamps should be reasonable (not zero, not too large)
         assert!(timestamp > 1600000000); // After 2020
-        // 两次调用间可能跨秒边界：放宽到 [ts*1000, (ts+2)*1000) 窗口，原严格不等式偶发失败
+                                         // 两次调用间可能跨秒边界：放宽到 [ts*1000, (ts+2)*1000) 窗口，原严格不等式偶发失败
         assert!(timestamp_millis >= timestamp * 1000);
         assert!(timestamp_millis < (timestamp + 2) * 1000);
     }
