@@ -82,6 +82,19 @@ thread_local! {
     static PENDING: RefCell<VecDeque<*mut QiCoro>> = RefCell::new(VecDeque::new());
     /// 本线程最近一次挂起意愿：0 = 让出（立即就绪）；>0 = 睡到该绝对 ms。
     static LAST_WAKE: Cell<u64> = const { Cell::new(0) };
+    /// R5 park-wake：step() resume 前设为当前协程；供通道 park 记录「谁在等」。
+    static CURRENT: Cell<*mut QiCoro> = const { Cell::new(std::ptr::null_mut()) };
+    /// R5：本次 resume 是否 park 了（挂到通道等待者列表）。true → step 不回队。
+    static PARKED: Cell<bool> = const { Cell::new(false) };
+    /// R5：当前 parked（挂在通道上、不在 PENDING）的协程数 —— 死锁检测。
+    static PARKED_COUNT: Cell<i64> = const { Cell::new(0) };
+    /// R5 **延迟 park**：顶层 `启动` 跑 ramp 时 CURRENT=null，协程首次 park 无法立刻
+    /// 挂到通道（还没 QiCoro 对象）。park_recv/send 此时把「意图」记这里，
+    /// qi_coro_spawn 建出 QiCoro 后据此挂到通道等待者列表（而非 PENDING）。
+    /// 0=无 / 1=recv / 2=send；目标通道 + send 值。
+    static PARK_INTENT_KIND: Cell<i32> = const { Cell::new(0) };
+    static PARK_INTENT_CHAN: Cell<*mut QiCoroChan> = const { Cell::new(std::ptr::null_mut()) };
+    static PARK_INTENT_VAL: Cell<i64> = const { Cell::new(0) };
 }
 
 fn now_ms() -> u64 {
@@ -120,6 +133,24 @@ pub extern "C" fn qi_coro_spawn(hdl: *mut c_void) -> *mut QiCoro {
         done: false,
         value: 0,
     }));
+    // R5 延迟 park：ramp 期间（CURRENT=null）协程已表达 park 意图 → 挂到通道等待者列表，
+    // 不入 PENDING（否则会自旋、且与唤醒链交互产生 lost-wakeup/hang —— R5 第一版回退的根因）。
+    let kind = PARK_INTENT_KIND.with(|k| k.replace(0));
+    if kind != 0 {
+        let ch = PARK_INTENT_CHAN.with(|c| c.replace(std::ptr::null_mut()));
+        if !ch.is_null() {
+            unsafe {
+                if kind == 1 {
+                    (*ch).recv_waiters.push_back(c);
+                } else {
+                    let v = PARK_INTENT_VAL.with(|x| x.get());
+                    (*ch).send_waiters.push_back((c, v));
+                }
+            }
+            PARKED_COUNT.with(|n| n.set(n.get() + 1));
+            return c;
+        }
+    }
     PENDING.with(|p| p.borrow_mut().push_back(c));
     c
 }
@@ -167,8 +198,12 @@ fn step() -> bool {
             // 默认「立即就绪」——协程若不再挂起就直接跑到完成；若挂起，
             // 挂起前的 让出/睡眠 会覆盖 LAST_WAKE。
             LAST_WAKE.with(|w| w.set(0));
+            // R5：记录当前协程 + 清 park 标志（通道 park 会置 true）。
+            CURRENT.with(|x| x.set(c));
+            PARKED.with(|p| p.set(false));
             let hdl = unsafe { (*c).hdl };
             (ops.resume)(hdl);
+            CURRENT.with(|x| x.set(std::ptr::null_mut()));
             if (ops.done)(hdl) {
                 let v = (ops.promise)(hdl);
                 unsafe {
@@ -177,6 +212,9 @@ fn step() -> bool {
                 }
                 (ops.destroy)(hdl);
                 // 不回收 QiCoro：留给 `等待` 读值。QiCoro 非 RC，不影响 QI_RC_REPORT。
+            } else if PARKED.with(|p| p.get()) {
+                // R5：协程 park 在某通道等待者列表上 —— 不回 PENDING（由 send/recv 唤醒）。
+                PARKED_COUNT.with(|n| n.set(n.get() + 1));
             } else {
                 let w = LAST_WAKE.with(|x| x.get());
                 unsafe {
@@ -190,9 +228,17 @@ fn step() -> bool {
 }
 
 /// 驱动所有排队 coroutine 直到全部完成。
+/// R5：结束时若仍有 parked 协程（挂通道上无人唤醒）→ 死锁，告警不 hang。
 #[no_mangle]
 pub extern "C" fn qi_coro_run_all() {
     while step() {}
+    let parked = PARKED_COUNT.with(|n| n.get());
+    if parked > 0 {
+        eprintln!(
+            "[qi-coro] 死锁：{} 个协程挂在通道上等待，但执行器已无可运行协程（无人发送/接收）。",
+            parked
+        );
+    }
 }
 
 /// 驱动直到指定 coroutine 完成（简化：轮转整个队列直到它 done）。
@@ -259,19 +305,29 @@ pub extern "C" fn qi_coro_step_once() -> i64 {
     step() as i64
 }
 
-/// R4：协作式 await 的非阻塞轮询。1 = 已就绪；0 = 未就绪。
-/// 协程 future 看 done 标志；eager Future（异步 IO）看 state。
+/// R4：协作式 await 的**非阻塞轮询**。1 = 已就绪（可取值）；0 = 未就绪（应让出）。
+/// 统一处理两类 future：
+/// - 协程 future（QiCoro，magic 命中）：看 `done` 标志；
+/// - eager `Future`（含 异步询问/异步对话 的**异步 IO** pending future）：看 state
+///   —— Completed/Failed 即就绪，Pending 未就绪。
+///
+/// 协程体内 `等待 <future>` 编译成「poll；未就绪则 让出+挂起；resume 再 poll」的
+/// 协作式循环（见 codegen 异步.rs 协程等待轮询）。这样：① 协程内 await 另一协程时
+/// 让出执行权、由外层执行器驱动被等协程到完成（不再 re-entrant 驱动崩溃）；② await
+/// 异步 IO 时让出，HTTP 后台线程在飞、同执行器上别的协程得以运行 —— 真 IO 上车。
+/// 取值仍走既有 qi_future_await_*（此刻已就绪，立即返回不阻塞）。
 ///
 /// # Safety
 /// `fut` 为 null 或指向 QiCoro / eager `Future` 的有效指针。
 #[no_mangle]
 pub extern "C" fn qi_coro_await_poll(fut: *const c_void) -> i32 {
     if fut.is_null() {
-        return 1;
+        return 1; // null → 视为已就绪（await 取默认值，不死等）
     }
     if unsafe { is_coro(fut) } {
         return unsafe { (*(fut as *const QiCoro)).done } as i32;
     }
+    // eager Future（异步 IO pending future）：Completed/Failed 即就绪。
     use crate::async_runtime::future::{Future, FutureState};
     let f = unsafe { &*(fut as *const Future) };
     let st = f.state.lock().unwrap().clone();
@@ -286,15 +342,36 @@ pub extern "C" fn qi_coro_await_poll(fut: *const c_void) -> i32 {
 // 与 tokio 版 `qi_runtime_channel_*`（跨线程、阻塞、boxed-i64 ABI）不同：本通道
 // 活在**同一个单线程 executor 世界**里，非阻塞 try_send/try_recv，值按裸 i64 位模式
 // 直传（不 box）。QI_CORO=1 且在协程上下文时，codegen 把 `<- ch` 编译成
-// 「try_recv；空则 让出+挂起；resume 再试」的**协作式挂起**循环。
-// cap<=0 视为无界；cap>0 为软上限。通道本体裸 Box（非 RC），不进 QI_RC_REPORT。
+// 「try_recv；空则 让出+挂起；resume 再试」的**协作式挂起**循环 —— 协程收空通道时
+// 让出执行权而非占死线程，另一协程得以运行并发送，从而唤醒等待者。
+//
+// cap 语义（R3 简化）：cap<=0 视为无界（协作式下发送恒成功）；cap>0 为软上限，满则
+// try_send 返回 1（当前 codegen 发送不挂起，仅无界/软上限，真·背压挂起留 R4）。
+// 通道本体是裸 Box（非 RC，不带引用计数），不进入 QI_RC_REPORT 统计；通过通道传的
+// RC 值（字符串/结构体指针）由 codegen 在发送端 retain、接收端按 OWNED 接管，净额平衡。
 
 /// 协程原生通道对象。单线程 executor 内使用，无需锁。
+/// R5 park-wake：收空通道的协程 park 进 recv_waiters；发满通道的协程连同值 park 进
+/// send_waiters。对端操作时把等待者移回 PENDING（唤醒），免去 R3/R4 的协作式空转。
 #[repr(C)]
 pub struct QiCoroChan {
     buf: VecDeque<i64>,
     cap: usize, // 0 = 无界
     closed: bool,
+    recv_waiters: VecDeque<*mut QiCoro>,        // 等接收的协程
+    send_waiters: VecDeque<(*mut QiCoro, i64)>, // 等发送的协程（连同待发值）
+}
+
+/// R5：唤醒一个 parked 协程 —— 移回 PENDING（立即就绪）、parked 计数减一。
+fn wake(c: *mut QiCoro) {
+    if c.is_null() {
+        return;
+    }
+    unsafe {
+        (*c).wake_at = 0;
+    }
+    PENDING.with(|p| p.borrow_mut().push_back(c));
+    PARKED_COUNT.with(|n| n.set((n.get() - 1).max(0)));
 }
 
 /// `通道<T>(cap)`（协程模式）→ 协程原生通道句柄。
@@ -304,10 +381,12 @@ pub extern "C" fn qi_coro_chan_new(cap: i64) -> *mut QiCoroChan {
         buf: VecDeque::new(),
         cap: if cap <= 0 { 0 } else { cap as usize },
         closed: false,
+        recv_waiters: VecDeque::new(),
+        send_waiters: VecDeque::new(),
     }))
 }
 
-/// 非阻塞发送：0 = 已入队；1 = 有界且满（无界恒 0）。
+/// 非阻塞发送：0 = 已入队（并唤醒一个等待接收者，若有）；1 = 有界且满（调用方应 park_send）。
 ///
 /// # Safety
 /// `ch` 为 null 或 `qi_coro_chan_new` 返回的有效指针。
@@ -318,13 +397,17 @@ pub extern "C" fn qi_coro_chan_try_send(ch: *mut QiCoroChan, v: i64) -> i32 {
     }
     let c = unsafe { &mut *ch };
     if c.cap != 0 && c.buf.len() >= c.cap {
-        return 1;
+        return 1; // 满 → 调用方 park_send
     }
     c.buf.push_back(v);
+    if let Some(r) = c.recv_waiters.pop_front() {
+        wake(r); // 唤醒一个等接收者（resume 后 try_recv 取到）
+    }
     0
 }
 
-/// 非阻塞接收：0 = 取到（写入 `*slot`）；1 = 空。值为 i64 位模式（单层，不 box）。
+/// 非阻塞接收：0 = 取到（写入 `*slot`）；1 = 空（调用方应 park_recv）。i64 单层直传。
+/// 取走一个后若有协程 park 在 send_waiters（因满而等）→ 把其值补进缓冲并唤醒它。
 ///
 /// # Safety
 /// `ch`/`slot` 为 null 或有效指针。
@@ -339,13 +422,59 @@ pub extern "C" fn qi_coro_chan_try_recv(ch: *mut QiCoroChan, slot: *mut i64) -> 
             unsafe {
                 *slot = v;
             }
+            if let Some((s, sv)) = c.send_waiters.pop_front() {
+                c.buf.push_back(sv);
+                wake(s);
+            }
             0
         }
         None => 1,
     }
 }
 
-/// 关闭通道（预留 R4）。
+/// R5：收空通道 → 把当前协程 park 进 recv_waiters（CURRENT 有值），或记延迟 park 意图
+/// （ramp 期间 CURRENT=null，交 qi_coro_spawn 落实）。置 PARKED，供 step 不回队。
+///
+/// # Safety
+/// `ch` 为 null 或有效指针。
+#[no_mangle]
+pub extern "C" fn qi_coro_chan_park_recv(ch: *mut QiCoroChan) {
+    if ch.is_null() {
+        return;
+    }
+    let cur = CURRENT.with(|x| x.get());
+    if cur.is_null() {
+        // ramp 期间：记意图，qi_coro_spawn 建出 QiCoro 后挂到 recv_waiters。
+        PARK_INTENT_KIND.with(|k| k.set(1));
+        PARK_INTENT_CHAN.with(|c| c.set(ch));
+        return;
+    }
+    unsafe { (*ch).recv_waiters.push_back(cur) };
+    PARKED.with(|p| p.set(true));
+}
+
+/// R5：发满通道 → 把当前协程连同待发值 park 进 send_waiters（或记延迟意图）。
+/// 被唤醒时值已由接收方补进缓冲（视作已发送），resume 后无需重试。
+///
+/// # Safety
+/// `ch` 为 null 或有效指针。
+#[no_mangle]
+pub extern "C" fn qi_coro_chan_park_send(ch: *mut QiCoroChan, v: i64) {
+    if ch.is_null() {
+        return;
+    }
+    let cur = CURRENT.with(|x| x.get());
+    if cur.is_null() {
+        PARK_INTENT_KIND.with(|k| k.set(2));
+        PARK_INTENT_CHAN.with(|c| c.set(ch));
+        PARK_INTENT_VAL.with(|x| x.set(v));
+        return;
+    }
+    unsafe { (*ch).send_waiters.push_back((cur, v)) };
+    PARKED.with(|p| p.set(true));
+}
+
+/// 关闭通道（当前 codegen 未用；预留给 R4 的收端「关闭即结束」语义）。
 ///
 /// # Safety
 /// `ch` 为 null 或有效指针。
