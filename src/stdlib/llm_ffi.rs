@@ -643,7 +643,51 @@ impl LLM会话 {
     /// 取 data[0].embedding（OpenAI 兼容形状：openai / aliyun compatible-mode / 等）。
     /// model 用会话模型 —— 建嵌入会话时传嵌入模型（如 text-embedding-v4）。
     /// 只读会话（不写历史、不动预算）。返回 f64 向量。
+    ///
+    /// 与 请求响应 一样夹一层**磁带（录制/回放/缓存）**：键 = 请求体 {"model","input"}
+    /// 的哈希（复用 磁带::请求键），REPLAY/CACHE/RECORD 三开关语义完全一致。
+    /// 没这层，课堂离线回放（QI_LLM_REPLAY=1 + 假 URL/KEY）就会真上网而废掉。
     fn 嵌入(&self, 文本: &str) -> Result<Vec<f64>, String> {
+        let 请求体 = json!({ "model": self.模型, "input": 文本 });
+        let 响应体 = self.嵌入请求响应(请求体)?;
+        Self::解析嵌入响应(&响应体)
+    }
+
+    /// 嵌入请求→响应体 Value，中间夹磁带闸（开关语义与非流式 请求响应 完全一致）：
+    /// - QI_LLM_REPLAY=1：不打 API，按请求哈希从磁带取（miss → Err）；
+    /// - QI_LLM_CACHE=1：命中磁带直接返回，未命中真调并写回；
+    /// - QI_LLM_RECORD=1：总是真调，落磁带。
+    /// 磁带文件由 QI_LLM_TAPE 指定（与对话共用同一文件；嵌入请求体不含 messages，
+    /// 键空间自然与对话隔离，不会撞键）。
+    fn 嵌入请求响应(&self, 请求体: Value) -> Result<Value, String> {
+        let 键 = 磁带::请求键(&请求体);
+        let 回放 = 环境开(&["QI_LLM_REPLAY"]);
+        let 缓存 = 环境开(&["QI_LLM_CACHE"]);
+        let 录制 = 环境开(&["QI_LLM_RECORD"]);
+
+        if 回放 || 缓存 {
+            if let Some(v) = 磁带::取(&键) {
+                return Ok(v);
+            }
+            if 回放 {
+                return Err(format!(
+                    "嵌入磁带回放未命中(QI_LLM_REPLAY)：无此请求的录制。键={}。先用 QI_LLM_RECORD=1 录制。",
+                    &键[..键.len().min(16)]
+                ));
+            }
+            // 缓存模式 miss：继续真调，下面会写回
+        }
+
+        let 响应体 = self.嵌入发送(请求体)?;
+
+        if 录制 || 缓存 {
+            磁带::存(&键, &响应体);
+        }
+        Ok(响应体)
+    }
+
+    /// 真打网络：POST {base}/embeddings（OpenAI 兼容），返回响应体 Value。
+    fn 嵌入发送(&self, 请求体: Value) -> Result<Value, String> {
         use reqwest::blocking::Client;
         let 超时秒 = self
             .配置
@@ -654,7 +698,6 @@ impl LLM会话 {
             .timeout(std::time::Duration::from_secs(超时秒))
             .build()
             .map_err(|e| format!("HTTP客户端构建失败: {}", e))?;
-        let 请求体 = json!({ "model": self.模型, "input": 文本 });
         let mut 请求构建器 = 客户端
             .post(self.嵌入端点())
             .header("Content-Type", "application/json");
@@ -675,9 +718,11 @@ impl LLM会话 {
                 .unwrap_or_else(|_| "无法读取错误响应".to_string());
             return Err(format!("嵌入API返回错误 {}: {}", 状态码, 错误文本));
         }
-        let 体: Value = 响应
-            .json()
-            .map_err(|e| format!("嵌入响应解析失败: {}", e))?;
+        响应.json().map_err(|e| format!("嵌入响应解析失败: {}", e))
+    }
+
+    /// 解析嵌入响应体 → f64 向量：取 data[0].embedding。缺字段/含非数值 → Err。
+    fn 解析嵌入响应(体: &Value) -> Result<Vec<f64>, String> {
         let 向量 = 体
             .get("data")
             .and_then(|d| d.get(0))
@@ -2535,6 +2580,46 @@ mod tests {
             assert_eq!(池.get(&句柄).unwrap().提供商, "anthropic"); // 大小写归一
         }
         qi_llm_close_session(句柄);
+    }
+
+    // ── 嵌入磁带（形状 + 回放，不打网络） ──
+
+    #[test]
+    fn 嵌入_响应解析形状() {
+        // 正常 OpenAI 兼容形状：data[0].embedding
+        let 体 = json!({"data": [{"embedding": [0.1, 0.2, -0.3]}]});
+        let v = LLM会话::解析嵌入响应(&体).unwrap();
+        assert_eq!(v, vec![0.1, 0.2, -0.3]);
+        // 缺字段 → Err（不 panic）
+        assert!(LLM会话::解析嵌入响应(&json!({"data": []})).is_err());
+        assert!(LLM会话::解析嵌入响应(&json!({})).is_err());
+    }
+
+    #[test]
+    fn 嵌入_磁带回放命中不打网络() {
+        // 磁带指向临时文件，避免污染工作目录；REPLAY 下命中即返回，绝不上网。
+        let 临时 = std::env::temp_dir().join(format!(
+            "qi_llm_embed_tape_test_{}.json",
+            std::process::id()
+        ));
+        std::env::set_var("QI_LLM_TAPE", &临时);
+
+        let 会话 = LLM会话::创建(
+            "https://example.com/v1".into(),
+            "text-embedding-v4".into(),
+            Some("k".into()),
+        );
+        // 键必须由与 嵌入 内部相同的请求体算出（{"model","input"}）
+        let 请求体 = json!({ "model": "text-embedding-v4", "input": "小猫" });
+        let 键 = 磁带::请求键(&请求体);
+        磁带::存(&键, &json!({"data": [{"embedding": [1.0, 2.0, 3.0]}]}));
+
+        std::env::set_var("QI_LLM_REPLAY", "1");
+        let v = 会话.嵌入("小猫").expect("嵌入回放应命中磁带");
+        std::env::remove_var("QI_LLM_REPLAY");
+
+        assert_eq!(v, vec![1.0, 2.0, 3.0]);
+        let _ = std::fs::remove_file(&临时);
     }
 
     // ── 流式磁带（录制/回放，不打网络） ──
