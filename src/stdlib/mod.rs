@@ -25,6 +25,7 @@ pub mod list;
 pub mod llm;
 pub mod llm_ffi;
 pub mod math;
+pub mod math_ffi;
 pub mod mcp;
 pub mod mcp_client_ffi;
 pub mod mcp_ffi;
