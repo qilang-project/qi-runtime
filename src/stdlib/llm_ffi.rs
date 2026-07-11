@@ -626,6 +626,71 @@ impl LLM会话 {
         Ok(响应)
     }
 
+    /// 会话嵌入 URL：OpenAI 兼容 base + /embeddings。base 已带 /embeddings 原样；
+    /// /chat/completions 结尾则替换为 /embeddings（允许用同一 chat 端点建嵌入会话）。
+    fn 嵌入端点(&self) -> String {
+        let 基 = self.端点.trim_end_matches('/');
+        if 基.ends_with("/embeddings") {
+            基.to_string()
+        } else if let Some(前缀) = 基.strip_suffix("/chat/completions") {
+            format!("{}/embeddings", 前缀)
+        } else {
+            format!("{}/embeddings", 基)
+        }
+    }
+
+    /// 文本嵌入：POST {base}/embeddings，请求体 `{"model":模型,"input":文本}`，
+    /// 取 data[0].embedding（OpenAI 兼容形状：openai / aliyun compatible-mode / 等）。
+    /// model 用会话模型 —— 建嵌入会话时传嵌入模型（如 text-embedding-v4）。
+    /// 只读会话（不写历史、不动预算）。返回 f64 向量。
+    fn 嵌入(&self, 文本: &str) -> Result<Vec<f64>, String> {
+        use reqwest::blocking::Client;
+        let 超时秒 = self
+            .配置
+            .get("timeout_secs")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(180);
+        let 客户端 = Client::builder()
+            .timeout(std::time::Duration::from_secs(超时秒))
+            .build()
+            .map_err(|e| format!("HTTP客户端构建失败: {}", e))?;
+        let 请求体 = json!({ "model": self.模型, "input": 文本 });
+        let mut 请求构建器 = 客户端
+            .post(self.嵌入端点())
+            .header("Content-Type", "application/json");
+        if let Some(ref 密钥) = self.密钥 {
+            请求构建器 = 请求构建器.header("Authorization", format!("Bearer {}", 密钥));
+        }
+        let 响应 = 请求构建器.json(&请求体).send().map_err(|e| {
+            let 根因 = e
+                .source()
+                .map(|s| format!("（根因: {}）", s))
+                .unwrap_or_default();
+            format!("HTTP请求失败: {}{}", e, 根因)
+        })?;
+        if !响应.status().is_success() {
+            let 状态码 = 响应.status();
+            let 错误文本 = 响应
+                .text()
+                .unwrap_or_else(|_| "无法读取错误响应".to_string());
+            return Err(format!("嵌入API返回错误 {}: {}", 状态码, 错误文本));
+        }
+        let 体: Value = 响应
+            .json()
+            .map_err(|e| format!("嵌入响应解析失败: {}", e))?;
+        let 向量 = 体
+            .get("data")
+            .and_then(|d| d.get(0))
+            .and_then(|e| e.get("embedding"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "嵌入响应缺少 data[0].embedding".to_string())?;
+        let mut 结果 = Vec::with_capacity(向量.len());
+        for x in 向量 {
+            结果.push(x.as_f64().ok_or_else(|| "嵌入向量含非数值".to_string())?);
+        }
+        Ok(结果)
+    }
+
     /// 提取 assistant 消息并归一化为 OpenAI 消息形状（content 文本 + tool_calls），
     /// 下游（提取文本/工具派发/历史）无需感知提供商差异。
     fn 提取消息(&self, 响应体: &Value) -> Result<Value, String> {
@@ -1288,6 +1353,47 @@ pub extern "C" fn qi_llm_chat(session_handle: i64, prompt: *const c_char) -> *mu
     }
 
     转为C字符串指针("LLM调用失败: 无效会话句柄".to_string())
+}
+
+/// 按 Qi 数组内存布局（`[长度:i64][elem0:8字节]...`，浮点槽存 f64 位模式）
+/// 分配一个浮点数组，经 qi_obj_alloc（带 RC header，rc=1 交出）。
+/// 与 向量模块 FFI 的返回数组同构，QI_ARC=1 时 codegen 可正确回收。
+fn 新建浮点数组(元素: &[f64]) -> *mut u8 {
+    use super::rc_obj::qi_obj_alloc;
+    let n = 元素.len();
+    let p = qi_obj_alloc(((n + 1) * 8) as i64);
+    unsafe {
+        *(p as *mut i64) = n as i64;
+        std::ptr::copy_nonoverlapping(元素.as_ptr(), (p as *mut f64).add(1), n);
+    }
+    p
+}
+
+/// 文本嵌入：`大模型.嵌入(会话, 文本) : 数组<浮点数>`。
+///
+/// 走会话端点 base + /embeddings（OpenAI 兼容），model = 会话模型
+/// （建嵌入会话时传嵌入模型，如 text-embedding-v4）。返回 Qi 浮点数组（rc=1 交出）。
+/// 失败（空指针 / 无效会话 / 网络 / 解析）→ 空数组并发一次 stderr 日志，绝不崩。
+#[no_mangle]
+pub extern "C" fn qi_llm_embed(session_handle: i64, text: *const c_char) -> *mut u8 {
+    if text.is_null() {
+        eprintln!("[qi-llm] 嵌入失败: 文本为空指针");
+        return 新建浮点数组(&[]);
+    }
+    let 文本 = unsafe { CStr::from_ptr(text).to_string_lossy().to_string() };
+    let 会话池 = 获取会话池().lock().unwrap();
+    if let Some(会话) = 会话池.get(&session_handle) {
+        match 会话.嵌入(&文本) {
+            Ok(v) => 新建浮点数组(&v),
+            Err(e) => {
+                eprintln!("[qi-llm] 嵌入失败: {}", e);
+                新建浮点数组(&[])
+            }
+        }
+    } else {
+        eprintln!("[qi-llm] 嵌入失败: 无效会话句柄 {}", session_handle);
+        新建浮点数组(&[])
+    }
 }
 
 /// 多模态图像对话：文本提示 + 单张图 URL。
