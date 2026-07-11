@@ -259,6 +259,92 @@ pub extern "C" fn qi_coro_step_once() -> i64 {
     step() as i64
 }
 
+// ───────────────────────── Round 3：协程原生通道 ─────────────────────────
+//
+// 与 tokio 版 `qi_runtime_channel_*`（跨线程、阻塞、boxed-i64 ABI）不同：本通道
+// 活在**同一个单线程 executor 世界**里，非阻塞 try_send/try_recv，值按裸 i64 位模式
+// 直传（不 box）。QI_CORO=1 且在协程上下文时，codegen 把 `<- ch` 编译成
+// 「try_recv；空则 让出+挂起；resume 再试」的**协作式挂起**循环。
+// cap<=0 视为无界；cap>0 为软上限。通道本体裸 Box（非 RC），不进 QI_RC_REPORT。
+
+/// 协程原生通道对象。单线程 executor 内使用，无需锁。
+#[repr(C)]
+pub struct QiCoroChan {
+    buf: VecDeque<i64>,
+    cap: usize, // 0 = 无界
+    closed: bool,
+}
+
+/// `通道<T>(cap)`（协程模式）→ 协程原生通道句柄。
+#[no_mangle]
+pub extern "C" fn qi_coro_chan_new(cap: i64) -> *mut QiCoroChan {
+    Box::into_raw(Box::new(QiCoroChan {
+        buf: VecDeque::new(),
+        cap: if cap <= 0 { 0 } else { cap as usize },
+        closed: false,
+    }))
+}
+
+/// 非阻塞发送：0 = 已入队；1 = 有界且满（无界恒 0）。
+///
+/// # Safety
+/// `ch` 为 null 或 `qi_coro_chan_new` 返回的有效指针。
+#[no_mangle]
+pub extern "C" fn qi_coro_chan_try_send(ch: *mut QiCoroChan, v: i64) -> i32 {
+    if ch.is_null() {
+        return 1;
+    }
+    let c = unsafe { &mut *ch };
+    if c.cap != 0 && c.buf.len() >= c.cap {
+        return 1;
+    }
+    c.buf.push_back(v);
+    0
+}
+
+/// 非阻塞接收：0 = 取到（写入 `*slot`）；1 = 空。值为 i64 位模式（单层，不 box）。
+///
+/// # Safety
+/// `ch`/`slot` 为 null 或有效指针。
+#[no_mangle]
+pub extern "C" fn qi_coro_chan_try_recv(ch: *mut QiCoroChan, slot: *mut i64) -> i32 {
+    if ch.is_null() || slot.is_null() {
+        return 1;
+    }
+    let c = unsafe { &mut *ch };
+    match c.buf.pop_front() {
+        Some(v) => {
+            unsafe {
+                *slot = v;
+            }
+            0
+        }
+        None => 1,
+    }
+}
+
+/// 关闭通道（预留 R4）。
+///
+/// # Safety
+/// `ch` 为 null 或有效指针。
+#[no_mangle]
+pub extern "C" fn qi_coro_chan_close(ch: *mut QiCoroChan) {
+    if !ch.is_null() {
+        unsafe { (*ch).closed = true };
+    }
+}
+
+/// 释放协程通道。
+///
+/// # Safety
+/// `ch` 为 null 或 `qi_coro_chan_new` 返回且未释放过的指针。
+#[no_mangle]
+pub extern "C" fn qi_coro_chan_free(ch: *mut QiCoroChan) {
+    if !ch.is_null() {
+        unsafe { drop(Box::from_raw(ch)) };
+    }
+}
+
 /// R2：提前销毁一个未完成的协程（`取消未来`）。
 /// - 未完成：从待驱动队列摘除 + destroy handle —— destroy 克隆走 coroutine 的
 ///   cleanup 路径，frame 内 RC 槽在 coro.free 前逐个释放（R2 的灵魂）。
