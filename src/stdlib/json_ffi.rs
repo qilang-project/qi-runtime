@@ -272,7 +272,11 @@ pub extern "C" fn qi_json_get_int(obj_id: i64, key: *const c_char) -> i64 {
     if let Some(ref map) = *storage {
         if let Some(Value::Object(ref obj)) = map.get(&(obj_id as u64)) {
             if let Some(Value::Number(ref n)) = obj.get(key_str) {
-                return n.as_i64().unwrap_or(0);
+                // 容错：整数字段收到浮点（LLM 常给 8.5 这类值）→ 截断而非归 0
+                return n
+                    .as_i64()
+                    .or_else(|| n.as_f64().map(|f| f as i64))
+                    .unwrap_or(0);
             }
         }
     }
@@ -932,6 +936,17 @@ pub extern "C" fn qi_json_enum_tag(names: *const c_char, value: *const c_char) -
             return i as i64;
         }
     }
+    // 容错第二轮：模型偶尔在变体名后附加装饰（如「需补材料(需 参数1)」）——
+    // 值以候选名开头即命中。只做 值.starts_with(名)（保守方向），避免把
+    // 「需补」这类残串错配到「需补材料」。
+    if !v.is_empty() {
+        for (i, n) in names.split(',').enumerate() {
+            let n = n.trim();
+            if !n.is_empty() && v.starts_with(n) {
+                return i as i64;
+            }
+        }
+    }
     0
 }
 
@@ -940,6 +955,20 @@ pub extern "C" fn qi_json_enum_tag(names: *const c_char, value: *const c_char) -
 // Qi 数组布局（与 codegen 数组字面量同构）：ptr → [长度:i64][elem0:8B][elem1:8B]...
 // 本体 qi_obj_alloc(rc=1) 交出（OWNED）；字符串元素每个 rc_cstr(rc=1)，
 // 数组释放时按元素类型级联回收。缺键/非数组/元素类型不符 → 空数组(len=0)，绝不 null。
+
+/// 分配 n 槽指针数组（`询问::<T>` 数组of结构体字段反序列化用）。
+/// 布局同 Qi 原生数组：ptr → [长度:i64][槽0:8B]...；qi_obj_alloc 已零初始化
+/// （槽全 null，元素逐个填入前 release 旧值安全），rc=1 交出（OWNED）。
+/// n<0 按 0（空数组，绝不 null）。
+#[no_mangle]
+pub extern "C" fn qi_json_alloc_obj_array(n: i64) -> *mut std::os::raw::c_void {
+    let n = if n < 0 { 0 } else { n as usize };
+    let p = super::rc_obj::qi_obj_alloc(((n + 1) * 8) as i64);
+    unsafe {
+        *(p as *mut i64) = n as i64;
+    }
+    p as *mut std::os::raw::c_void
+}
 
 fn 新建qi数组(槽: &[i64]) -> *mut std::os::raw::c_void {
     let n = 槽.len();
