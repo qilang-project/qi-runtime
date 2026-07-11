@@ -259,6 +259,28 @@ pub extern "C" fn qi_coro_step_once() -> i64 {
     step() as i64
 }
 
+/// R4：协作式 await 的非阻塞轮询。1 = 已就绪；0 = 未就绪。
+/// 协程 future 看 done 标志；eager Future（异步 IO）看 state。
+///
+/// # Safety
+/// `fut` 为 null 或指向 QiCoro / eager `Future` 的有效指针。
+#[no_mangle]
+pub extern "C" fn qi_coro_await_poll(fut: *const c_void) -> i32 {
+    if fut.is_null() {
+        return 1;
+    }
+    if unsafe { is_coro(fut) } {
+        return unsafe { (*(fut as *const QiCoro)).done } as i32;
+    }
+    use crate::async_runtime::future::{Future, FutureState};
+    let f = unsafe { &*(fut as *const Future) };
+    let st = f.state.lock().unwrap().clone();
+    match st {
+        FutureState::Pending => 0,
+        _ => 1,
+    }
+}
+
 // ───────────────────────── Round 3：协程原生通道 ─────────────────────────
 //
 // 与 tokio 版 `qi_runtime_channel_*`（跨线程、阻塞、boxed-i64 ABI）不同：本通道
