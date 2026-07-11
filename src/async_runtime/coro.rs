@@ -150,6 +150,22 @@ pub extern "C" fn qi_coro_spawn(hdl: *mut c_void) -> *mut QiCoro {
         done: false,
         value: 0,
     }));
+    // **关键修复**：协程可能在 ramp 期间就跑到 final suspend（body 无中途挂起点，如通道
+    // 未满/未空、无 让出 —— 一路跑完）。此时 handle 已 done，**绝不能再入就绪队列让 worker
+    // resume**（对 done 协程调 llvm.coro.resume 是 UB → 段错误）。直接收值+销毁+返回。
+    {
+        let o = ops();
+        if (o.done)(hdl) {
+            let v = (o.promise)(hdl);
+            unsafe {
+                (*c).value = v;
+                (*c).done = true;
+            }
+            (o.destroy)(hdl);
+            // 已完成的 fire-and-forget 协程：不 LIVE++（无需调度）。若被 await，值已就位。
+            return c;
+        }
+    }
     LIVE.fetch_add(1, Ordering::AcqRel);
     // R5 延迟 park：ramp 期间协程已表达 park 意图 → 挂到通道等待者列表（锁内），不入就绪队列。
     let kind = PARK_INTENT_KIND.with(|k| k.replace(0));
