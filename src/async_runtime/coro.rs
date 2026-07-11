@@ -276,9 +276,7 @@ fn worker_loop() {
                     return;
                 }
                 // 有 worker 在跑（可能即将 wake 出新 work）→ 等通知（带超时防错过）。
-                let _ = CV
-                    .wait_timeout(guard, Duration::from_millis(2))
-                    .unwrap();
+                let _ = CV.wait_timeout(guard, Duration::from_millis(2)).unwrap();
             }
         }
     }
@@ -503,15 +501,20 @@ pub extern "C" fn qi_coro_chan_try_recv(ch: *mut QiCoroChan, slot: *mut i64) -> 
             unsafe {
                 *slot = v;
             }
-            let woken = if let Some((s, sv)) = inner.send_waiters.pop_front() {
+            // 腾出空位 → 提升一个等待发送者的值进 buf。**关键修复（R5 潜藏 bug）**：被提升
+            // 的值现在在 buf 里、需要一个消费者来取；若有等待接收者就唤醒一个，否则该值卡在
+            // buf、消费者全 park 饿死 —— 此前被测试里 producer 的 让出() 掩盖。同时唤醒发送者继续。
+            let mut wakes: Vec<Cptr> = Vec::new();
+            if let Some((s, sv)) = inner.send_waiters.pop_front() {
                 inner.buf.push_back(sv);
-                Some(s)
-            } else {
-                None
-            };
+                wakes.push(s);
+                if let Some(r) = inner.recv_waiters.pop_front() {
+                    wakes.push(r);
+                }
+            }
             drop(inner);
-            if let Some(s) = woken {
-                wake(s);
+            for w in wakes {
+                wake(w);
             }
             0
         }
