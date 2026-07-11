@@ -31,6 +31,7 @@
 //! });
 //! ```
 
+pub mod coro;
 pub mod executor;
 pub mod ffi;
 pub mod future;

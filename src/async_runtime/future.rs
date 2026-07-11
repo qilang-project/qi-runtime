@@ -306,6 +306,10 @@ pub extern "C-unwind" fn qi_future_await_i64(future: *mut Future) -> i64 {
     if future.is_null() {
         return -1;
     }
+    // coro future（QI_CORO）：首 8 字节 magic 命中 → 交协程 executor 驱动取值。
+    if unsafe { crate::async_runtime::coro::is_coro(future as *const _) } {
+        return crate::async_runtime::coro::qi_coro_await_i64(future as *mut _);
+    }
 
     unsafe {
         let future_ref = &*future;
@@ -325,6 +329,11 @@ pub extern "C-unwind" fn qi_future_await_f64(future: *mut Future) -> f64 {
     if future.is_null() {
         return 0.0;
     }
+    // coro future（QI_CORO）：magic 命中 → 取 i64 位模式再 bitcast 回 f64。
+    if unsafe { crate::async_runtime::coro::is_coro(future as *const _) } {
+        let bits = crate::async_runtime::coro::qi_coro_await_i64(future as *mut _);
+        return f64::from_bits(bits as u64);
+    }
 
     unsafe {
         let future_ref = &*future;
@@ -343,6 +352,10 @@ pub extern "C-unwind" fn qi_future_await_f64(future: *mut Future) -> f64 {
 pub extern "C-unwind" fn qi_future_await_bool(future: *mut Future) -> i32 {
     if future.is_null() {
         return 0;
+    }
+    // coro future（QI_CORO）：magic 命中 → i64 值 !=0 即 true。
+    if unsafe { crate::async_runtime::coro::is_coro(future as *const _) } {
+        return (crate::async_runtime::coro::qi_coro_await_i64(future as *mut _) != 0) as i32;
     }
 
     unsafe {
