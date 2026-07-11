@@ -668,7 +668,8 @@ pub extern "C" fn qi_json_array_length(array_id: i64) -> i64 {
     0
 }
 
-/// 检查对象是否包含键
+/// 检查对象是否包含键（值为 null 也算不存在——LLM 常输出 null 表「缺失」，
+/// 询问::<T> 的 选项<T> 可选字段靠这个语义区分 有/无）
 #[no_mangle]
 pub extern "C" fn qi_json_has_key(obj_id: i64, key: *const c_char) -> i64 {
     if obj_id <= 0 || key.is_null() {
@@ -685,7 +686,10 @@ pub extern "C" fn qi_json_has_key(obj_id: i64, key: *const c_char) -> i64 {
     let storage = JSON_VALUES.lock().unwrap();
     if let Some(ref map) = *storage {
         if let Some(Value::Object(ref obj)) = map.get(&(obj_id as u64)) {
-            return if obj.contains_key(key_str) { 1 } else { 0 };
+            return match obj.get(key_str) {
+                Some(v) if !v.is_null() => 1,
+                _ => 0,
+            };
         }
     }
     0
