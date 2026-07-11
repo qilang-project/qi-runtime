@@ -80,11 +80,6 @@ pub struct QiCoro {
 struct Cptr(*mut QiCoro);
 unsafe impl Send for Cptr {}
 
-/// R6：可跨 worker 传递的通道指针。
-#[derive(Clone, Copy)]
-struct ChanPtr(*mut QiCoroChan);
-unsafe impl Send for ChanPtr {}
-
 // ───────────────────────── R6 全局调度器状态 ─────────────────────────
 /// 全局就绪队列（多 worker 共享，Mutex 提供跨 worker happens-before）。
 static READY: Mutex<VecDeque<Cptr>> = Mutex::new(VecDeque::new());
