@@ -232,3 +232,53 @@ pub extern "C" fn qi_coro_await_i64(c: *mut QiCoro) -> i64 {
     qi_coro_run_until_done(c);
     unsafe { (*c).value }
 }
+
+/// R2：同步 `等待` 一个返回 RC 指针（字符串/结构体）的 coroutine future ——
+/// **take 语义**：promise 里的 +1 随返回值移交调用方，值槽置 0；二次 take
+/// 得 null（与 eager `qi_future_await_ptr` 的 take 一致，杜绝双释放）。
+///
+/// # Safety
+/// `c` 必须是 `qi_coro_spawn` 返回的有效 QiCoro 指针（或 null）。
+#[no_mangle]
+pub extern "C" fn qi_coro_take_ptr(c: *mut QiCoro) -> *mut u8 {
+    if c.is_null() {
+        return std::ptr::null_mut();
+    }
+    qi_coro_run_until_done(c);
+    unsafe {
+        let v = (*c).value;
+        (*c).value = 0;
+        v as *mut u8
+    }
+}
+
+/// R2：单步驱动执行器（resume 一个就绪协程一次 / 或睡到最早唤醒时刻）。
+/// 返回 1 = 队列还有协程；0 = 队列已空。
+#[no_mangle]
+pub extern "C" fn qi_coro_step_once() -> i64 {
+    step() as i64
+}
+
+/// R2：提前销毁一个未完成的协程（`取消未来`）。
+/// - 未完成：从待驱动队列摘除 + destroy handle —— destroy 克隆走 coroutine 的
+///   cleanup 路径，frame 内 RC 槽在 coro.free 前逐个释放（R2 的灵魂）。
+/// - 已完成/已取消/null：no-op（幂等，绝不双 destroy）。
+/// 取消后 done=true、value=0：再 `等待` 得 0/null（勿使用）。
+///
+/// # Safety
+/// `c` 必须是 `qi_coro_spawn` 返回的有效 QiCoro 指针（或 null）。
+#[no_mangle]
+pub extern "C" fn qi_coro_cancel(c: *mut QiCoro) {
+    if c.is_null() || unsafe { (*c).done } {
+        return;
+    }
+    // 从待驱动队列摘除（防 executor 之后 resume 已 destroy 的 handle）
+    PENDING.with(|p| p.borrow_mut().retain(|&x| x != c));
+    let ops = ops();
+    let hdl = unsafe { (*c).hdl };
+    (ops.destroy)(hdl);
+    unsafe {
+        (*c).done = true;
+        (*c).value = 0;
+    }
+}

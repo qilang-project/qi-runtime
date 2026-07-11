@@ -382,6 +382,10 @@ pub extern "C-unwind" fn qi_future_await_string(future: *mut Future) -> *const c
     if future.is_null() {
         return std::ptr::null();
     }
+    // coro future（QI_CORO）：promise 里是 +1 RC 字符串指针 —— take 移交调用方。
+    if unsafe { crate::async_runtime::coro::is_coro(future as *const _) } {
+        return crate::async_runtime::coro::qi_coro_take_ptr(future as *mut _) as *const c_char;
+    }
 
     unsafe {
         let future_ref = &*future;
@@ -411,6 +415,11 @@ pub extern "C-unwind" fn qi_future_await_string(future: *mut Future) -> *const c
 pub extern "C-unwind" fn qi_future_await_ptr(future: *mut Future) -> *mut u8 {
     if future.is_null() {
         return std::ptr::null_mut();
+    }
+    // coro future（QI_CORO）：promise 里是 +1 RC 指针（字符串/结构体）—— take
+    // 移交调用方（二次 take 得 null，杜绝双释放）。
+    if unsafe { crate::async_runtime::coro::is_coro(future as *const _) } {
+        return crate::async_runtime::coro::qi_coro_take_ptr(future as *mut _);
     }
 
     unsafe {
