@@ -202,6 +202,23 @@ pub(crate) unsafe fn obj_release_shallow(data: *const u8) {
     }
 }
 
+/// 判别一个指针是否为 RC 字符串（STR magic）。null / OBJ / CLO / 其它 → 0。
+///
+/// 供 codegen 的「延迟解码 future」使用：`异步询问::<T>` 返回的 未来<T> 物理上
+/// 装的是**原始回复字符串**（在飞 HTTP），而普通结构体 future 装的是结构体指针。
+/// `等待` 在 IR 层用本函数区分两者：STR → JSON 解码建 T；OBJ → 直接就是 T。
+/// 前提与 qi_obj_retain 相同：所有 RC 分配的 header 在 base-24 且可读。
+#[no_mangle]
+pub extern "C" fn qi_rc_is_string(p: *const u8) -> i64 {
+    if p.is_null() {
+        return 0;
+    }
+    unsafe {
+        let magic = *(p.sub(HEADER_SIZE) as *const u64);
+        i64::from(magic == QI_STR_MAGIC)
+    }
+}
+
 /// 增引用：null no-op；OBJ magic → refcount++；STR magic → 委托字符串 retain；
 /// CLO magic → 委托闭包 retain；其余 → 一次性警告后 no-op。
 #[no_mangle]
