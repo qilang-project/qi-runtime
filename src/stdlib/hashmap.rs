@@ -361,6 +361,100 @@ pub extern "C" fn qi_hashmap_string_size(map_id: i64) -> i64 {
     0
 }
 
+/// 检查字符串哈希表是否包含键（与整数表 contains 对称）
+#[no_mangle]
+pub extern "C" fn qi_hashmap_str_contains(map_id: i64, key: *const c_char) -> i64 {
+    if map_id <= 0 {
+        return 0;
+    }
+    let key_str = unsafe {
+        match c_str_to_rust(key) {
+            Some(s) => s,
+            None => return 0,
+        }
+    };
+    let maps = HASHMAPS.lock().unwrap();
+    if let Some(ref map_collection) = *maps {
+        if let Some(MapValue::StringMap(ref map)) = map_collection.get(&(map_id as u64)) {
+            return if map.contains_key(&key_str) { 1 } else { 0 };
+        }
+    }
+    0
+}
+
+/// 删除字符串哈希表的键（与整数表 remove 对称）
+#[no_mangle]
+pub extern "C" fn qi_hashmap_str_remove(map_id: i64, key: *const c_char) -> i64 {
+    if map_id <= 0 {
+        return 0;
+    }
+    let key_str = unsafe {
+        match c_str_to_rust(key) {
+            Some(s) => s,
+            None => return 0,
+        }
+    };
+    let mut maps = HASHMAPS.lock().unwrap();
+    if let Some(ref mut map_collection) = *maps {
+        if let Some(MapValue::StringMap(ref mut map)) = map_collection.get_mut(&(map_id as u64)) {
+            return if map.remove(&key_str).is_some() { 1 } else { 0 };
+        }
+    }
+    0
+}
+
+/// 通用：检查任意类型哈希表是否包含键（整数/浮点/字符串表统一分派）。
+/// `哈希表.包含键` 绑定此函数，故对三种表都正确（此前只认整数表）。
+#[no_mangle]
+pub extern "C" fn qi_hashmap_contains(map_id: i64, key: *const c_char) -> i64 {
+    if map_id <= 0 {
+        return 0;
+    }
+    let key_str = unsafe {
+        match c_str_to_rust(key) {
+            Some(s) => s,
+            None => return 0,
+        }
+    };
+    let maps = HASHMAPS.lock().unwrap();
+    if let Some(ref map_collection) = *maps {
+        let has = match map_collection.get(&(map_id as u64)) {
+            Some(MapValue::IntegerMap(m)) => m.contains_key(&key_str),
+            Some(MapValue::FloatMap(m)) => m.contains_key(&key_str),
+            Some(MapValue::StringMap(m)) => m.contains_key(&key_str),
+            None => false,
+        };
+        return if has { 1 } else { 0 };
+    }
+    0
+}
+
+/// 通用：删除任意类型哈希表的键（整数/浮点/字符串表统一分派）。
+/// `哈希表.删除键` 绑定此函数。返回 1=删了 / 0=键不存在或表无效。
+#[no_mangle]
+pub extern "C" fn qi_hashmap_remove(map_id: i64, key: *const c_char) -> i64 {
+    if map_id <= 0 {
+        return 0;
+    }
+    let key_str = unsafe {
+        match c_str_to_rust(key) {
+            Some(s) => s,
+            None => return 0,
+        }
+    };
+    let mut maps = HASHMAPS.lock().unwrap();
+    if let Some(ref mut map_collection) = *maps {
+        let removed = match map_collection.get_mut(&(map_id as u64)) {
+            Some(MapValue::IntegerMap(m)) => m.remove(&key_str).is_some(),
+            Some(MapValue::FloatMap(m)) => m.remove(&key_str).is_some(),
+            Some(MapValue::StringMap(m)) => m.remove(&key_str).is_some(),
+            None => false,
+        };
+        return if removed { 1 } else { 0 };
+    }
+    0
+}
+
 // ============================================================================
 // 通用操作 (Generic Operations)
 // ============================================================================
