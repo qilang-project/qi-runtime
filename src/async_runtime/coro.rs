@@ -22,6 +22,23 @@
 //! - QiCoro frame 任一时刻仅一个 worker 持有（就绪队列出队即独占）；ARC refcount 是
 //!   AtomicI64（qi_str/rc_obj），跨 worker 共享 RC 对象安全。
 //! - RC 对象/frame 的数据可见性由就绪队列的 Mutex（release/acquire）提供 happens-before。
+//!
+//! ## R7：高扇入抗惊群（work-stealing 本地队列 + IDLE 门控 notify + HANDOFF 死锁修）
+//! R6 里所有唤醒都推**全局** READY + 每次 `notify_one`。高扇入（单消费者连续唤醒 5 万
+//! 发送者）下：每唤醒一个就 notify 一个睡着的 worker，worker 醒来只干一点点活（发送者
+//! 仅剩 `返回`）又睡 —— 5 万次 park/notify 的 futex 往返≈整段耗时（实测 215ms，其中
+//! `wait≈4.9 万`）。三处根治：
+//! - **每 worker 本地就绪队列 `LOCALQ` + 批量偷取**：worker 内唤醒对端时，NEXT 单槽已占
+//!   （高扇入的第 2 个起）就落**本地队列**（自 push 几乎无争用），空闲 worker 从别人队列
+//!   一次**偷一半**（摊薄全局锁争用）。取代「全部挤全局 READY 由 12 worker 抢单个」。
+//! - **IDLE 门控 notify**：只有真的有 worker park 在 Condvar（`IDLE>0`）才 `notify_one`；
+//!   忙碌 worker 自己从队列/偷取抢活 → 免空发 notify 的 futex 风暴。
+//! - **HANDOFF 计数修死锁误判**：NEXT 单槽里的在途协程不计入 SCHEDULABLE，R6 靠 2ms 采样
+//!   概率躲过「对端刚进 NEXT、RUNNING 归 0」窗口；R7 用 `HANDOFF` 原子精确计数，死锁检测
+//!   要求 `RUNNING==0 && HANDOFF==0`，pingpong 不再偶发假死锁。
+//! 效果：高扇入 215ms→~30ms（反超 Go 49ms），pingpong/chan/纯创建 无回退。CPU 密集非
+//!   调度器瓶颈（大负载实测扩展 5.2×≈Go 5.9×，小负载差距是单核 codegen O1 + turbo）。
+//! `QI_CORO_SPIN`（默认 0）保留 park 前自旋旋钮（当前无收益，实验用）。
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -89,10 +106,27 @@ static CV: Condvar = Condvar::new();
 static LIVE: AtomicI64 = AtomicI64::new(0);
 /// 正在被某 worker resume 的协程数（就绪队列取出即 ++，跑完 --）。
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
-/// 正停在某 worker NEXT 单槽里的在途协程数（NEXT 直接交接期间，协程「有主」但既不在
-/// RUNNING 也不在 READY）。死锁检测必须把它算上：否则对端刚进 NEXT、持有者恰在 RUNNING
-/// 归 0 的瞬时窗口会被误判死锁（R6 靠 2ms 采样 + 连续确认 2 次概率躲过，仍偶发假死锁）。
+/// 可调度协程总数镜像（全局 READY + 所有 worker 本地队列，不含 NEXT 单槽）。无锁快照：
+/// 供 worker 自旋时免锁探测有无新活，也供 push 端判断是否需 notify。
+static SCHEDULABLE: AtomicUsize = AtomicUsize::new(0);
+/// 正 park 在 Condvar 上的 worker 数（>0 才需 notify，避免 handoff 时空发 notify）。
+static IDLE: AtomicUsize = AtomicUsize::new(0);
+/// 正停在某 worker NEXT 单槽里的协程数（NEXT 私有不可偷、不计入 SCHEDULABLE）。它们
+/// 是「在途可跑」的活 —— 死锁检测必须把它算上，否则 pingpong 里对端刚进 NEXT、持有者
+/// 恰好在 RUNNING 归 0 的瞬时窗口会被误判死锁（旧代码靠 2ms 采样概率侥幸躲过）。
 static HANDOFF: AtomicUsize = AtomicUsize::new(0);
+/// park 前自旋轮数上限（run_all 读 QI_CORO_SPIN 覆盖，默认 0=不自旋）。IDLE 门控 notify +
+/// 批量偷取已消除 futex 风暴，自旋反而在过订阅（worker>物理核）时抢核、拖累 pingpong，
+/// 故默认关；保留旋钮供实验。
+static SPIN_LIMIT: AtomicUsize = AtomicUsize::new(0);
+
+/// worker 本地就绪队列上限（同时也是 run_all 支持的最大 worker 数）。
+const MAX_WORKERS: usize = 256;
+/// 每 worker 一个本地就绪队列（可被其它 worker 偷取，散播 handoff 密集时的溢出唤醒）。
+/// 自 push/pop 走本队列锁（几乎无争用）；偷取时批量搬走一半（摊薄争用）。R6 的单槽 NEXT
+/// 仍保留（不可偷，保 pingpong 生产者↔消费者定位）；NEXT 满后的额外唤醒才落本地队列。
+static LOCALQ: [Mutex<VecDeque<Cptr>>; MAX_WORKERS] =
+    [const { Mutex::new(VecDeque::new()) }; MAX_WORKERS];
 /// 本次 run_all 的 worker 总数。
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// 广播退出（LIVE==0 或死锁）。
@@ -119,6 +153,9 @@ thread_local! {
     /// R6：死锁误判防护——(队列空+RUNNING=0+LIVE>0) 连续确认 2 次才判死锁，
     /// 避开「协程刚进本地 NEXT、RUNNING 短暂归 0」的瞬时窗口。
     static DEADLOCK_CONFIRM: Cell<i32> = const { Cell::new(0) };
+    /// 本 worker 在 LOCALQ 中的下标（0..WORKERS）；usize::MAX = 非 worker 线程
+    /// （主线程 spawn 阶段 / 同步 step 上下文），此时唤醒/入队一律走全局 READY。
+    static WORKER_ID: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
 fn now_ms() -> u64 {
@@ -146,7 +183,21 @@ pub extern "C" fn qi_coro_sleep(ms: i64) {
 /// 2ms 超时兜底（醒来重查队列）。
 fn push_ready(c: Cptr) {
     READY.lock().unwrap().push_back(c);
-    CV.notify_one();
+    SCHEDULABLE.fetch_add(1, Ordering::Release);
+    // 仅当有 worker 真的 park 在 Condvar 上才 notify。忙碌/自旋中的 worker 会自己
+    // 探测 SCHEDULABLE 抢活 —— 免去 handoff 密集场景（高扇入）的 futex 唤醒风暴。
+    if IDLE.load(Ordering::Acquire) > 0 {
+        CV.notify_one();
+    }
+}
+
+/// 入本 worker 的本地就绪队列（可被偷）。wake 溢出（NEXT 已占）时用。
+fn push_local(wid: usize, c: Cptr) {
+    LOCALQ[wid].lock().unwrap().push_back(c);
+    SCHEDULABLE.fetch_add(1, Ordering::Release);
+    if IDLE.load(Ordering::Acquire) > 0 {
+        CV.notify_one();
+    }
 }
 
 /// coroutine ramp 初始挂起时由调用点调：把 handle 包成 future 入队（或据延迟 park 意图挂通道）。
@@ -214,30 +265,81 @@ fn pick() -> Option<Result<Cptr, u64>> {
         HANDOFF.fetch_sub(1, Ordering::AcqRel);
         return Some(Ok(Cptr(nx)));
     }
-    let mut q = READY.lock().unwrap();
-    if q.is_empty() {
-        return None;
-    }
-    let now = now_ms();
-    let mut earliest = u64::MAX;
-    let mut idx = None;
-    for (i, c) in q.iter().enumerate() {
-        let w = unsafe { (*c.0).wake_at };
-        if w <= now {
-            idx = Some(i);
-            break;
-        }
-        if w < earliest {
-            earliest = w;
-        }
-    }
-    match idx {
-        Some(i) => {
-            let c = q.remove(i).unwrap();
+    let wid = WORKER_ID.with(|w| w.get());
+    // 本 worker 本地队列（LIFO 保 handoff 局部性；本队列锁几乎无争用）。
+    if wid != usize::MAX {
+        if let Some(c) = LOCALQ[wid].lock().unwrap().pop_back() {
+            SCHEDULABLE.fetch_sub(1, Ordering::Release);
             RUNNING.fetch_add(1, Ordering::AcqRel);
-            Some(Ok(c))
+            return Some(Ok(c));
         }
-        None => Some(Err(earliest.saturating_sub(now))),
+    }
+    // 全局 READY（含定时器：只取到点的；否则记最早时刻，落到偷取后再决定）。
+    let mut timer: Option<u64> = None;
+    {
+        let mut q = READY.lock().unwrap();
+        if !q.is_empty() {
+            let now = now_ms();
+            let mut earliest = u64::MAX;
+            let mut idx = None;
+            for (i, c) in q.iter().enumerate() {
+                let w = unsafe { (*c.0).wake_at };
+                if w <= now {
+                    idx = Some(i);
+                    break;
+                }
+                if w < earliest {
+                    earliest = w;
+                }
+            }
+            match idx {
+                Some(i) => {
+                    let c = q.remove(i).unwrap();
+                    SCHEDULABLE.fetch_sub(1, Ordering::Release);
+                    RUNNING.fetch_add(1, Ordering::AcqRel);
+                    return Some(Ok(c));
+                }
+                None => timer = Some(earliest.saturating_sub(now)),
+            }
+        }
+    }
+    // 偷取：从其它 worker 的本地队列各偷取一半（批量，摊薄争用）。偷到即跑。
+    if wid != usize::MAX {
+        let n = WORKERS.load(Ordering::Acquire).min(MAX_WORKERS);
+        for off in 1..n {
+            let victim = (wid + off) % n;
+            if let Ok(mut vq) = LOCALQ[victim].try_lock() {
+                let len = vq.len();
+                if len == 0 {
+                    continue;
+                }
+                let take = len.div_ceil(2); // 偷一半（向上取整，至少 1）
+                                            // 搬 take 个到本地队列，返回其中一个直接跑。
+                let mut mine = LOCALQ[wid].lock().unwrap();
+                let mut first = None;
+                for _ in 0..take {
+                    if let Some(c) = vq.pop_front() {
+                        if first.is_none() {
+                            first = Some(c);
+                        } else {
+                            mine.push_back(c);
+                        }
+                    }
+                }
+                drop(mine);
+                drop(vq);
+                if let Some(c) = first {
+                    // take 个里 1 个直接跑、其余进本地：SCHEDULABLE 只减 1（跑的那个）。
+                    SCHEDULABLE.fetch_sub(1, Ordering::Release);
+                    RUNNING.fetch_add(1, Ordering::AcqRel);
+                    return Some(Ok(c));
+                }
+            }
+        }
+    }
+    match timer {
+        Some(ms) => Some(Err(ms)),
+        None => None,
     }
 }
 
@@ -293,9 +395,24 @@ fn worker_loop() {
                 std::thread::sleep(Duration::from_millis(sleep_ms.min(5).max(1)));
             }
             None => {
-                // 就绪队列空。等待新 work，或判死锁/完成。
+                // 就绪队列空。先自旋无锁探测（桥接 handoff 空档，免 park/notify futex 风暴），
+                // 自旋耗尽仍无活才 park。
+                let spin = SPIN_LIMIT.load(Ordering::Relaxed);
+                let mut got = false;
+                for _ in 0..spin {
+                    if SCHEDULABLE.load(Ordering::Acquire) > 0 || SHUTDOWN.load(Ordering::Acquire) {
+                        got = true;
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                if got {
+                    continue; // 回去 pick 抢活 / 或退出
+                }
+                // 自旋耗尽仍无活 → 等待新 work，或判死锁/完成。
                 let guard = READY.lock().unwrap();
-                if !guard.is_empty() || SHUTDOWN.load(Ordering::Acquire) {
+                // SCHEDULABLE 含本地队列：全局 READY 空但某本地队列仍有活（可偷）→ 别 park。
+                if SCHEDULABLE.load(Ordering::Acquire) > 0 || SHUTDOWN.load(Ordering::Acquire) {
                     continue;
                 }
                 if LIVE.load(Ordering::Acquire) <= 0 {
@@ -320,8 +437,13 @@ fn worker_loop() {
                 } else {
                     DEADLOCK_CONFIRM.with(|d| d.set(0));
                 }
-                // 有 worker 在跑（可能即将 wake 出新 work）→ 等通知（带超时防错过）。
-                let _ = CV.wait_timeout(guard, Duration::from_millis(2)).unwrap();
+                // 有 worker 在跑（可能即将 wake 出新 work）→ 真 park。IDLE++ 让 push_ready
+                // 知道有人在睡、需要 notify（在锁内改 IDLE，与 push_ready 的 lock 顺序一致，
+                // 无丢唤醒）。带超时兜底防错过。
+                IDLE.fetch_add(1, Ordering::Release);
+                let (guard, _) = CV.wait_timeout(guard, Duration::from_millis(2)).unwrap();
+                IDLE.fetch_sub(1, Ordering::Release);
+                drop(guard);
             }
         }
     }
@@ -336,24 +458,39 @@ pub extern "C" fn qi_coro_run_all() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&x| x >= 1)
+        .map(|x| x.min(MAX_WORKERS))
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|x| x.get())
                 .unwrap_or(1)
+                .min(MAX_WORKERS)
         });
+    if let Some(s) = std::env::var("QI_CORO_SPIN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        SPIN_LIMIT.store(s, Ordering::Relaxed);
+    }
     SHUTDOWN.store(false, Ordering::Release);
     DEADLOCK.store(false, Ordering::Release);
     WORKERS.store(n, Ordering::Release);
 
     if n == 1 {
         // 单 worker：调用线程直接跑（与 R5 单线程行为一致，零线程开销）。
+        WORKER_ID.with(|w| w.set(0));
         worker_loop();
+        WORKER_ID.with(|w| w.set(usize::MAX));
     } else {
         let mut handles = Vec::new();
-        for _ in 1..n {
-            handles.push(std::thread::spawn(worker_loop));
+        for id in 1..n {
+            handles.push(std::thread::spawn(move || {
+                WORKER_ID.with(|w| w.set(id));
+                worker_loop();
+            }));
         }
-        worker_loop(); // 调用线程也当一个 worker
+        WORKER_ID.with(|w| w.set(0)); // 调用线程也当一个 worker（id 0）
+        worker_loop();
+        WORKER_ID.with(|w| w.set(usize::MAX));
         for h in handles {
             let _ = h.join();
         }
@@ -496,11 +633,17 @@ fn wake(c: Cptr) {
     unsafe {
         (*c.0).wake_at = 0;
     }
-    let in_worker = CURRENT.with(|x| !x.get().is_null());
-    if in_worker && NEXT.with(|n| n.get().is_null()) {
-        // HANDOFF++ 在 waker 仍 RUNNING 时发生 → 全程 RUNNING>0||HANDOFF>0，死锁检测不误判。
-        HANDOFF.fetch_add(1, Ordering::AcqRel);
-        NEXT.with(|n| n.set(c.0));
+    let wid = WORKER_ID.with(|w| w.get());
+    if wid != usize::MAX {
+        // 本 worker 内唤醒对端：优先塞 NEXT 单槽（不可偷，保 pingpong 生产者↔消费者定位）。
+        if NEXT.with(|n| n.get().is_null()) {
+            // HANDOFF++ 在 waker 仍 RUNNING 时发生 → 全程 RUNNING>0||HANDOFF>0，死锁检测不误判。
+            HANDOFF.fetch_add(1, Ordering::AcqRel);
+            NEXT.with(|n| n.set(c.0));
+            return;
+        }
+        // NEXT 已占（如高扇入：单消费者连续唤醒众发送者）→ 落本地队列，空闲 worker 可批量偷。
+        push_local(wid, c);
         return;
     }
     push_ready(c);
@@ -675,7 +818,15 @@ pub extern "C" fn qi_coro_cancel(c: *mut QiCoro) {
     if c.is_null() || unsafe { (*c).done } {
         return;
     }
-    READY.lock().unwrap().retain(|x| x.0 != c);
+    {
+        let mut q = READY.lock().unwrap();
+        let before = q.len();
+        q.retain(|x| x.0 != c);
+        let removed = before - q.len();
+        if removed > 0 {
+            SCHEDULABLE.fetch_sub(removed, Ordering::Release);
+        }
+    }
     let ops = ops();
     let hdl = unsafe { (*c).hdl };
     (ops.destroy)(hdl);
