@@ -130,10 +130,12 @@ pub extern "C" fn qi_coro_sleep(ms: i64) {
     LAST_WAKE.with(|w| w.set(t));
 }
 
-/// 入就绪队列 + 唤醒等待 worker。notify_all：多 worker 下宁多醒不漏醒（醒来抢不到活会再睡）。
+/// 入就绪队列 + 唤醒一个等待 worker。notify_one 避免惊群（notify_all 会让 N 个 worker
+/// 全醒、N-1 个抢不到活白白再睡 → 通道密集场景 O(N) 浪费）。漏醒由 worker wait 的
+/// 2ms 超时兜底（醒来重查队列）。
 fn push_ready(c: Cptr) {
     READY.lock().unwrap().push_back(c);
-    CV.notify_all();
+    CV.notify_one();
 }
 
 /// coroutine ramp 初始挂起时由调用点调：把 handle 包成 future 入队（或据延迟 park 意图挂通道）。
