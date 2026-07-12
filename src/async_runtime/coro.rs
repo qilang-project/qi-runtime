@@ -108,6 +108,13 @@ thread_local! {
     static PARK_INTENT_VAL: Cell<i64> = const { Cell::new(0) };
     /// 协程挂起前的下次恢复意愿：0 = 立即就绪；>0 = 睡到该绝对 ms。
     static LAST_WAKE: Cell<u64> = const { Cell::new(0) };
+    /// R6 **直接交接**：运行中的协程唤醒对端时，把对端塞进本 worker 的「下一个」槽而非推
+    /// 全局队列+跨线程唤醒 —— 让 pingpong（生产者↔消费者）待在同一线程上，免去每次交接
+    /// 的跨线程 condvar 唤醒（通道密集从 1764ms→接近单线程）。pick() 先取此槽。
+    static NEXT: Cell<*mut QiCoro> = const { Cell::new(std::ptr::null_mut()) };
+    /// R6：死锁误判防护——(队列空+RUNNING=0+LIVE>0) 连续确认 2 次才判死锁，
+    /// 避开「协程刚进本地 NEXT、RUNNING 短暂归 0」的瞬时窗口。
+    static DEADLOCK_CONFIRM: Cell<i32> = const { Cell::new(0) };
 }
 
 fn now_ms() -> u64 {
@@ -195,6 +202,12 @@ pub extern "C" fn qi_coro_spawn(hdl: *mut c_void) -> *mut QiCoro {
 /// - None：队列真空。
 /// RUNNING 在取到时同锁内 ++（与死锁检测同步）。
 fn pick() -> Option<Result<Cptr, u64>> {
+    // R6 直接交接：先取本 worker 的 NEXT 槽（同线程接力，不进全局队列/不跨线程唤醒）。
+    let nx = NEXT.with(|n| n.replace(std::ptr::null_mut()));
+    if !nx.is_null() {
+        RUNNING.fetch_add(1, Ordering::AcqRel);
+        return Some(Ok(Cptr(nx)));
+    }
     let mut q = READY.lock().unwrap();
     if q.is_empty() {
         return None;
@@ -265,9 +278,12 @@ fn worker_loop() {
             return;
         }
         match pick() {
-            Some(Ok(c)) => run_one(c),
+            Some(Ok(c)) => {
+                DEADLOCK_CONFIRM.with(|d| d.set(0)); // 有活 → 重置死锁确认
+                run_one(c);
+            }
             Some(Err(sleep_ms)) => {
-                // 有定时器但没到点：短睡等最早唤醒（并让出以便别的 worker 抢 wake 的活）。
+                DEADLOCK_CONFIRM.with(|d| d.set(0));
                 std::thread::sleep(Duration::from_millis(sleep_ms.min(5).max(1)));
             }
             None => {
@@ -281,12 +297,22 @@ fn worker_loop() {
                     CV.notify_all();
                     return;
                 }
-                // 队列空 + 无人在跑 + 仍有活协程 → 全 park 无人唤醒 → 死锁。
+                // 队列空 + 无人在跑 + 仍有活协程 → 疑似死锁。但要防 NEXT 直接交接的瞬时
+                // 窗口（协程刚进某 worker 的 NEXT、RUNNING 短暂归 0）：连续确认 2 次才判死。
                 if RUNNING.load(Ordering::Acquire) == 0 {
-                    DEADLOCK.store(true, Ordering::Release);
-                    SHUTDOWN.store(true, Ordering::Release);
-                    CV.notify_all();
-                    return;
+                    let n = DEADLOCK_CONFIRM.with(|d| {
+                        let v = d.get() + 1;
+                        d.set(v);
+                        v
+                    });
+                    if n >= 2 {
+                        DEADLOCK.store(true, Ordering::Release);
+                        SHUTDOWN.store(true, Ordering::Release);
+                        CV.notify_all();
+                        return;
+                    }
+                } else {
+                    DEADLOCK_CONFIRM.with(|d| d.set(0));
                 }
                 // 有 worker 在跑（可能即将 wake 出新 work）→ 等通知（带超时防错过）。
                 let _ = CV.wait_timeout(guard, Duration::from_millis(2)).unwrap();
@@ -455,13 +481,19 @@ pub struct QiCoroChan {
     inner: Mutex<ChanInner>,
 }
 
-/// 唤醒一个 parked 协程 —— 移回就绪队列（立即就绪）+ 通知 worker。
+/// 唤醒一个 parked 协程 —— 立即就绪。R6 直接交接：若本 worker 正在跑协程（CURRENT 非空）
+/// 且本地 NEXT 槽空 → 塞进 NEXT，本 worker 接力跑（不跨线程、不推全局队列）；否则推全局队列。
 fn wake(c: Cptr) {
     if c.0.is_null() {
         return;
     }
     unsafe {
         (*c.0).wake_at = 0;
+    }
+    let in_worker = CURRENT.with(|x| !x.get().is_null());
+    if in_worker && NEXT.with(|n| n.get().is_null()) {
+        NEXT.with(|n| n.set(c.0));
+        return;
     }
     push_ready(c);
 }
