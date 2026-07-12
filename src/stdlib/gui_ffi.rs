@@ -146,6 +146,33 @@ extern "C" {
         b: u8,
     );
     fn qi_gui_renderer_free_impl(renderer_id: u64);
+
+    // ── egui 控件层 ──────────────────────────────────────────────
+    fn qi_gui_egui_app_create_impl(title: *const c_char, width: u32, height: u32) -> u64;
+    fn qi_gui_egui_frame_begin_impl(app_id: u64) -> i32;
+    fn qi_gui_egui_frame_end_impl(app_id: u64);
+    fn qi_gui_egui_app_close_impl(app_id: u64);
+    fn qi_gui_egui_label_impl(text: *const c_char);
+    fn qi_gui_egui_heading_impl(text: *const c_char);
+    fn qi_gui_egui_colored_label_impl(text: *const c_char, r: i64, g: i64, b: i64);
+    fn qi_gui_egui_button_impl(text: *const c_char) -> i32;
+    fn qi_gui_egui_text_edit_impl(id: *const c_char, value: *const c_char) -> *const c_char;
+    fn qi_gui_egui_text_edit_multiline_impl(
+        id: *const c_char,
+        value: *const c_char,
+    ) -> *const c_char;
+    fn qi_gui_egui_slider_impl(id: *const c_char, cur: i64, min: i64, max: i64) -> i64;
+    fn qi_gui_egui_checkbox_impl(id: *const c_char, text: *const c_char, cur: i32) -> i32;
+    fn qi_gui_egui_combo_impl(id: *const c_char, options_csv: *const c_char, cur: i64) -> i64;
+    fn qi_gui_egui_separator_impl();
+    fn qi_gui_egui_space_impl();
+    fn qi_gui_egui_horizontal_begin_impl();
+    fn qi_gui_egui_horizontal_end_impl();
+    fn qi_gui_egui_group_begin_impl(title: *const c_char);
+    fn qi_gui_egui_group_end_impl();
+    fn qi_gui_egui_progress_impl(percent: i64);
+    fn qi_gui_egui_plot_impl(id: *const c_char, values_csv: *const c_char, width: i64, height: i64);
+    fn qi_gui_egui_message_impl(text: *const c_char);
 }
 
 #[no_mangle]
@@ -984,6 +1011,320 @@ pub extern "C" fn qi_gui_renderer_free(renderer_id: i64) {
     #[cfg(not(has_gui))]
     {
         let _ = renderer_id;
+    }
+}
+
+// ============================================================================
+// egui 控件层 —— Qi ABI 包装（整数一律 i64，字符串 *const c_char）
+// ============================================================================
+
+/// 创建 egui 应用窗口，返回句柄（>0 成功，0 失败）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_app_create(title: *const c_char, width: i64, height: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        if title.is_null() {
+            return 0;
+        }
+        unsafe { qi_gui_egui_app_create_impl(title, width as u32, height as u32) as i64 }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (title, width, height);
+        eprintln!("错误: GUI 库未安装。请安装完整版本以使用图形化功能。");
+        0
+    }
+}
+
+/// 帧开始：返回 1=窗口存活，0=已关闭
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_frame_begin(app_id: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        if app_id <= 0 {
+            return 0;
+        }
+        unsafe { qi_gui_egui_frame_begin_impl(app_id as u64) as i64 }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = app_id;
+        0
+    }
+}
+
+/// 帧结束
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_frame_end(app_id: i64) {
+    #[cfg(has_gui)]
+    {
+        if app_id <= 0 {
+            return;
+        }
+        unsafe { qi_gui_egui_frame_end_impl(app_id as u64) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = app_id;
+    }
+}
+
+/// 关闭应用
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_app_close(app_id: i64) {
+    #[cfg(has_gui)]
+    {
+        if app_id <= 0 {
+            return;
+        }
+        unsafe { qi_gui_egui_app_close_impl(app_id as u64) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = app_id;
+    }
+}
+
+/// 标签
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_label(text: *const c_char) {
+    #[cfg(has_gui)]
+    {
+        if !text.is_null() {
+            unsafe { qi_gui_egui_label_impl(text) }
+        }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = text;
+    }
+}
+
+/// 标题文本（大号）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_heading(text: *const c_char) {
+    #[cfg(has_gui)]
+    {
+        if !text.is_null() {
+            unsafe { qi_gui_egui_heading_impl(text) }
+        }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = text;
+    }
+}
+
+/// 彩色标签
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_colored_label(text: *const c_char, r: i64, g: i64, b: i64) {
+    #[cfg(has_gui)]
+    {
+        if !text.is_null() {
+            unsafe { qi_gui_egui_colored_label_impl(text, r, g, b) }
+        }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (text, r, g, b);
+    }
+}
+
+/// 按钮：返回本帧是否被点击（1/0）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_button(text: *const c_char) -> i64 {
+    #[cfg(has_gui)]
+    {
+        if text.is_null() {
+            return 0;
+        }
+        unsafe { qi_gui_egui_button_impl(text) as i64 }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = text;
+        0
+    }
+}
+
+/// 单行输入框：传入当前值，返回新值
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_text_edit(id: *const c_char, value: *const c_char) -> *mut c_char {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_text_edit_impl(id, value) as *mut c_char }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (id, value);
+        std::ptr::null_mut()
+    }
+}
+
+/// 多行输入框
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_text_edit_multiline(
+    id: *const c_char,
+    value: *const c_char,
+) -> *mut c_char {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_text_edit_multiline_impl(id, value) as *mut c_char }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (id, value);
+        std::ptr::null_mut()
+    }
+}
+
+/// 整数滑条：返回新值
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_slider(id: *const c_char, cur: i64, min: i64, max: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_slider_impl(id, cur, min, max) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (id, min, max);
+        cur
+    }
+}
+
+/// 复选框：返回新的勾选状态（1/0）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_checkbox(id: *const c_char, text: *const c_char, cur: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_checkbox_impl(id, text, cur as i32) as i64 }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (id, text);
+        cur
+    }
+}
+
+/// 下拉选择：options 为 CSV，cur 为当前序号，返回新序号
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_combo(
+    id: *const c_char,
+    options_csv: *const c_char,
+    cur: i64,
+) -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_combo_impl(id, options_csv, cur) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (id, options_csv);
+        cur
+    }
+}
+
+/// 分隔线
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_separator() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_separator_impl()
+    }
+}
+
+/// 空行（纵向间距）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_space() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_space_impl()
+    }
+}
+
+/// 水平布局开始
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_horizontal_begin() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_horizontal_begin_impl()
+    }
+}
+
+/// 水平布局结束
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_horizontal_end() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_horizontal_end_impl()
+    }
+}
+
+/// 分组开始（带标题边框）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_group_begin(title: *const c_char) {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_group_begin_impl(title) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = title;
+    }
+}
+
+/// 分组结束
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_group_end() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_group_end_impl()
+    }
+}
+
+/// 进度条：percent 0..100
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_progress(percent: i64) {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_progress_impl(percent) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = percent;
+    }
+}
+
+/// 折线图：id 标识，values 为 CSV 数值，宽高（点）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_plot(
+    id: *const c_char,
+    values_csv: *const c_char,
+    width: i64,
+    height: i64,
+) {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_plot_impl(id, values_csv, width, height) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (id, values_csv, width, height);
+    }
+}
+
+/// 消息弹窗：浮动窗口显示文本（需每帧调用保持显示）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_message(text: *const c_char) {
+    #[cfg(has_gui)]
+    {
+        if !text.is_null() {
+            unsafe { qi_gui_egui_message_impl(text) }
+        }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = text;
     }
 }
 

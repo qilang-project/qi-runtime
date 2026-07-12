@@ -23,6 +23,11 @@
 //! // runtime.execute_program(program_data).unwrap();
 //! ```
 
+// GUI 特性开启时把 qi-gui 拉入链接图，使其 #[no_mangle] qi_gui_*_impl 符号
+// 编入 libqi_runtime.a（供 stdlib::gui_ffi 的包装转调，含老 tao API 与 egui 控件层）。
+#[cfg(feature = "gui")]
+extern crate qi_gui;
+
 pub mod async_runtime;
 pub mod debug;
 pub mod environment;
