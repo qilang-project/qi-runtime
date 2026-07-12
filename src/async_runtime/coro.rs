@@ -89,6 +89,10 @@ static CV: Condvar = Condvar::new();
 static LIVE: AtomicI64 = AtomicI64::new(0);
 /// 正在被某 worker resume 的协程数（就绪队列取出即 ++，跑完 --）。
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
+/// 正停在某 worker NEXT 单槽里的在途协程数（NEXT 直接交接期间，协程「有主」但既不在
+/// RUNNING 也不在 READY）。死锁检测必须把它算上：否则对端刚进 NEXT、持有者恰在 RUNNING
+/// 归 0 的瞬时窗口会被误判死锁（R6 靠 2ms 采样 + 连续确认 2 次概率躲过，仍偶发假死锁）。
+static HANDOFF: AtomicUsize = AtomicUsize::new(0);
 /// 本次 run_all 的 worker 总数。
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// 广播退出（LIVE==0 或死锁）。
@@ -205,7 +209,9 @@ fn pick() -> Option<Result<Cptr, u64>> {
     // R6 直接交接：先取本 worker 的 NEXT 槽（同线程接力，不进全局队列/不跨线程唤醒）。
     let nx = NEXT.with(|n| n.replace(std::ptr::null_mut()));
     if !nx.is_null() {
+        // 先 RUNNING++ 再 HANDOFF--：区间不存在两者同 0 的窗口（协程始终「有主」）。
         RUNNING.fetch_add(1, Ordering::AcqRel);
+        HANDOFF.fetch_sub(1, Ordering::AcqRel);
         return Some(Ok(Cptr(nx)));
     }
     let mut q = READY.lock().unwrap();
@@ -297,9 +303,9 @@ fn worker_loop() {
                     CV.notify_all();
                     return;
                 }
-                // 队列空 + 无人在跑 + 仍有活协程 → 疑似死锁。但要防 NEXT 直接交接的瞬时
-                // 窗口（协程刚进某 worker 的 NEXT、RUNNING 短暂归 0）：连续确认 2 次才判死。
-                if RUNNING.load(Ordering::Acquire) == 0 {
+                // 队列空 + 无人在跑 + 无在途 handoff + 仍有活协程 → 疑似死锁。HANDOFF 计入
+                // NEXT 单槽里的在途协程（否则 pingpong 误判）；再叠加连续确认 2 次防瞬时窗口。
+                if RUNNING.load(Ordering::Acquire) == 0 && HANDOFF.load(Ordering::Acquire) == 0 {
                     let n = DEADLOCK_CONFIRM.with(|d| {
                         let v = d.get() + 1;
                         d.set(v);
@@ -492,6 +498,8 @@ fn wake(c: Cptr) {
     }
     let in_worker = CURRENT.with(|x| !x.get().is_null());
     if in_worker && NEXT.with(|n| n.get().is_null()) {
+        // HANDOFF++ 在 waker 仍 RUNNING 时发生 → 全程 RUNNING>0||HANDOFF>0，死锁检测不误判。
+        HANDOFF.fetch_add(1, Ordering::AcqRel);
         NEXT.with(|n| n.set(c.0));
         return;
     }
