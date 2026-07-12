@@ -293,14 +293,20 @@ fn worker_loop() {
     }
 }
 
-/// 驱动所有排队 coroutine 直到全部完成。R6：起 QI_CORO_WORKERS 个 worker 共同排空。
+/// 驱动所有排队 coroutine 直到全部完成。R6：起 N 个 worker 共同排空。
+/// N = `QI_CORO_WORKERS`（显式覆盖），否则**默认 = CPU 逻辑核数**（对齐 Go 的
+/// GOMAXPROCS=NumCPU，开箱即多核）；设 `QI_CORO_WORKERS=1` 回到单线程。
 #[no_mangle]
 pub extern "C" fn qi_coro_run_all() {
     let n = std::env::var("QI_CORO_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&x| x >= 1)
-        .unwrap_or(1);
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|x| x.get())
+                .unwrap_or(1)
+        });
     SHUTDOWN.store(false, Ordering::Release);
     DEADLOCK.store(false, Ordering::Release);
     WORKERS.store(n, Ordering::Release);
