@@ -95,34 +95,93 @@ pub extern "C-unwind" fn qi_web_panic_for_test() -> i64 {
     panic!("intentional panic for recover demo");
 }
 
-/// 一次性 HTTP/1.1 响应序列化：把状态行 + 头部 + Content-Length + body 一锅写完，
-/// 一个 alloc，零中间字符串。返回字节切片句柄，调用方负责 free。
-///
-/// 替代 qi-web 端 `输出响应头部` + `缓冲::从字符串` + `缓冲::追加字符串` 那条 ~10
-/// 次小分配的链条。对 hot path 的"快响应"尤其有效（bench_最小 那种）。
-#[no_mangle]
-pub extern "C" fn qi_runtime_serialize_http_response(
-    status_code: i64,
-    status_text_ptr: *const c_char,
-    headers_ptr: *const c_char,
-    body_ptr: *const c_char,
-) -> i64 {
-    fn cstr_or_empty<'a>(p: *const c_char) -> &'a [u8] {
-        if p.is_null() {
-            &[]
+#[inline]
+fn cstr_bytes<'a>(p: *const c_char) -> &'a [u8] {
+    if p.is_null() {
+        &[]
+    } else {
+        unsafe { CStr::from_ptr(p).to_bytes() }
+    }
+}
+
+// ── sendfile：二进制文件 Rust 侧读取直发 ──────────────────────────────
+// qi-web `发送文件` 构造带内部标记头 `X-Qi-Sendfile: <绝对路径>`（body 留空、
+// Content-Type 已由扩展名映射设好）。这里的响应序列化检测到该头就：剥掉内部头 →
+// 校验路径 → `std::fs::read` 读原始字节 → 用真实字节数当 Content-Length 直接写进
+// 响应体。这样非法 UTF-8 的图片/字体/下载不再经 C 字符串管道（会被 NUL 截断 / 读空
+// 误报 404），彻底二进制安全。
+//
+// 覆盖：同步 `处理连接` 与 M:N 异步服务两条路径（都走这里序列化）。TLS / HTTP2
+// 直连走 qi 端 `输出响应` 字符串路径（见 响应.qi 的回退处理），二进制经此受限。
+
+/// 快速判断 headers 是否含 sendfile 标记（case-insensitive）。热路径先过这一关，
+/// 无标记时零额外分配，老路径逐字节不变、性能零回退。
+#[inline]
+fn headers_have_sendfile(headers: &[u8]) -> bool {
+    const K: &[u8] = b"x-qi-sendfile";
+    if headers.len() < K.len() {
+        return false;
+    }
+    headers.windows(K.len()).any(|w| w.eq_ignore_ascii_case(K))
+}
+
+/// 从 headers 里剥掉 X-Qi-Sendfile 行，返回 (剥掉标记后的 headers, 文件路径)。
+fn strip_sendfile_header(headers: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    const KEY: &[u8] = b"x-qi-sendfile:";
+    let mut kept: Vec<u8> = Vec::with_capacity(headers.len());
+    let mut path: Option<Vec<u8>> = None;
+    let mut first = true;
+    for raw in headers.split(|&b| b == b'\n') {
+        let line = if raw.last() == Some(&b'\r') {
+            &raw[..raw.len() - 1]
         } else {
-            unsafe { CStr::from_ptr(p).to_bytes() }
+            raw
+        };
+        if line.len() >= KEY.len() && line[..KEY.len()].eq_ignore_ascii_case(KEY) {
+            let mut v = &line[KEY.len()..];
+            while matches!(v.first(), Some(b' ') | Some(b'\t')) {
+                v = &v[1..];
+            }
+            while matches!(v.last(), Some(b' ') | Some(b'\t')) {
+                v = &v[..v.len() - 1];
+            }
+            path = Some(v.to_vec());
+        } else if !line.is_empty() {
+            if !first {
+                kept.extend_from_slice(b"\r\n");
+            }
+            kept.extend_from_slice(line);
+            first = false;
         }
     }
+    (kept, path)
+}
 
-    let status_text = cstr_or_empty(status_text_ptr);
-    let headers = cstr_or_empty(headers_ptr);
-    let body = cstr_or_empty(body_ptr);
+/// sendfile 路径安全：必须绝对路径（Unix `/…` 或 Windows `X:\` / `X:/`）且不含 `..`。
+fn sendfile_path_ok(path: &[u8]) -> bool {
+    if path.is_empty() || find_subslice(path, b"..").is_some() {
+        return false;
+    }
+    if path.first() == Some(&b'/') {
+        return true;
+    }
+    path.len() >= 3
+        && path[0].is_ascii_alphabetic()
+        && path[1] == b':'
+        && (path[2] == b'/' || path[2] == b'\\')
+}
 
-    // 预估：状态行 ~32 + 头部 + "Content-Length: NNNN\r\n\r\n" + body
-    let cap = 48 + headers.len() + 32 + body.len();
+/// 组装一条 HTTP/1.1 响应到 Vec：状态行 + headers + [Connection] + Content-Length + body。
+#[inline]
+fn build_http_response(
+    status_code: i64,
+    status_text: &[u8],
+    headers: &[u8],
+    conn_header: Option<&[u8]>,
+    body: &[u8],
+) -> Vec<u8> {
+    let cap = 48 + headers.len() + conn_header.map(|c| c.len() + 2).unwrap_or(0) + 32 + body.len();
     let mut out: Vec<u8> = Vec::with_capacity(cap);
-
     out.extend_from_slice(b"HTTP/1.1 ");
     let _ = write!(out, "{}", status_code);
     out.extend_from_slice(b" ");
@@ -132,11 +191,80 @@ pub extern "C" fn qi_runtime_serialize_http_response(
         out.extend_from_slice(headers);
         out.extend_from_slice(b"\r\n");
     }
+    if let Some(conn) = conn_header {
+        out.extend_from_slice(conn);
+        out.extend_from_slice(b"\r\n");
+    }
     out.extend_from_slice(b"Content-Length: ");
     let _ = write!(out, "{}", body.len());
     out.extend_from_slice(b"\r\n\r\n");
     out.extend_from_slice(body);
+    out
+}
 
+/// sendfile 慢路径：剥标记头 → 校验路径 → 读文件字节 → 组装。
+/// 路径不安全 → 500；文件读不到 → 404。conn_header 透传 keep-alive 语义。
+fn serialize_sendfile_response(
+    status_code: i64,
+    status_text: &[u8],
+    headers: &[u8],
+    conn_header: Option<&[u8]>,
+) -> Vec<u8> {
+    let (clean_headers, path) = strip_sendfile_header(headers);
+    let path = match path {
+        Some(p) => p,
+        None => {
+            return build_http_response(status_code, status_text, &clean_headers, conn_header, &[])
+        }
+    };
+    const CT_TEXT: &[u8] = b"Content-Type: text/plain; charset=utf-8";
+    if !sendfile_path_ok(&path) {
+        let msg = b"500 Internal Server Error: invalid sendfile path";
+        return build_http_response(500, b"Internal Server Error", CT_TEXT, conn_header, msg);
+    }
+    let path_str = match std::str::from_utf8(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            let msg = b"500 Internal Server Error: bad sendfile path encoding";
+            return build_http_response(500, b"Internal Server Error", CT_TEXT, conn_header, msg);
+        }
+    };
+    match std::fs::read(path_str) {
+        Ok(bytes) => build_http_response(
+            status_code,
+            status_text,
+            &clean_headers,
+            conn_header,
+            &bytes,
+        ),
+        Err(_) => {
+            let body = format!("404 Not Found: {}", path_str);
+            build_http_response(404, b"Not Found", CT_TEXT, conn_header, body.as_bytes())
+        }
+    }
+}
+
+/// 一次性 HTTP/1.1 响应序列化：把状态行 + 头部 + Content-Length + body 一锅写完，
+/// 一个 alloc，零中间字符串。返回字节切片句柄，调用方负责 free。
+///
+/// 替代 qi-web 端 `输出响应头部` + `缓冲::从字符串` + `缓冲::追加字符串` 那条 ~10
+/// 次小分配的链条。对 hot path 的"快响应"尤其有效（bench_最小 那种）。
+/// 检测到 X-Qi-Sendfile 标记头则走 sendfile 二进制直发路径。
+#[no_mangle]
+pub extern "C" fn qi_runtime_serialize_http_response(
+    status_code: i64,
+    status_text_ptr: *const c_char,
+    headers_ptr: *const c_char,
+    body_ptr: *const c_char,
+) -> i64 {
+    let status_text = cstr_bytes(status_text_ptr);
+    let headers = cstr_bytes(headers_ptr);
+    let out = if headers_have_sendfile(headers) {
+        serialize_sendfile_response(status_code, status_text, headers, None)
+    } else {
+        let body = cstr_bytes(body_ptr);
+        build_http_response(status_code, status_text, headers, None, body)
+    };
     crate::stdlib::bytes_ffi::register_bytes(out)
 }
 
@@ -150,17 +278,8 @@ pub extern "C" fn qi_runtime_serialize_http_response_ka(
     body_ptr: *const c_char,
     keep_alive: i64,
 ) -> i64 {
-    fn cstr_or_empty<'a>(p: *const c_char) -> &'a [u8] {
-        if p.is_null() {
-            &[]
-        } else {
-            unsafe { CStr::from_ptr(p).to_bytes() }
-        }
-    }
-
-    let status_text = cstr_or_empty(status_text_ptr);
-    let headers = cstr_or_empty(headers_ptr);
-    let body = cstr_or_empty(body_ptr);
+    let status_text = cstr_bytes(status_text_ptr);
+    let headers = cstr_bytes(headers_ptr);
 
     let conn_header: &[u8] = if keep_alive != 0 {
         b"Connection: keep-alive"
@@ -168,25 +287,12 @@ pub extern "C" fn qi_runtime_serialize_http_response_ka(
         b"Connection: close"
     };
 
-    let cap = 48 + headers.len() + 2 + conn_header.len() + 32 + body.len();
-    let mut out: Vec<u8> = Vec::with_capacity(cap);
-
-    out.extend_from_slice(b"HTTP/1.1 ");
-    let _ = write!(out, "{}", status_code);
-    out.extend_from_slice(b" ");
-    out.extend_from_slice(status_text);
-    out.extend_from_slice(b"\r\n");
-    if !headers.is_empty() {
-        out.extend_from_slice(headers);
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(conn_header);
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(b"Content-Length: ");
-    let _ = write!(out, "{}", body.len());
-    out.extend_from_slice(b"\r\n\r\n");
-    out.extend_from_slice(body);
-
+    let out = if headers_have_sendfile(headers) {
+        serialize_sendfile_response(status_code, status_text, headers, Some(conn_header))
+    } else {
+        let body = cstr_bytes(body_ptr);
+        build_http_response(status_code, status_text, headers, Some(conn_header), body)
+    };
     crate::stdlib::bytes_ffi::register_bytes(out)
 }
 
