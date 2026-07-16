@@ -49,9 +49,21 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
+        // 环境覆盖（默认值不变）：高吞吐服务可调高 QI_MAX_MEM_MB 让追踪 GC 少触发，
+        // 避开分配热路径上 trigger_gc 的全堆 stop-the-world 扫描导致的尾延迟尖峰。
+        let max_memory_mb = std::env::var("QI_MAX_MEM_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024);
+        let gc_threshold_percent = std::env::var("QI_GC_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|&v| v > 0.0 && v <= 1.0)
+            .unwrap_or(0.8);
         Self {
-            max_memory_mb: 1024,
-            gc_threshold_percent: 0.8,
+            max_memory_mb,
+            gc_threshold_percent,
             io_buffer_size: 8192,
             network_timeout_ms: 30000,
             debug_mode: false,

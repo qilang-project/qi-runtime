@@ -125,6 +125,82 @@ fn headers_have_sendfile(headers: &[u8]) -> bool {
     headers.windows(K.len()).any(|w| w.eq_ignore_ascii_case(K))
 }
 
+// ── 缓存体：预构建 HTTP 响应零拷贝直发 ─────────────────────────────────
+// qi-web `注册缓存体(内容, 类型)` 启动时调一次：这里把**完整 HTTP/1.1 响应**
+// （状态行 + Content-Type + Connection + Content-Length + body）预构建成
+// keep-alive / close 两个变体，注册为持久字节（负句柄，见 bytes_ffi）。
+// handler 返回 `缓存体响应(体id)`（唯一头 `X-Qi-Cached-Body: <id>`、body 空），
+// 序列化在此命中标记 → 直接返回对应持久句柄：每请求零分配、零拷贝；
+// 写出方按负句柄走 Arc 借用直写，`释放切片` 对负句柄是 no-op。
+// 语义约定：缓存体响应恒为 200 OK，且不可再附加其它响应头（附加会退回普通路径）。
+
+static CACHED_RESPONSES: std::sync::OnceLock<dashmap::DashMap<i64, (i64, i64)>> =
+    std::sync::OnceLock::new();
+static CACHED_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn cached_responses() -> &'static dashmap::DashMap<i64, (i64, i64)> {
+    CACHED_RESPONSES.get_or_init(dashmap::DashMap::new)
+}
+
+/// 注册缓存体：预构建 ka/close 两个完整响应，返回 体id（>0；失败 -1）。
+#[no_mangle]
+pub extern "C" fn qi_web_cache_body_register(
+    body_ptr: *const c_char,
+    content_type_ptr: *const c_char,
+) -> i64 {
+    let body = cstr_bytes(body_ptr);
+    let ct = cstr_bytes(content_type_ptr);
+    if body.is_empty() {
+        return -1;
+    }
+    let ct: &[u8] = if ct.is_empty() {
+        b"application/json; charset=utf-8"
+    } else {
+        ct
+    };
+    let mut headers: Vec<u8> = Vec::with_capacity(16 + ct.len());
+    headers.extend_from_slice(b"Content-Type: ");
+    headers.extend_from_slice(ct);
+
+    let ka = build_http_response(200, b"OK", &headers, Some(b"Connection: keep-alive"), body);
+    let close = build_http_response(200, b"OK", &headers, Some(b"Connection: close"), body);
+    let ka_h = crate::stdlib::bytes_ffi::register_persistent_bytes(ka);
+    let close_h = crate::stdlib::bytes_ffi::register_persistent_bytes(close);
+
+    let id = CACHED_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    cached_responses().insert(id, (ka_h, close_h));
+    id
+}
+
+/// 序列化快路径：headers 恰好是单条 `X-Qi-Cached-Body: <id>` 时返回预构建
+/// 持久句柄（按 keep_alive 选变体）；否则返回 0 走普通路径。
+#[inline]
+fn cached_body_fast_path(headers: &[u8], keep_alive: bool) -> i64 {
+    const K: &[u8] = b"X-Qi-Cached-Body: ";
+    if headers.len() <= K.len() || &headers[..K.len()] != K {
+        return 0;
+    }
+    let rest = &headers[K.len()..];
+    // 必须是纯标记（无其它头）：附加了别的头就退回普通路径
+    if rest.iter().any(|&b| b == b'\r' || b == b'\n') {
+        return 0;
+    }
+    let id = match std::str::from_utf8(rest).ok().and_then(|s| s.trim().parse::<i64>().ok()) {
+        Some(v) => v,
+        None => return 0,
+    };
+    match cached_responses().get(&id) {
+        Some(e) => {
+            if keep_alive {
+                e.0
+            } else {
+                e.1
+            }
+        }
+        None => 0,
+    }
+}
+
 /// 从 headers 里剥掉 X-Qi-Sendfile 行，返回 (剥掉标记后的 headers, 文件路径)。
 fn strip_sendfile_header(headers: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
     const KEY: &[u8] = b"x-qi-sendfile:";
@@ -280,6 +356,12 @@ pub extern "C" fn qi_runtime_serialize_http_response_ka(
 ) -> i64 {
     let status_text = cstr_bytes(status_text_ptr);
     let headers = cstr_bytes(headers_ptr);
+
+    // 缓存体零拷贝快路径：命中即返回预构建持久句柄（负数），零分配零拷贝
+    let cached = cached_body_fast_path(headers, keep_alive != 0);
+    if cached != 0 {
+        return cached;
+    }
 
     let conn_header: &[u8] = if keep_alive != 0 {
         b"Connection: keep-alive"

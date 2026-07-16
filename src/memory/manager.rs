@@ -3,7 +3,6 @@
 //! This module provides the core memory management functionality for the Qi runtime,
 //! including allocation tracking, tracing GC integration, and exact deallocation.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -111,7 +110,11 @@ impl MemoryManager {
         self.in_use_bytes.fetch_add(size, Ordering::Relaxed);
         self.total_allocated.fetch_add(size, Ordering::Relaxed);
 
-        if self.should_trigger_gc() {
+        // 常规追踪 GC 已移到后台收集线程（见 executor 的后台 GC，read 锁下收集，
+        // 不偷请求线程），避开分配热路径上的全堆 stop-the-world 扫描导致的尾延迟尖峰。
+        // 这里只留一个濒临上限(>95%)的兜底：后台来不及时同步收一次，防 OOM。
+        // 常态 web 负载占用远达不到 95%，故热路径不会命中这条。
+        if self.get_usage_ratio() > 0.95 {
             let _ = self.trigger_gc();
         }
 
@@ -139,26 +142,47 @@ impl MemoryManager {
         Ok(())
     }
 
-    /// Trigger garbage collection
+    /// Trigger garbage collection —— 免快照 mark-sweep。
+    ///
+    /// 旧实现每轮先把整个 allocations DashMap 拷进一个临时 HashMap（O(N) 哈希
+    /// + 分配，还要挨个 shard 拿读锁），map 大时一次收集能拖出几百 ms 的
+    /// stop-the-world 尾尖。现在：先 begin_mark() 做可达性标记，然后直接
+    /// **迭代 DashMap 本身**挑出不可达指针（shard 级短读锁、零快照分配），
+    /// 最后逐个 remove + 释放。
+    ///
+    /// 双重释放防护：remove 返回 None（已被 deallocate()/并发收集摘走）就
+    /// 跳过，不再碰指针 —— DashMap 的 remove 所有权令牌语义保证每个指针
+    /// 只会被真正释放一次。
     pub fn trigger_gc(&self) -> MemoryResult<usize> {
-        let heap: HashMap<*const u8, usize> = self
+        let 开始 = std::time::Instant::now();
+        self.gc.begin_mark()?;
+
+        // 挑出不可达对象（is_unreachable 在此刻再查一次 roots，
+        // 标记之后才诞生的对象出生即 root，不会被误收）
+        let 待收: Vec<*const u8> = self
             .allocations
             .iter()
-            .map(|e| (*e.key(), e.value().size))
+            .map(|e| *e.key())
+            .filter(|ptr| self.gc.is_unreachable(*ptr))
             .collect();
 
-        let result = self.gc.collect(&heap)?;
         let mut freed_bytes = 0usize;
-
-        for ptr in &result.collected_objects {
-            if let Some((_, info)) = self.allocations.remove(ptr) {
-                unsafe { self.deallocate_raw_with_layout(*ptr as *mut u8, info.size, info.align)? };
-                self.gc.forget_object(*ptr)?;
+        let mut freed_objects = 0u64;
+        for ptr in 待收 {
+            if let Some((_, info)) = self.allocations.remove(&ptr) {
+                unsafe { self.deallocate_raw_with_layout(ptr as *mut u8, info.size, info.align)? };
+                self.gc.forget_object(ptr)?;
                 freed_bytes += info.size;
+                freed_objects += 1;
                 self.in_use_bytes.fetch_sub(info.size, Ordering::Relaxed);
             }
         }
 
+        self.gc.record_cycle(
+            freed_objects,
+            freed_bytes as u64,
+            开始.elapsed().as_secs_f64() * 1000.0,
+        );
         self.gc_cycles.fetch_add(1, Ordering::Relaxed);
         Ok(freed_bytes)
     }
@@ -166,6 +190,12 @@ impl MemoryManager {
     /// Check if garbage collection should be triggered based on memory usage
     pub fn should_collect(&self) -> bool {
         self.get_usage_ratio() > self.gc_threshold
+    }
+
+    /// 累计分配字节（单调递增）。后台 GC 用它算「自上次收集以来新分配了多少」，
+    /// 按增量而非占用比触发——把每次收集前的堆增长封顶，避免堆涨到阈值才收那一下巨扫。
+    pub fn total_allocated_bytes(&self) -> usize {
+        self.total_allocated.load(Ordering::Relaxed)
     }
 
     /// Trigger garbage collection and return bytes freed

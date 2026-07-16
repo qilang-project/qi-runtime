@@ -225,6 +225,34 @@ impl GarbageCollector {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// 开始一轮标记：清空上轮标记 + 从 roots 做可达性标记，返回本轮 cycle 号。
+    /// 与 [`is_unreachable`] / [`record_cycle`] 配合，供 MemoryManager 做
+    /// **免快照**清扫（直接迭代它自己的 allocations DashMap，不再构建全堆
+    /// HashMap 快照）。
+    pub fn begin_mark(&self) -> MemoryResult<u64> {
+        let cycle = self
+            .current_cycle
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.marked_objects.clear();
+        self.mark_phase()?;
+        Ok(cycle)
+    }
+
+    /// 清扫判定：既没被本轮标记、也不是 root（root 在清扫时再查一次，
+    /// 保护标记之后才新分配的对象 —— allocate() 出生即 add_root）。
+    pub fn is_unreachable(&self, ptr: *const u8) -> bool {
+        !self.marked_objects.contains(&ptr) && !self.roots.contains(&ptr)
+    }
+
+    /// 记录一轮收集的统计（免快照路径由 MemoryManager 汇总后回填）。
+    pub fn record_cycle(&self, objects: u64, bytes: u64, time_ms: f64) {
+        self.stats
+            .lock()
+            .unwrap()
+            .record_collection(objects, bytes, time_ms);
+    }
+
     pub fn collect(&self, heap: &HashMap<*const u8, usize>) -> MemoryResult<GcResult> {
         let start_time = std::time::Instant::now();
         let cycle = self

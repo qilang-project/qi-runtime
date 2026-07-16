@@ -33,7 +33,16 @@ static 全局网络接口: OnceLock<NetworkInterface> = OnceLock::new();
 // 互相阻塞**。每个 TcpConnection 还是裹一层 Mutex —— 是为了 read/write 需要
 // &mut self；因为一条连接同一时刻只有一个 goroutine 在用，这个内层 Mutex
 // 几乎永远不会真的竞争。
-static TCP连接池: OnceLock<DashMap<i64, Mutex<TcpConnection>>> = OnceLock::new();
+//
+// 值类型是 **Arc**<Mutex<TcpConnection>>，与 TCP服务器池 的 Arc<TcpListener>
+// 同一课教训：任何 IO（尤其阻塞 read）之前必须先克隆 Arc、立刻放掉 DashMap
+// 的 shard guard。曾经 read/write 在持 shard 读 guard 的状态下阻塞在 socket
+// 上（keep-alive 连接常态：goroutine 停在 read 里等下一条请求）——此时任何
+// 落在同一 shard 的 insert（accept 新连接）/ remove（关连接）都要等写锁，
+// 而挂起的写锁又挡住该 shard 后续所有读者：一次 accept 就能把整个 shard 上的
+// 活跃连接冻住几百毫秒，超时→重连→更多 accept，雪崩式尾延迟
+// （wrk 实测 99% 从 µs 级尖到 323ms+ / 一轮 20 个超时都源于此）。
+static TCP连接池: OnceLock<DashMap<i64, std::sync::Arc<Mutex<TcpConnection>>>> = OnceLock::new();
 static 连接句柄计数器: AtomicI64 = AtomicI64::new(0);
 
 fn 获取网络接口() -> Option<&'static NetworkInterface> {
@@ -46,8 +55,15 @@ fn 初始化网络接口() {
     });
 }
 
-fn 获取连接池() -> &'static DashMap<i64, Mutex<TcpConnection>> {
+fn 获取连接池() -> &'static DashMap<i64, std::sync::Arc<Mutex<TcpConnection>>> {
     TCP连接池.get_or_init(DashMap::new)
+}
+
+/// 按句柄取连接的 Arc 克隆 —— shard guard 在本函数内立即释放，
+/// 调用方随后在 guard 之外做（可能阻塞的）IO。
+#[inline]
+fn 取连接(handle: i64) -> Option<std::sync::Arc<Mutex<TcpConnection>>> {
+    获取连接池().get(&handle).map(|e| e.value().clone())
 }
 
 fn 下一个句柄() -> i64 {
@@ -57,17 +73,24 @@ fn 下一个句柄() -> i64 {
 /// 从TCP连接池中取出连接并返回TcpStream（用于WebSocket升级）
 /// 这将从池中移除连接，调用者获得TcpStream的所有权
 pub(crate) fn 取出TCP流(handle: i64) -> Option<std::net::TcpStream> {
-    获取连接池()
-        .remove(&handle)
-        .map(|(_, mu)| mu.into_inner().unwrap().into_stream())
+    let (_, arc) = 获取连接池().remove(&handle)?;
+    // 常态：本连接只有当前 goroutine 在用，remove 后 Arc 唯一，直接拆箱。
+    // 兜底：极端并发下别的线程还持着克隆（瞬态 IO 中），退回 dup fd
+    // （try_clone_stream），残余 Arc 随其使用结束自然释放。
+    match std::sync::Arc::try_unwrap(arc) {
+        Ok(mu) => Some(mu.into_inner().unwrap_or_else(|e| e.into_inner()).into_stream()),
+        Err(arc) => {
+            let conn = arc.lock().unwrap_or_else(|e| e.into_inner());
+            conn.try_clone_stream().ok()
+        }
+    }
 }
 
 /// 克隆TCP连接的流（保留原连接在池中）
 pub(crate) fn 克隆TCP流(handle: i64) -> Option<std::net::TcpStream> {
-    获取连接池().get(&handle).and_then(|entry| {
-        let conn = entry.lock().unwrap();
-        conn.try_clone_stream().ok()
-    })
+    let arc = 取连接(handle)?;
+    let conn = arc.lock().unwrap_or_else(|e| e.into_inner());
+    conn.try_clone_stream().ok()
 }
 
 /// 初始化网络模块
@@ -102,7 +125,7 @@ pub extern "C" fn qi_network_tcp_connect(host: *const c_char, port: u16, timeout
         match TcpConnection::connect(配置) {
             Ok(连接) => {
                 let 句柄 = 下一个句柄();
-                获取连接池().insert(句柄, Mutex::new(连接));
+                获取连接池().insert(句柄, std::sync::Arc::new(Mutex::new(连接)));
                 句柄
             }
             Err(_) => -1,
@@ -118,8 +141,9 @@ pub extern "C" fn qi_network_tcp_read(handle: i64, buffer: *mut u8, buffer_size:
         return -1;
     }
 
-    if let Some(entry) = 获取连接池().get(&handle) {
-        let mut 连接 = entry.lock().unwrap();
+    // 先克隆 Arc 放掉 shard guard，再做阻塞 read —— 不挡池上的 insert/remove
+    if let Some(连接arc) = 取连接(handle) {
+        let mut 连接 = 连接arc.lock().unwrap();
         let 缓冲区 = unsafe { std::slice::from_raw_parts_mut(buffer, buffer_size as usize) };
         match 连接.read(缓冲区) {
             Ok(字节数) => 字节数 as i64,
@@ -138,8 +162,8 @@ pub extern "C" fn qi_network_tcp_write(handle: i64, data: *const u8, data_size: 
         return -1;
     }
 
-    if let Some(entry) = 获取连接池().get(&handle) {
-        let mut 连接 = entry.lock().unwrap();
+    if let Some(连接arc) = 取连接(handle) {
+        let mut 连接 = 连接arc.lock().unwrap();
         let 数据 = unsafe { std::slice::from_raw_parts(data, data_size as usize) };
         match 连接.write(数据) {
             Ok(字节数) => 字节数 as i64,
@@ -160,8 +184,8 @@ pub extern "C" fn qi_network_tcp_read_string(handle: i64, buffer_size: i64) -> *
 
     let mut 缓冲区 = vec![0u8; buffer_size as usize];
 
-    if let Some(entry) = 获取连接池().get(&handle) {
-        let mut 连接 = entry.lock().unwrap();
+    if let Some(连接arc) = 取连接(handle) {
+        let mut 连接 = 连接arc.lock().unwrap();
         if let Ok(size) = 连接.read(&mut 缓冲区) {
             if size > 0 {
                 if let Ok(字符串) = String::from_utf8(缓冲区[..size].to_vec()) {
@@ -188,8 +212,8 @@ pub extern "C" fn qi_network_tcp_write_string(handle: i64, data: *const c_char) 
         let 数据字符串 = CStr::from_ptr(data).to_string_lossy();
         let 数据字节 = 数据字符串.as_bytes();
 
-        if let Some(entry) = 获取连接池().get(&handle) {
-            let mut 连接 = entry.lock().unwrap();
+        if let Some(连接arc) = 取连接(handle) {
+            let mut 连接 = 连接arc.lock().unwrap();
             match 连接.write(数据字节) {
                 Ok(字节数) => {
                     let _ = 连接.flush();
@@ -218,8 +242,8 @@ pub extern "C" fn qi_network_tcp_close(handle: i64) -> i64 {
 /// 返回 1 成功，0 失败
 #[no_mangle]
 pub extern "C" fn qi_network_tcp_flush(handle: i64) -> i64 {
-    if let Some(entry) = 获取连接池().get(&handle) {
-        let mut 连接 = entry.lock().unwrap();
+    if let Some(连接arc) = 取连接(handle) {
+        let mut 连接 = 连接arc.lock().unwrap();
         match 连接.flush() {
             Ok(_) => 1,
             Err(_) => 0,
@@ -232,8 +256,8 @@ pub extern "C" fn qi_network_tcp_flush(handle: i64) -> i64 {
 /// 获取 TCP 连接已读取的字节数
 #[no_mangle]
 pub extern "C" fn qi_network_tcp_bytes_read(handle: i64) -> i64 {
-    if let Some(entry) = 获取连接池().get(&handle) {
-        let 连接 = entry.lock().unwrap();
+    if let Some(连接arc) = 取连接(handle) {
+        let 连接 = 连接arc.lock().unwrap();
         连接.bytes_read() as i64
     } else {
         -1
@@ -243,8 +267,8 @@ pub extern "C" fn qi_network_tcp_bytes_read(handle: i64) -> i64 {
 /// 获取 TCP 连接已写入的字节数
 #[no_mangle]
 pub extern "C" fn qi_network_tcp_bytes_written(handle: i64) -> i64 {
-    if let Some(entry) = 获取连接池().get(&handle) {
-        let 连接 = entry.lock().unwrap();
+    if let Some(连接arc) = 取连接(handle) {
+        let 连接 = 连接arc.lock().unwrap();
         连接.bytes_written() as i64
     } else {
         -1
@@ -378,7 +402,7 @@ pub extern "C" fn qi_network_tcp_accept(server_handle: i64) -> i64 {
         Ok((stream, _addr)) => match TcpConnection::from_stream(stream) {
             Ok(连接) => {
                 let 句柄 = 下一个句柄();
-                获取连接池().insert(句柄, Mutex::new(连接));
+                获取连接池().insert(句柄, std::sync::Arc::new(Mutex::new(连接)));
                 句柄
             }
             Err(_) => -1,
@@ -413,9 +437,11 @@ pub extern "C" fn qi_network_tcp_read_bytes(handle: i64, buffer_size: i64) -> i6
     };
     let mut buf = vec![0u8; size];
 
-    let n = match 获取连接池().get(&handle) {
-        Some(entry) => {
-            let mut conn = entry.lock().unwrap();
+    // 关键路径：keep-alive 连接的 goroutine 大部分时间阻塞在这个 read 里等
+    // 下一条请求 —— 必须先克隆 Arc 放掉 shard guard 再 read，绝不能持 guard 阻塞。
+    let n = match 取连接(handle) {
+        Some(连接arc) => {
+            let mut conn = 连接arc.lock().unwrap();
             match conn.read(&mut buf) {
                 Ok(n) => n,
                 Err(_) => return -1,
@@ -432,15 +458,32 @@ pub extern "C" fn qi_network_tcp_read_bytes(handle: i64, buffer_size: i64) -> i6
 
 /// 二进制安全写：从 字节切片 句柄读出字节写入连接
 /// 返回写入字节数；错误返回 -1
+/// 负句柄 = 持久字节（预构建缓存响应）：克隆 Arc 借用直写，零拷贝。
 #[no_mangle]
 pub extern "C" fn qi_network_tcp_write_bytes(handle: i64, bytes_handle: i64) -> i64 {
-    let data = match crate::stdlib::bytes_ffi::clone_bytes(bytes_handle) {
-        Some(v) => v,
-        None => return -1,
+    // 两种来源统一成 &[u8]：持久句柄零拷贝（Arc），普通句柄保持原 clone 语义
+    let 持久;
+    let 普通;
+    let data: &[u8] = if bytes_handle < 0 {
+        match crate::stdlib::bytes_ffi::persistent_arc(bytes_handle) {
+            Some(a) => {
+                持久 = a;
+                &持久
+            }
+            None => return -1,
+        }
+    } else {
+        match crate::stdlib::bytes_ffi::clone_bytes(bytes_handle) {
+            Some(v) => {
+                普通 = v;
+                &普通
+            }
+            None => return -1,
+        }
     };
 
-    if let Some(entry) = 获取连接池().get(&handle) {
-        let mut c = entry.lock().unwrap();
+    if let Some(连接arc) = 取连接(handle) {
+        let mut c = 连接arc.lock().unwrap();
         let mut written = 0usize;
         while written < data.len() {
             match c.write(&data[written..]) {
@@ -480,12 +523,24 @@ pub extern "C" fn qi_network_tcp_listener_set_nonblocking(
 
 use std::net::UdpSocket;
 
-// UDP Socket 池
-static UDP套接字池: OnceLock<Mutex<HashMap<i64, UdpSocket>>> = OnceLock::new();
+// UDP Socket 池。值是 Arc<UdpSocket>：UdpSocket 的 send_to/recv_from/set_* 全是
+// &self，无需内层 Mutex——取用时克隆 Arc、立刻释放池锁，阻塞 IO 全在锁外做。
+// 否则（旧实现）一个套接字阻塞在 recv_from 会攥着全局锁，冻结所有 UDP 操作，
+// 与 TCP 连接池「持 shard guard 做阻塞 IO」是同一类病（TCP 版已修，见上）。
+static UDP套接字池: OnceLock<Mutex<HashMap<i64, Arc<UdpSocket>>>> = OnceLock::new();
 
 #[allow(non_snake_case)]
-fn 获取UDP池() -> &'static Mutex<HashMap<i64, UdpSocket>> {
+fn 获取UDP池() -> &'static Mutex<HashMap<i64, Arc<UdpSocket>>> {
     UDP套接字池.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 取出句柄对应的套接字克隆（Arc），池锁只握住查表这一瞬间。
+fn 取UDP(handle: i64) -> Option<Arc<UdpSocket>> {
+    获取UDP池()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&handle)
+        .cloned()
 }
 
 /// 创建 UDP Socket 并绑定到指定地址和端口
@@ -503,8 +558,10 @@ pub extern "C" fn qi_network_udp_bind(host: *const c_char, port: u16) -> i64 {
         match UdpSocket::bind(&地址) {
             Ok(socket) => {
                 let 句柄 = 下一个句柄();
-                let mut UDP池 = 获取UDP池().lock().unwrap();
-                UDP池.insert(句柄, socket);
+                获取UDP池()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(句柄, Arc::new(socket));
                 句柄
             }
             Err(_) => -1,
@@ -530,14 +587,13 @@ pub extern "C" fn qi_network_udp_send_string(
         let 目标主机 = CStr::from_ptr(host).to_string_lossy().to_string();
         let 目标地址 = format!("{}:{}", 目标主机, port);
 
-        let mut UDP池 = 获取UDP池().lock().unwrap();
-        if let Some(socket) = UDP池.get_mut(&handle) {
-            match socket.send_to(消息.as_bytes(), &目标地址) {
-                Ok(字节数) => 字节数 as i64,
-                Err(_) => -1,
-            }
-        } else {
-            -1
+        // 克隆 Arc 即放池锁，send_to 在锁外做
+        let Some(socket) = 取UDP(handle) else {
+            return -1;
+        };
+        match socket.send_to(消息.as_bytes(), &目标地址) {
+            Ok(字节数) => 字节数 as i64,
+            Err(_) => -1,
         }
     }
 }
@@ -560,15 +616,14 @@ pub extern "C" fn qi_network_udp_send_to(
         let 目标主机 = CStr::from_ptr(host).to_string_lossy().to_string();
         let 目标地址 = format!("{}:{}", 目标主机, port);
 
-        let mut UDP池 = 获取UDP池().lock().unwrap();
-        if let Some(socket) = UDP池.get_mut(&handle) {
-            let 数据 = std::slice::from_raw_parts(data, data_size as usize);
-            match socket.send_to(数据, &目标地址) {
-                Ok(字节数) => 字节数 as i64,
-                Err(_) => -1,
-            }
-        } else {
-            -1
+        // 克隆 Arc 即放池锁，send_to 在锁外做
+        let Some(socket) = 取UDP(handle) else {
+            return -1;
+        };
+        let 数据 = std::slice::from_raw_parts(data, data_size as usize);
+        match socket.send_to(数据, &目标地址) {
+            Ok(字节数) => 字节数 as i64,
+            Err(_) => -1,
         }
     }
 }
@@ -588,30 +643,30 @@ pub extern "C" fn qi_network_udp_recv_from(
         return -1;
     }
 
-    let mut UDP池 = 获取UDP池().lock().unwrap();
-    if let Some(socket) = UDP池.get_mut(&handle) {
-        let 缓冲区 = unsafe { std::slice::from_raw_parts_mut(buffer, buffer_size as usize) };
+    // 关键路径：recv_from 是阻塞调用，必须在池锁外做——克隆 Arc 即放锁。
+    // 旧实现持全局锁阻塞等包，会把所有 UDP 操作（含 close/set_timeout）一起冻住。
+    let Some(socket) = 取UDP(handle) else {
+        return -1;
+    };
+    let 缓冲区 = unsafe { std::slice::from_raw_parts_mut(buffer, buffer_size as usize) };
 
-        match socket.recv_from(缓冲区) {
-            Ok((字节数, 地址)) => {
-                // 如果提供了发送方信息指针，填充它们
-                if !sender_host.is_null() {
-                    let ip字符串 = 地址.ip().to_string();
-                    unsafe {
-                        *sender_host = crate::stdlib::qi_str::rc_cstr_from_string(ip字符串);
-                    }
+    match socket.recv_from(缓冲区) {
+        Ok((字节数, 地址)) => {
+            // 如果提供了发送方信息指针，填充它们
+            if !sender_host.is_null() {
+                let ip字符串 = 地址.ip().to_string();
+                unsafe {
+                    *sender_host = crate::stdlib::qi_str::rc_cstr_from_string(ip字符串);
                 }
-                if !sender_port.is_null() {
-                    unsafe {
-                        *sender_port = 地址.port();
-                    }
-                }
-                字节数 as i64
             }
-            Err(_) => -1,
+            if !sender_port.is_null() {
+                unsafe {
+                    *sender_port = 地址.port();
+                }
+            }
+            字节数 as i64
         }
-    } else {
-        -1
+        Err(_) => -1,
     }
 }
 
@@ -624,9 +679,8 @@ pub extern "C" fn qi_network_udp_recv_string(handle: i64, buffer_size: i64) -> *
     }
 
     let mut 缓冲区 = vec![0u8; buffer_size as usize];
-    let mut UDP池 = 获取UDP池().lock().unwrap();
-
-    if let Some(socket) = UDP池.get_mut(&handle) {
+    // 阻塞 recv 在池锁外做（克隆 Arc 即放锁）
+    if let Some(socket) = 取UDP(handle) {
         match socket.recv_from(&mut 缓冲区) {
             Ok((size, _sender_addr)) => {
                 if size > 0 {
@@ -646,8 +700,14 @@ pub extern "C" fn qi_network_udp_recv_string(handle: i64, buffer_size: i64) -> *
 /// 返回 1 成功，0 失败
 #[no_mangle]
 pub extern "C" fn qi_network_udp_close(handle: i64) -> i64 {
-    let mut UDP池 = 获取UDP池().lock().unwrap();
-    if UDP池.remove(&handle).is_some() {
+    // 从池里摘掉即认为关闭；若别的线程正阻塞在 recv（持有 Arc 克隆），
+    // 套接字随其调用返回后自然释放——语义与 TCP 池修复一致。
+    let 有 = 获取UDP池()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&handle)
+        .is_some();
+    if 有 {
         1
     } else {
         0
@@ -658,23 +718,21 @@ pub extern "C" fn qi_network_udp_close(handle: i64) -> i64 {
 /// 返回 1 成功，0 失败
 #[no_mangle]
 pub extern "C" fn qi_network_udp_set_timeout(handle: i64, timeout_ms: i64) -> i64 {
-    let mut UDP池 = 获取UDP池().lock().unwrap();
-    if let Some(socket) = UDP池.get_mut(&handle) {
-        let 超时 = if timeout_ms > 0 {
-            Some(Duration::from_millis(timeout_ms as u64))
-        } else {
-            None
-        };
-
-        match socket.set_read_timeout(超时) {
-            Ok(_) => match socket.set_write_timeout(超时) {
-                Ok(_) => 1,
-                Err(_) => 0,
-            },
-            Err(_) => 0,
-        }
+    let Some(socket) = 取UDP(handle) else {
+        return 0;
+    };
+    let 超时 = if timeout_ms > 0 {
+        Some(Duration::from_millis(timeout_ms as u64))
     } else {
-        0
+        None
+    };
+
+    match socket.set_read_timeout(超时) {
+        Ok(_) => match socket.set_write_timeout(超时) {
+            Ok(_) => 1,
+            Err(_) => 0,
+        },
+        Err(_) => 0,
     }
 }
 
@@ -682,14 +740,12 @@ pub extern "C" fn qi_network_udp_set_timeout(handle: i64, timeout_ms: i64) -> i6
 /// 返回 1 成功，0 失败
 #[no_mangle]
 pub extern "C" fn qi_network_udp_set_broadcast(handle: i64, enable: i32) -> i64 {
-    let mut UDP池 = 获取UDP池().lock().unwrap();
-    if let Some(socket) = UDP池.get_mut(&handle) {
-        match socket.set_broadcast(enable != 0) {
-            Ok(_) => 1,
-            Err(_) => 0,
-        }
-    } else {
-        0
+    let Some(socket) = 取UDP(handle) else {
+        return 0;
+    };
+    match socket.set_broadcast(enable != 0) {
+        Ok(_) => 1,
+        Err(_) => 0,
     }
 }
 
@@ -734,6 +790,62 @@ mod tests {
             println!("Resolved localhost to: {}", ip_str);
             qi_network_free_string(ip_ptr);
         }
+    }
+
+    /// 回归测试：一个套接字阻塞在 recv_from 时，其它 UDP 操作不得被冻结。
+    /// 旧实现（Mutex<HashMap<i64, UdpSocket>> 持全局锁做阻塞 IO）下本测试会
+    /// 卡死在 B 的 send/recv 上直到 A 收到包；Arc 化修复后应毫秒级完成。
+    #[test]
+    fn test_udp_blocked_recv_does_not_freeze_pool() {
+        let 主机 = CString::new("127.0.0.1").unwrap();
+        // 随机高位端口（>3000），避开常用端口
+        let 端口a: u16 = 46731;
+        let 端口b: u16 = 46732;
+        let a = qi_network_udp_bind(主机.as_ptr(), 端口a);
+        let b = qi_network_udp_bind(主机.as_ptr(), 端口b);
+        assert!(a > 0 && b > 0, "bind 失败（端口被占？换端口重跑）");
+
+        // 线程 1：A 无超时阻塞等包（旧实现会在此攥住全局池锁）
+        let 收线程 = std::thread::spawn(move || {
+            let mut 缓冲 = [0u8; 64];
+            qi_network_udp_recv_from(
+                a,
+                缓冲.as_mut_ptr(),
+                缓冲.len() as i64,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        });
+        // 确保线程 1 已进入阻塞 recv
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // 主线程：B 自发自收一个包——必须在 A 仍阻塞期间完成
+        let 开始 = std::time::Instant::now();
+        assert_eq!(qi_network_udp_set_timeout(b, 2000), 1);
+        let 消息 = CString::new("ping").unwrap();
+        let 发 = qi_network_udp_send_string(b, 消息.as_ptr(), 主机.as_ptr(), 端口b);
+        assert_eq!(发, 4, "B send 失败");
+        let mut 缓冲 = [0u8; 64];
+        let 收 = qi_network_udp_recv_from(
+            b,
+            缓冲.as_mut_ptr(),
+            缓冲.len() as i64,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(收, 4, "B recv 失败");
+        assert!(
+            开始.elapsed() < std::time::Duration::from_secs(1),
+            "B 的收发被 A 的阻塞 recv 冻结了 {:?} —— 池锁又被持锁 IO 攥住了",
+            开始.elapsed()
+        );
+
+        // 给 A 发一个包解除阻塞，回收线程与句柄
+        let 解 = CString::new("bye").unwrap();
+        assert_eq!(qi_network_udp_send_string(b, 解.as_ptr(), 主机.as_ptr(), 端口a), 3);
+        assert_eq!(收线程.join().unwrap(), 3);
+        assert_eq!(qi_network_udp_close(a), 1);
+        assert_eq!(qi_network_udp_close(b), 1);
     }
 }
 
@@ -914,17 +1026,28 @@ async fn handle_conn_async(
         // handler 可能已经释放了；no-op 再来一次
         crate::stdlib::bytes_ffi::free_bytes(req_handle);
 
-        if resp_handle <= 0 {
+        // 0 = handler 已自行流式写完；负数是**合法的持久句柄**（预构建缓存响应），不是错误
+        if resp_handle == 0 {
             return;
         }
 
-        // 取响应字节，async 写回
-        let resp = match crate::stdlib::bytes_ffi::take_bytes(resp_handle) {
-            Some(v) => v,
-            None => return,
-        };
-        if stream.write_all(&resp).await.is_err() {
-            return;
+        // 取响应字节，async 写回。负句柄 = 预构建持久响应：Arc 借用零拷贝直写。
+        if resp_handle < 0 {
+            let arc = match crate::stdlib::bytes_ffi::persistent_arc(resp_handle) {
+                Some(a) => a,
+                None => return,
+            };
+            if stream.write_all(&arc).await.is_err() {
+                return;
+            }
+        } else {
+            let resp = match crate::stdlib::bytes_ffi::take_bytes(resp_handle) {
+                Some(v) => v,
+                None => return,
+            };
+            if stream.write_all(&resp).await.is_err() {
+                return;
+            }
         }
         let _ = stream.flush().await;
 

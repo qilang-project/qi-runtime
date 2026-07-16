@@ -6,6 +6,7 @@
 #![allow(static_mut_refs)]
 
 use std::ffi::{c_char, c_int, CStr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, RwLock};
 
 use crate::{RuntimeConfig, RuntimeEnvironment};
@@ -15,6 +16,81 @@ static RUNTIME_INIT: Once = Once::new();
 // memory_manager 内部用 DashMap + 原子计数器，方法已是 &self，所以读锁就够了。
 // 写锁只在 initialize / terminate 时需要。
 static mut RUNTIME: Option<RwLock<RuntimeEnvironment>> = None;
+
+// 后台 GC 收集线程：常规追踪 GC 从「分配热路径同步全堆 stop-the-world」改到这里。
+// 每隔 QI_GC_INTERVAL_MS（默认 25ms）检查一次内存占用，超阈值就在 read 锁下收一次
+// ——不偷请求/worker 线程，消除 qi-web 高吞吐下的尾延迟尖峰。收集本身与其它线程的
+// mutation 的并发性和原来（同步 GC 也是只挡触发那一条线程、其它线程照跑）完全一致；
+// 双重释放已由 allocations DashMap 的 remove 所有权令牌兜底。
+static GC_STOP: AtomicBool = AtomicBool::new(false);
+static mut GC_THREAD: Option<std::thread::JoinHandle<()>> = None;
+
+/// 启动后台 GC 收集线程（幂等）。
+fn 启动后台GC() {
+    unsafe {
+        if GC_THREAD.is_some() {
+            return;
+        }
+    }
+    GC_STOP.store(false, Ordering::SeqCst);
+    // 默认 10ms：短间隔让每次后台收集时堆还小、扫得快、停顿短（实测尾延迟 ~12ms，
+    // 对比 25ms 的 ~65ms / 50ms 的 ~265ms）。QI_GC_INTERVAL_MS 可覆盖。
+    let 间隔毫秒: u64 = std::env::var("QI_GC_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(10);
+    // 增量阈值：自上次收集以来新分配超过这么多字节就收一次（默认 64MB，QI_GC_DELTA_MB 可调）。
+    // 这样每次收集前堆增长被封顶，收集始终是小扫描——避免堆涨到占用阈值(820MB)才收那一下巨扫
+    // 造成的 ~1s 尾尖。占用比阈值(should_collect)作为额外兜底。
+    let 增量字节: usize = std::env::var("QI_GC_DELTA_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(64)
+        * 1024
+        * 1024;
+    let handle = std::thread::Builder::new()
+        .name("qi-gc".to_string())
+        .spawn(move || {
+            let mut 上次累计: usize = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(间隔毫秒));
+                if GC_STOP.load(Ordering::Relaxed) {
+                    break;
+                }
+                unsafe {
+                    if let Some(rt) = RUNTIME.as_ref() {
+                        if let Ok(g) = rt.read() {
+                            let 累计 = g.memory_manager.total_allocated_bytes();
+                            if 累计.saturating_sub(上次累计) > 增量字节
+                                || g.memory_manager.should_collect()
+                            {
+                                let _ = g.memory_manager.collect();
+                                上次累计 = 累计;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    if let Ok(h) = handle {
+        unsafe {
+            GC_THREAD = Some(h);
+        }
+    }
+}
+
+/// 停止后台 GC 线程并 join。必须在 RUNTIME.take() 之前调：
+/// 否则收集线程可能正持 RwLock 的读锁，take 掉 RwLock 是 UB。
+fn 停止后台GC() {
+    GC_STOP.store(true, Ordering::SeqCst);
+    unsafe {
+        if let Some(h) = GC_THREAD.take() {
+            let _ = h.join();
+        }
+    }
+}
 
 /// Initialize the Qi runtime
 ///
@@ -36,6 +112,7 @@ pub extern "C" fn qi_runtime_initialize() -> c_int {
                 unsafe {
                     RUNTIME = Some(RwLock::new(runtime));
                 }
+                启动后台GC();
             }
             Err(e) => {
                 eprintln!("Runtime 创建失败: {}", e);
@@ -51,6 +128,7 @@ pub extern "C" fn qi_runtime_initialize() -> c_int {
 #[no_mangle]
 pub extern "C" fn qi_runtime_shutdown() -> c_int {
     qi_runtime_flush_stdout(); // 刷出所有线程未完的打印行
+    停止后台GC(); // 先停收集线程并 join，确保它不再持读锁，再安全 take 掉 RUNTIME
     unsafe {
         if let Some(runtime_mutex) = RUNTIME.take() {
             if let Ok(mut runtime) = runtime_mutex.write() {

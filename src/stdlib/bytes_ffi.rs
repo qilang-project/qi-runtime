@@ -51,7 +51,33 @@ pub(crate) fn take_bytes(handle: i64) -> Option<Vec<u8>> {
 
 /// 内部 API：释放句柄
 pub(crate) fn free_bytes(handle: i64) {
+    if handle < 0 {
+        return; // 持久句柄：释放是 no-op（进程生命周期常驻）
+    }
     pool().remove(&handle);
+}
+
+// ── 持久字节（负数句柄）────────────────────────────────────────────
+// 进程生命周期常驻、只读共享的字节块（预构建的缓存 HTTP 响应等）。写出方
+// 克隆 Arc（一次原子引用计数）后在池锁外写 socket——每请求零分配零拷贝；
+// qi 侧照常调 释放切片 也无副作用（no-op）。与普通句柄用符号区分：恒为负。
+
+static PERSISTENT: OnceLock<DashMap<i64, std::sync::Arc<Vec<u8>>>> = OnceLock::new();
+
+fn persistent_pool() -> &'static DashMap<i64, std::sync::Arc<Vec<u8>>> {
+    PERSISTENT.get_or_init(DashMap::new)
+}
+
+/// 注册持久字节，返回负数句柄。
+pub(crate) fn register_persistent_bytes(data: Vec<u8>) -> i64 {
+    let h = -next_handle();
+    persistent_pool().insert(h, std::sync::Arc::new(data));
+    h
+}
+
+/// 取持久字节的 Arc 克隆（廉价，一次原子操作）。
+pub(crate) fn persistent_arc(handle: i64) -> Option<std::sync::Arc<Vec<u8>>> {
+    persistent_pool().get(&handle).map(|v| v.clone())
 }
 
 fn cstr_bytes(p: *const c_char) -> Option<&'static [u8]> {
@@ -107,6 +133,9 @@ pub extern "C" fn qi_bytes_to_string(handle: i64) -> *mut c_char {
 /// 字节长度
 #[no_mangle]
 pub extern "C" fn qi_bytes_length(handle: i64) -> i64 {
+    if handle < 0 {
+        return persistent_arc(handle).map(|v| v.len() as i64).unwrap_or(0);
+    }
     pool().get(&handle).map(|v| v.len() as i64).unwrap_or(0)
 }
 
@@ -316,10 +345,10 @@ pub extern "C" fn qi_bytes_from_base64(s: *const c_char) -> i64 {
     }
 }
 
-/// 释放字节切片
+/// 释放字节切片（持久负句柄是 no-op）
 #[no_mangle]
 pub extern "C" fn qi_bytes_free(handle: i64) -> i64 {
-    pool().remove(&handle);
+    free_bytes(handle);
     0
 }
 
