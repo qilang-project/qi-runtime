@@ -9,16 +9,26 @@ use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::raw::c_char;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use std::sync::OnceLock;
 
-// WebSocket 连接池
-static WEBSOCKET连接池: OnceLock<Mutex<HashMap<i64, WebSocketConnection>>> = OnceLock::new();
+// WebSocket 连接池：值是 Arc<WebSocketConnection>——取用时克隆 Arc、立刻释放池锁，
+// 阻塞 recv 与并发 send 全在池锁外做。
+static WEBSOCKET连接池: OnceLock<Mutex<HashMap<i64, Arc<WebSocketConnection>>>> = OnceLock::new();
 static WS句柄计数器: OnceLock<Mutex<i64>> = OnceLock::new();
 
-fn 获取WS连接池() -> &'static Mutex<HashMap<i64, WebSocketConnection>> {
+fn 获取WS连接池() -> &'static Mutex<HashMap<i64, Arc<WebSocketConnection>>> {
     WEBSOCKET连接池.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 取句柄对应连接的 Arc 克隆，池锁只握住查表这一瞬间。
+fn 取WS(handle: i64) -> Option<Arc<WebSocketConnection>> {
+    获取WS连接池()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&handle)
+        .cloned()
 }
 
 fn 获取WS句柄计数器() -> &'static Mutex<i64> {
@@ -58,11 +68,21 @@ pub struct WebSocketFrame {
     pub payload: Vec<u8>,
 }
 
-/// WebSocket 连接状态
+/// WebSocket 连接状态。
+///
+/// 池里以 `Arc<WebSocketConnection>` 共享：任一 FFI 只在克隆 Arc 时短暂持池锁，
+/// 阻塞 IO（recv）在池锁外做——不再冻结整个 WS 池（这是「广播能否推给正 park
+/// 在 recv 的连接」的命门，与 TCP/UDP 池的 Arc 修复同源）。
+///
+/// 读写用 `&TcpStream` 各走各的（socket 支持读写并发）：
+///   - recv 不加锁（只有本连接的循环在读），所以它 park 在 read 时不挡任何写；
+///   - send 用 send_lock 串行化（防多个广播线程往同一连接写导致帧交错），
+///     且 send_lock 与 recv 无关 → 广播 push 到正在 recv 的连接立即成功，无需心跳。
 pub struct WebSocketConnection {
     stream: TcpStream,
     is_server: bool, // true = 服务器端, false = 客户端
-    is_connected: bool,
+    is_connected: std::sync::atomic::AtomicBool,
+    send_lock: Mutex<()>,
 }
 
 impl WebSocketConnection {
@@ -71,16 +91,13 @@ impl WebSocketConnection {
         WebSocketConnection {
             stream,
             is_server,
-            is_connected: true,
+            is_connected: std::sync::atomic::AtomicBool::new(true),
+            send_lock: Mutex::new(()),
         }
     }
 
-    /// 发送 WebSocket 帧
-    pub fn send_frame(
-        &mut self,
-        opcode: WebSocketOpcode,
-        payload: &[u8],
-    ) -> Result<(), std::io::Error> {
+    /// 发送 WebSocket 帧（&self：可并发；send_lock 串行化写、防帧交错）
+    pub fn send_frame(&self, opcode: WebSocketOpcode, payload: &[u8]) -> Result<(), std::io::Error> {
         let mut frame = Vec::new();
 
         // 第一字节: FIN + opcode
@@ -114,15 +131,19 @@ impl WebSocketConnection {
             frame.extend_from_slice(payload);
         }
 
-        self.stream.write_all(&frame)?;
-        self.stream.flush()?;
+        // send_lock 只护「写」这一段，防并发广播帧交错；不挡 recv。
+        let _发送守卫 = self.send_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut 写 = &self.stream;
+        写.write_all(&frame)?;
+        写.flush()?;
         Ok(())
     }
 
-    /// 接收 WebSocket 帧
-    pub fn recv_frame(&mut self) -> Result<WebSocketFrame, std::io::Error> {
+    /// 接收 WebSocket 帧（&self：用 &TcpStream 读，不加锁、不挡并发写）
+    pub fn recv_frame(&self) -> Result<WebSocketFrame, std::io::Error> {
+        let mut 读 = &self.stream;
         let mut header = [0u8; 2];
-        self.stream.read_exact(&mut header)?;
+        读.read_exact(&mut header)?;
 
         let fin = (header[0] & 0x80) != 0;
         let opcode = WebSocketOpcode::from_u8(header[0] & 0x0F).ok_or_else(|| {
@@ -135,18 +156,18 @@ impl WebSocketConnection {
         // 读取扩展长度
         if payload_len == 126 {
             let mut ext_len = [0u8; 2];
-            self.stream.read_exact(&mut ext_len)?;
+            读.read_exact(&mut ext_len)?;
             payload_len = u16::from_be_bytes(ext_len) as u64;
         } else if payload_len == 127 {
             let mut ext_len = [0u8; 8];
-            self.stream.read_exact(&mut ext_len)?;
+            读.read_exact(&mut ext_len)?;
             payload_len = u64::from_be_bytes(ext_len);
         }
 
         // 读取 mask key（如果存在）
         let mask_key = if masked {
             let mut key = [0u8; 4];
-            self.stream.read_exact(&mut key)?;
+            读.read_exact(&mut key)?;
             Some(key)
         } else {
             None
@@ -154,7 +175,7 @@ impl WebSocketConnection {
 
         // 读取 payload
         let mut payload = vec![0u8; payload_len as usize];
-        self.stream.read_exact(&mut payload)?;
+        读.read_exact(&mut payload)?;
 
         // 如果有 mask，解码
         if let Some(key) = mask_key {
@@ -171,34 +192,46 @@ impl WebSocketConnection {
     }
 
     /// 发送文本消息
-    pub fn send_text(&mut self, text: &str) -> Result<(), std::io::Error> {
+    pub fn send_text(&self, text: &str) -> Result<(), std::io::Error> {
         self.send_frame(WebSocketOpcode::Text, text.as_bytes())
     }
 
     /// 发送二进制消息
-    pub fn send_binary(&mut self, data: &[u8]) -> Result<(), std::io::Error> {
+    pub fn send_binary(&self, data: &[u8]) -> Result<(), std::io::Error> {
         self.send_frame(WebSocketOpcode::Binary, data)
     }
 
     /// 发送 ping
-    pub fn send_ping(&mut self, data: &[u8]) -> Result<(), std::io::Error> {
+    pub fn send_ping(&self, data: &[u8]) -> Result<(), std::io::Error> {
         self.send_frame(WebSocketOpcode::Ping, data)
     }
 
     /// 发送 pong
-    pub fn send_pong(&mut self, data: &[u8]) -> Result<(), std::io::Error> {
+    pub fn send_pong(&self, data: &[u8]) -> Result<(), std::io::Error> {
         self.send_frame(WebSocketOpcode::Pong, data)
     }
 
     /// 发送关闭帧
-    pub fn send_close(&mut self, code: u16, reason: &str) -> Result<(), std::io::Error> {
+    pub fn send_close(&self, code: u16, reason: &str) -> Result<(), std::io::Error> {
         let mut payload = Vec::new();
         payload.push((code >> 8) as u8);
         payload.push(code as u8);
         payload.extend_from_slice(reason.as_bytes());
         self.send_frame(WebSocketOpcode::Close, &payload)?;
-        self.is_connected = false;
+        self.is_connected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// 是否仍连接（原子读）
+    pub fn 是否连接(&self) -> bool {
+        self.is_connected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 标记断开（原子写）
+    pub fn 标记断开(&self) {
+        self.is_connected
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -400,8 +433,10 @@ pub extern "C" fn qi_websocket_accept(host: *const c_char, port: u16) -> i64 {
     *句柄计数 += 1;
     let 句柄 = *句柄计数;
 
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    ws_pool.insert(句柄, ws_conn);
+    获取WS连接池()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(句柄, Arc::new(ws_conn));
 
     句柄
 }
@@ -449,8 +484,10 @@ pub extern "C" fn qi_websocket_upgrade_connection(
     *句柄计数 += 1;
     let 句柄 = *句柄计数;
 
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    ws_pool.insert(句柄, ws_conn);
+    获取WS连接池()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(句柄, Arc::new(ws_conn));
 
     句柄
 }
@@ -517,8 +554,10 @@ pub extern "C" fn qi_websocket_connect(url: *const c_char) -> i64 {
     *句柄计数 += 1;
     let 句柄 = *句柄计数;
 
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    ws_pool.insert(句柄, ws_conn);
+    获取WS连接池()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(句柄, Arc::new(ws_conn));
 
     句柄
 }
@@ -575,14 +614,13 @@ pub extern "C" fn qi_websocket_send_text(handle: i64, message: *const c_char) ->
 
     let text = unsafe { CStr::from_ptr(message).to_string_lossy() };
 
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    if let Some(conn) = ws_pool.get_mut(&handle) {
-        match conn.send_text(&text) {
-            Ok(_) => 1,
-            Err(_) => 0,
-        }
-    } else {
-        0
+    // 克隆 Arc 即放池锁，send 在锁外做（send_lock 串行化写，但不挡别的连接、不挡 recv）
+    let Some(conn) = 取WS(handle) else {
+        return 0;
+    };
+    match conn.send_text(&text) {
+        Ok(_) => 1,
+        Err(_) => 0,
     }
 }
 
@@ -596,14 +634,12 @@ pub extern "C" fn qi_websocket_send_binary(handle: i64, data: *const u8, size: i
 
     let bytes = unsafe { std::slice::from_raw_parts(data, size as usize) };
 
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    if let Some(conn) = ws_pool.get_mut(&handle) {
-        match conn.send_binary(bytes) {
-            Ok(_) => 1,
-            Err(_) => 0,
-        }
-    } else {
-        0
+    let Some(conn) = 取WS(handle) else {
+        return 0;
+    };
+    match conn.send_binary(bytes) {
+        Ok(_) => 1,
+        Err(_) => 0,
     }
 }
 
@@ -616,26 +652,25 @@ pub extern "C" fn qi_websocket_recv(handle: i64, buffer: *mut u8, buffer_size: i
         return 0;
     }
 
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    if let Some(conn) = ws_pool.get_mut(&handle) {
-        match conn.recv_frame() {
-            Ok(frame) => {
-                let copy_len = std::cmp::min(frame.payload.len(), buffer_size as usize);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(frame.payload.as_ptr(), buffer, copy_len);
-                }
-
-                // 自动回复 ping
-                if frame.opcode == WebSocketOpcode::Ping {
-                    let _ = conn.send_pong(&frame.payload);
-                }
-
-                frame.opcode as i64
+    // 阻塞 recv 在池锁外做（克隆 Arc 即放锁）——不冻结整个 WS 池
+    let Some(conn) = 取WS(handle) else {
+        return 0;
+    };
+    match conn.recv_frame() {
+        Ok(frame) => {
+            let copy_len = std::cmp::min(frame.payload.len(), buffer_size as usize);
+            unsafe {
+                std::ptr::copy_nonoverlapping(frame.payload.as_ptr(), buffer, copy_len);
             }
-            Err(_) => 0,
+
+            // 自动回复 ping
+            if frame.opcode == WebSocketOpcode::Ping {
+                let _ = conn.send_pong(&frame.payload);
+            }
+
+            frame.opcode as i64
         }
-    } else {
-        0
+        Err(_) => 0,
     }
 }
 
@@ -643,34 +678,36 @@ pub extern "C" fn qi_websocket_recv(handle: i64, buffer: *mut u8, buffer_size: i
 /// 返回消息字符串（需释放）
 #[no_mangle]
 pub extern "C" fn qi_websocket_recv_text(handle: i64) -> *mut c_char {
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    if let Some(conn) = ws_pool.get_mut(&handle) {
-        loop {
-            match conn.recv_frame() {
-                Ok(frame) => {
-                    // 自动回复 ping
-                    if frame.opcode == WebSocketOpcode::Ping {
-                        let _ = conn.send_pong(&frame.payload);
-                        continue; // 继续接收下一帧
-                    }
+    // 阻塞 recv 循环在池锁外做：本连接 park 在 read 时，池锁空闲，
+    // 别的连接/广播 push 照常进行（send_lock 与本连接的 recv 无关）。
+    let Some(conn) = 取WS(handle) else {
+        return crate::stdlib::qi_str::rc_cstr_from_str("");
+    };
+    loop {
+        match conn.recv_frame() {
+            Ok(frame) => {
+                // 自动回复 ping
+                if frame.opcode == WebSocketOpcode::Ping {
+                    let _ = conn.send_pong(&frame.payload);
+                    continue; // 继续接收下一帧
+                }
 
-                    if frame.opcode == WebSocketOpcode::Text {
-                        if let Ok(text) = String::from_utf8(frame.payload) {
-                            return crate::stdlib::qi_str::rc_cstr_from_string(text);
-                        }
-                    }
-
-                    // 收到关闭帧
-                    if frame.opcode == WebSocketOpcode::Close {
-                        conn.is_connected = false;
-                        return crate::stdlib::qi_str::rc_cstr_from_str("");
+                if frame.opcode == WebSocketOpcode::Text {
+                    if let Ok(text) = String::from_utf8(frame.payload) {
+                        return crate::stdlib::qi_str::rc_cstr_from_string(text);
                     }
                 }
-                Err(_) => {
-                    // 读取错误，标记连接已断开
-                    conn.is_connected = false;
-                    break;
+
+                // 收到关闭帧
+                if frame.opcode == WebSocketOpcode::Close {
+                    conn.标记断开();
+                    return crate::stdlib::qi_str::rc_cstr_from_str("");
                 }
+            }
+            Err(_) => {
+                // 读取错误，标记连接已断开
+                conn.标记断开();
+                break;
             }
         }
     }
@@ -682,14 +719,12 @@ pub extern "C" fn qi_websocket_recv_text(handle: i64) -> *mut c_char {
 /// 返回 1 成功, 0 失败
 #[no_mangle]
 pub extern "C" fn qi_websocket_ping(handle: i64) -> i64 {
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    if let Some(conn) = ws_pool.get_mut(&handle) {
-        match conn.send_ping(b"ping") {
-            Ok(_) => 1,
-            Err(_) => 0,
-        }
-    } else {
-        0
+    let Some(conn) = 取WS(handle) else {
+        return 0;
+    };
+    match conn.send_ping(b"ping") {
+        Ok(_) => 1,
+        Err(_) => 0,
     }
 }
 
@@ -703,8 +738,13 @@ pub extern "C" fn qi_websocket_close(handle: i64, code: u16, reason: *const c_ch
         unsafe { CStr::from_ptr(reason).to_string_lossy().to_string() }
     };
 
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    if let Some(mut conn) = ws_pool.remove(&handle) {
+    // 先从池里摘掉（短暂持锁），拿到 Arc 后在锁外发关闭帧。
+    // 若别的线程正阻塞在 recv（持有 Arc 克隆），流随其调用返回后自然释放。
+    let conn = 获取WS连接池()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&handle);
+    if let Some(conn) = conn {
         let _ = conn.send_close(code, &reason_str);
         1
     } else {
@@ -722,13 +762,11 @@ pub extern "C" fn qi_websocket_free_string(s: *mut c_char) {
 /// 返回 1 有效, 0 无效
 #[no_mangle]
 pub extern "C" fn qi_websocket_is_connected(handle: i64) -> i64 {
-    let ws_pool = 获取WS连接池().lock().unwrap();
-    if let Some(conn) = ws_pool.get(&handle) {
-        if conn.is_connected {
-            1
-        } else {
-            0
-        }
+    let Some(conn) = 取WS(handle) else {
+        return 0;
+    };
+    if conn.是否连接() {
+        1
     } else {
         0
     }
@@ -767,8 +805,10 @@ pub extern "C" fn qi_websocket_register_tcp(tcp_handle: i64, is_server: i64) -> 
     *句柄计数 += 1;
     let 句柄 = *句柄计数;
 
-    let mut ws_pool = 获取WS连接池().lock().unwrap();
-    ws_pool.insert(句柄, ws_conn);
+    获取WS连接池()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(句柄, Arc::new(ws_conn));
 
     句柄
 }
