@@ -352,6 +352,32 @@ pub extern "C" fn qi_bytes_free(handle: i64) -> i64 {
     0
 }
 
+/// 把字节切片原样写入文件（二进制安全——multipart 上传落盘、图片存储等）。
+/// 成功返回写入字节数，失败返回 -1。支持持久负句柄。
+/// 数据先克隆出来、**在池锁外做磁盘 IO**（勿持池锁写盘，见 TCP/UDP/WS 池教训）。
+#[no_mangle]
+pub extern "C" fn qi_bytes_write_file(handle: i64, path_ptr: *const c_char) -> i64 {
+    if path_ptr.is_null() {
+        return -1;
+    }
+    let path = unsafe { CStr::from_ptr(path_ptr).to_string_lossy().to_string() };
+    let data: Vec<u8> = if handle < 0 {
+        match persistent_arc(handle) {
+            Some(a) => (*a).clone(),
+            None => return -1,
+        }
+    } else {
+        match clone_bytes(handle) {
+            Some(v) => v,
+            None => return -1,
+        }
+    };
+    match std::fs::write(&path, &data) {
+        Ok(_) => data.len() as i64,
+        Err(_) => -1,
+    }
+}
+
 /// 释放由 to_string / to_hex / to_base64 返回的 C 字符串（header-aware rc_cstr）
 #[no_mangle]
 pub extern "C" fn qi_bytes_free_string(s: *mut c_char) {
