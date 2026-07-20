@@ -95,6 +95,9 @@ pub struct MCP工具 {
     /// 对象布局: [fn_ptr_at_offset_0, env_slots...]
     /// 调用: trampoline(env=obj_ptr, args_json) → result_str
     pub 回调指针: Option<usize>,
+    /// 原始 inputSchema 覆盖 (Qi 层直接给出完整 JSON Schema 字符串时使用)。
+    /// 存在时 转为Schema 直接采用它, 不再从 参数列表 重建。
+    pub 原始输入schema: Option<JsonValue>,
 }
 
 impl std::fmt::Debug for MCP工具 {
@@ -106,6 +109,7 @@ impl std::fmt::Debug for MCP工具 {
             .field("执行函数", &self.执行函数.is_some())
             .field("回调ID", &self.回调ID)
             .field("回调指针", &self.回调指针)
+            .field("原始输入schema", &self.原始输入schema.is_some())
             .finish()
     }
 }
@@ -120,6 +124,7 @@ impl MCP工具 {
             执行函数: None,
             回调ID: None,
             回调指针: None,
+            原始输入schema: None,
         }
     }
 
@@ -171,6 +176,15 @@ impl MCP工具 {
 
     /// 转换为JSON Schema格式
     pub fn 转为Schema(&self) -> JsonValue {
+        // 若 Qi 层已给出完整 inputSchema 字符串, 直接采用它。
+        if let Some(schema) = &self.原始输入schema {
+            return serde_json::json!({
+                "name": self.名称,
+                "description": self.描述,
+                "inputSchema": schema
+            });
+        }
+
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
 
@@ -599,6 +613,17 @@ impl MCP服务器 {
             .ok_or_else(|| MCP错误::工具错误(format!("工具不存在: {}", 工具名)))?;
 
         工具.回调指针 = Some(指针);
+        Ok(())
+    }
+
+    /// 设置工具原始 inputSchema (完整 JSON Schema 字符串)
+    pub fn 设置工具原始schema(&mut self, 工具名: &str, schema: JsonValue) -> MCP结果<()> {
+        let 工具 = self
+            .工具表
+            .get_mut(工具名)
+            .ok_or_else(|| MCP错误::工具错误(format!("工具不存在: {}", 工具名)))?;
+
+        工具.原始输入schema = Some(schema);
         Ok(())
     }
 

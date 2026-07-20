@@ -768,6 +768,48 @@ pub extern "C" fn qi_mcp_set_tool_callback_ptr(
     }
 }
 
+/// 设置工具原始 inputSchema (完整 JSON Schema 字符串)
+///
+/// 参数:
+/// - server_id: 服务器句柄
+/// - tool_name: 工具名称
+/// - schema_json: 完整的 inputSchema JSON 字符串 (如 {"type":"object","properties":{...}})
+///
+/// 返回: 0 成功, -1 失败 (工具不存在 / JSON 非法 / 服务器不存在)
+///
+/// 注意: 必须先调用 qi_mcp_register_tool 注册工具。存在原始 schema 时,
+/// tools/list 直接采用它, 不再从 add_tool_parameter 添加的参数重建。
+#[no_mangle]
+pub extern "C" fn qi_mcp_set_tool_schema(
+    server_id: i64,
+    tool_name: *const c_char,
+    schema_json: *const c_char,
+) -> i32 {
+    if tool_name.is_null() || schema_json.is_null() {
+        return -1;
+    }
+
+    unsafe {
+        let 工具名 = CStr::from_ptr(tool_name).to_string_lossy().to_string();
+        let json_str = CStr::from_ptr(schema_json).to_string_lossy().to_string();
+
+        let schema: JsonValue = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(_) => return -1,
+        };
+
+        let mut 服务器池 = 获取服务器池().lock().unwrap();
+        if let Some(服务器) = 服务器池.get_mut(&server_id) {
+            match 服务器.设置工具原始schema(&工具名, schema) {
+                Ok(_) => 0,
+                Err(_) => -1,
+            }
+        } else {
+            -1
+        }
+    }
+}
+
 /// JSON-RPC 2.0 stdio 服务器主循环
 ///
 /// 从 stdin 读 newline-delimited JSON-RPC 请求，处理后写到 stdout。
