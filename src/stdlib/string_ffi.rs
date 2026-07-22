@@ -179,6 +179,106 @@ pub extern "C" fn qi_string_char_count(text_ptr: *const c_char) -> i64 {
     }
 }
 
+/// 按字符（Unicode 标量）提取子串：从第 `start` 个字符起，取 `count` 个字符。
+///
+/// 与按字节的 `qi_string_substring` 不同，这里的偏移和长度都以「字符」计，
+/// 汉字/emoji 各算一个字符，绝不会把多字节字符切成半个产出非法 UTF-8。
+/// 越界一律钳制（clamp）：起点超过字符数返回空串，长度超过剩余字符只取到末尾。
+#[no_mangle]
+pub extern "C" fn qi_string_char_substring(
+    text_ptr: *const c_char,
+    start: i64,
+    count: i64,
+) -> *mut c_char {
+    if text_ptr.is_null() || start < 0 || count < 0 {
+        return empty_c_string();
+    }
+
+    unsafe {
+        let text = match CStr::from_ptr(text_ptr).to_str() {
+            Ok(s) => s,
+            Err(_) => return empty_c_string(),
+        };
+
+        // skip/take 天然钳制越界，不会 panic
+        let result: String = text
+            .chars()
+            .skip(start as usize)
+            .take(count as usize)
+            .collect();
+
+        crate::stdlib::qi_str::rc_cstr_from_string(result)
+    }
+}
+
+/// 按字符查找子串首次出现位置，返回「字符」索引，未找到返回 -1。
+///
+/// 与按字节的 `qi_string_find` 不同，返回值是字符下标（可直接喂给
+/// `qi_string_char_substring` / `qi_string_char_at`），对中文优先语言更直觉。
+#[no_mangle]
+pub extern "C" fn qi_string_char_find(text_ptr: *const c_char, search_ptr: *const c_char) -> i64 {
+    if text_ptr.is_null() || search_ptr.is_null() {
+        return -1;
+    }
+
+    unsafe {
+        let text = match CStr::from_ptr(text_ptr).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+
+        let search = match CStr::from_ptr(search_ptr).to_str() {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+
+        match text.find(search) {
+            // 把字节偏移转成字符偏移：统计命中位置之前的字符数
+            Some(byte_pos) => text[..byte_pos].chars().count() as i64,
+            None => -1,
+        }
+    }
+}
+
+/// 按字符索引取单个字符（返回单字符串）。越界返回空串。
+#[no_mangle]
+pub extern "C" fn qi_string_char_at(text_ptr: *const c_char, index: i64) -> *mut c_char {
+    if text_ptr.is_null() || index < 0 {
+        return empty_c_string();
+    }
+
+    unsafe {
+        let text = match CStr::from_ptr(text_ptr).to_str() {
+            Ok(s) => s,
+            Err(_) => return empty_c_string(),
+        };
+
+        match text.chars().nth(index as usize) {
+            Some(ch) => crate::stdlib::qi_str::rc_cstr_from_string(ch.to_string()),
+            None => empty_c_string(),
+        }
+    }
+}
+
+/// 按字符从第 `start` 个字符起取到末尾。起点越界返回空串。
+#[no_mangle]
+pub extern "C" fn qi_string_char_from(text_ptr: *const c_char, start: i64) -> *mut c_char {
+    if text_ptr.is_null() || start < 0 {
+        return empty_c_string();
+    }
+
+    unsafe {
+        let text = match CStr::from_ptr(text_ptr).to_str() {
+            Ok(s) => s,
+            Err(_) => return empty_c_string(),
+        };
+
+        let result: String = text.chars().skip(start as usize).collect();
+
+        crate::stdlib::qi_str::rc_cstr_from_string(result)
+    }
+}
+
 /// Replace all occurrences of a substring with another
 /// Returns a new string allocated with malloc
 #[no_mangle]

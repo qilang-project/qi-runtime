@@ -201,11 +201,16 @@ fn cached_body_fast_path(headers: &[u8], keep_alive: bool) -> i64 {
     }
 }
 
-/// 从 headers 里剥掉 X-Qi-Sendfile 行，返回 (剥掉标记后的 headers, 文件路径)。
-fn strip_sendfile_header(headers: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+/// 从 headers 里剥掉 X-Qi-Sendfile / X-Qi-Range 两个内部标记行，
+/// 返回 (剥掉标记后的 headers, 文件路径, Range 规格如 "bytes=0-1023")。
+/// X-Qi-Range 由 qi-web `发送文件带范围` 从请求 Range 头透传下来，
+/// 让二进制安全的 sendfile 路径能做 206 部分响应（字体 / 视频在 iOS/Safari 上必需）。
+fn strip_sendfile_header(headers: &[u8]) -> (Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>) {
     const KEY: &[u8] = b"x-qi-sendfile:";
+    const RKEY: &[u8] = b"x-qi-range:";
     let mut kept: Vec<u8> = Vec::with_capacity(headers.len());
     let mut path: Option<Vec<u8>> = None;
+    let mut range: Option<Vec<u8>> = None;
     let mut first = true;
     for raw in headers.split(|&b| b == b'\n') {
         let line = if raw.last() == Some(&b'\r') {
@@ -213,15 +218,19 @@ fn strip_sendfile_header(headers: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
         } else {
             raw
         };
-        if line.len() >= KEY.len() && line[..KEY.len()].eq_ignore_ascii_case(KEY) {
-            let mut v = &line[KEY.len()..];
+        let trim = |mut v: &[u8]| -> Vec<u8> {
             while matches!(v.first(), Some(b' ') | Some(b'\t')) {
                 v = &v[1..];
             }
             while matches!(v.last(), Some(b' ') | Some(b'\t')) {
                 v = &v[..v.len() - 1];
             }
-            path = Some(v.to_vec());
+            v.to_vec()
+        };
+        if line.len() >= KEY.len() && line[..KEY.len()].eq_ignore_ascii_case(KEY) {
+            path = Some(trim(&line[KEY.len()..]));
+        } else if line.len() >= RKEY.len() && line[..RKEY.len()].eq_ignore_ascii_case(RKEY) {
+            range = Some(trim(&line[RKEY.len()..]));
         } else if !line.is_empty() {
             if !first {
                 kept.extend_from_slice(b"\r\n");
@@ -230,7 +239,66 @@ fn strip_sendfile_header(headers: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
             first = false;
         }
     }
-    (kept, path)
+    (kept, path, range)
+}
+
+/// 往 headers 尾追加一行（内部已用 \r\n 连接，故先补分隔）。
+#[inline]
+fn append_header_line(hdrs: &mut Vec<u8>, line: &[u8]) {
+    if !hdrs.is_empty() {
+        hdrs.extend_from_slice(b"\r\n");
+    }
+    hdrs.extend_from_slice(line);
+}
+
+/// 解析单段 byte range：`bytes=START-END` / `bytes=START-` / `bytes=-SUFFIX`。
+/// 返回闭区间 (start, end)（含端点），END 越界钳制到 total-1。
+/// None = 语法错 / 多段（交回全量 200）/ 不可满足（调用方转 416）。
+fn parse_byte_range(spec: &[u8], total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let s = std::str::from_utf8(spec).ok()?.trim();
+    let rest = s.strip_prefix("bytes=")?;
+    if rest.contains(',') {
+        return None; // 多段 range：不支持，退回全量
+    }
+    let dash = rest.find('-')?;
+    let a = rest[..dash].trim();
+    let b = rest[dash + 1..].trim();
+    if a.is_empty() {
+        // 后缀式：最后 N 字节
+        let n: u64 = b.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        let n = n.min(total);
+        return Some((total - n, total - 1));
+    }
+    let start: u64 = a.parse().ok()?;
+    if start >= total {
+        return None; // 不可满足
+    }
+    let end: u64 = if b.is_empty() {
+        total - 1
+    } else {
+        let e: u64 = b.parse().ok()?;
+        e.min(total - 1)
+    };
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// 二进制安全地读文件的 [start, start+len) 字节。
+fn read_file_range(path: &str, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 /// sendfile 路径安全：必须绝对路径（Unix `/…` 或 Windows `X:\` / `X:/`）且不含 `..`。
@@ -286,7 +354,7 @@ fn serialize_sendfile_response(
     headers: &[u8],
     conn_header: Option<&[u8]>,
 ) -> Vec<u8> {
-    let (clean_headers, path) = strip_sendfile_header(headers);
+    let (clean_headers, path, range) = strip_sendfile_header(headers);
     let path = match path {
         Some(p) => p,
         None => {
@@ -305,14 +373,70 @@ fn serialize_sendfile_response(
             return build_http_response(500, b"Internal Server Error", CT_TEXT, conn_header, msg);
         }
     };
+
+    // sendfile 响应总是宣告支持字节范围（浏览器 / Safari 据此发 Range 请求）。
+    let mut hdrs = clean_headers;
+    append_header_line(&mut hdrs, b"Accept-Ranges: bytes");
+
+    // 带 Range → 走 206 部分响应（二进制安全的 seek + 部分读）。
+    if let Some(spec) = range.as_deref() {
+        match std::fs::metadata(path_str) {
+            Ok(meta) => {
+                let total = meta.len();
+                match parse_byte_range(spec, total) {
+                    Some((start, end)) => match read_file_range(path_str, start, end - start + 1) {
+                        Ok(bytes) => {
+                            append_header_line(
+                                &mut hdrs,
+                                format!("Content-Range: bytes {}-{}/{}", start, end, total)
+                                    .as_bytes(),
+                            );
+                            return build_http_response(
+                                206,
+                                b"Partial Content",
+                                &hdrs,
+                                conn_header,
+                                &bytes,
+                            );
+                        }
+                        Err(_) => {
+                            let body = format!("404 Not Found: {}", path_str);
+                            return build_http_response(
+                                404,
+                                b"Not Found",
+                                CT_TEXT,
+                                conn_header,
+                                body.as_bytes(),
+                            );
+                        }
+                    },
+                    None => {
+                        // 不可满足的 range → 416 + Content-Range: bytes */total
+                        append_header_line(
+                            &mut hdrs,
+                            format!("Content-Range: bytes */{}", total).as_bytes(),
+                        );
+                        let msg = b"416 Range Not Satisfiable";
+                        return build_http_response(
+                            416,
+                            b"Range Not Satisfiable",
+                            &hdrs,
+                            conn_header,
+                            msg,
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                let body = format!("404 Not Found: {}", path_str);
+                return build_http_response(404, b"Not Found", CT_TEXT, conn_header, body.as_bytes());
+            }
+        }
+    }
+
+    // 无 Range → 全量 200。
     match std::fs::read(path_str) {
-        Ok(bytes) => build_http_response(
-            status_code,
-            status_text,
-            &clean_headers,
-            conn_header,
-            &bytes,
-        ),
+        Ok(bytes) => build_http_response(status_code, status_text, &hdrs, conn_header, &bytes),
         Err(_) => {
             let body = format!("404 Not Found: {}", path_str);
             build_http_response(404, b"Not Found", CT_TEXT, conn_header, body.as_bytes())
@@ -763,6 +887,46 @@ fn router() -> &'static std::sync::RwLock<RouteNode> {
     ROUTER.get_or_init(|| std::sync::RwLock::new(RouteNode::new()))
 }
 
+/// 单个十六进制字符 → 数值（0..15），非法字符返回 None。
+#[inline]
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 百分号解码**单个路径段**：把 `%XX`（两位十六进制）还原成原字节，其余字节原样保留。
+///
+/// - 浏览器 / curl 对非 ASCII 路径一律百分号编码：`/登出` 实际发的是
+///   `/%E7%99%BB%E5%87%BA`。中文路由注册时是原样 UTF-8 字节，故匹配前必须先解码，
+///   否则中文路由永远 404（这正是本函数要修的 bug）。
+/// - 路径里的 `+` 是**字面加号**（只有查询串里 `+` 才代表空格），因此这里不动 `+`。
+/// - 非法 `%XX`（后面不足两位或不是十六进制）把 `%` 原样保留，绝不 panic。
+/// - 返回原始字节（可能是合法 UTF-8，也可能是半截多字节序列）；字节级比较天然安全。
+/// - 无 `%` 时走快路径，行为与旧版逐字节匹配完全一致 → ASCII 路由零回归。
+fn percent_decode_segment(seg: &[u8]) -> Vec<u8> {
+    if !seg.contains(&b'%') {
+        return seg.to_vec();
+    }
+    let mut out = Vec::with_capacity(seg.len());
+    let mut i = 0usize;
+    while i < seg.len() {
+        if seg[i] == b'%' && i + 2 < seg.len() {
+            if let (Some(h), Some(l)) = (hex_val(seg[i + 1]), hex_val(seg[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(seg[i]);
+        i += 1;
+    }
+    out
+}
+
 #[inline]
 fn method_idx(method: &[u8]) -> i32 {
     match method {
@@ -798,7 +962,11 @@ pub extern "C" fn qi_web_router_register(
     }
     let mut router = router().write().unwrap();
     let mut cur: &mut RouteNode = &mut *router;
-    for seg in path.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
+    for raw_seg in path.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
+        // 注册端也解码：与匹配端保持同一「已解码」规范空间。中文路由通常本就是
+        // 原样 UTF-8（无 %，解码即恒等），这里只为对称容错（例如有人注册成 %XX）。
+        let seg_decoded = percent_decode_segment(raw_seg);
+        let seg = seg_decoded.as_slice();
         if seg.len() >= 2 && seg.first() == Some(&b'{') && seg.last() == Some(&b'}') {
             let name = &seg[1..seg.len() - 1];
             if cur.param_child.is_none() {
@@ -848,7 +1016,11 @@ pub extern "C" fn qi_web_router_match(
     let router = router().read().unwrap();
     let mut cur: &RouteNode = &*router;
     let mut params: Vec<u8> = Vec::new();
-    for seg in path.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
+    for raw_seg in path.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
+        // 请求路径段先百分号解码，再拿去和注册的原样 UTF-8 段做字节比较。
+        // 这样浏览器发来的 `/%E7%99%BB%E5%87%BA` 能命中注册的 `/登出`。
+        let seg_decoded = percent_decode_segment(raw_seg);
+        let seg = seg_decoded.as_slice();
         if let Some(child) = cur.static_children.get(seg) {
             cur = child;
         } else if let Some((name, pchild)) = cur.param_child.as_ref() {
@@ -857,6 +1029,8 @@ pub extern "C" fn qi_web_router_match(
             }
             params.extend_from_slice(name);
             params.push(b'=');
+            // 参数值存**解码后**的字节：`/用户/{名字}` 收到 %XX 编码的中文时，
+            // 路径参数() 直接拿到真实中文，无需二次解码。
             params.extend_from_slice(seg);
             cur = pchild.as_ref();
         } else {
@@ -876,10 +1050,17 @@ pub extern "C" fn qi_web_router_match(
             method_mask |= 1u8 << i;
         }
     }
+    // 解码后的参数字节通常是合法 UTF-8（正常中文）。半截 / 非法 UTF-8（如
+    // `/用户/%E7%99`）走 lossy 替换成 U+FFFD，保证交给 Qi 侧的 字符串 永远满足
+    // UTF-8 公约，绝不触发下游 from_utf8_unchecked 的未定义行为，也绝不 panic。
+    let params_bytes: std::borrow::Cow<'_, [u8]> = match std::str::from_utf8(&params) {
+        Ok(_) => std::borrow::Cow::Borrowed(&params),
+        Err(_) => std::borrow::Cow::Owned(String::from_utf8_lossy(&params).into_owned().into_bytes()),
+    };
     Box::into_raw(Box::new(MatchResult {
         handler_index,
         path_hit: 1,
-        params: RcStr::from_bytes(&params),
+        params: RcStr::from_bytes(&params_bytes),
         method_mask,
     }))
 }
@@ -967,4 +1148,93 @@ fn fallback_500() -> *const c_char {
     // rc_cstr 分配：qi 侧若走 qi_string_free 正常回收；不 free 也只是原有的
     // "intentional leak" 语义（错误路径，非热路径）
     crate::stdlib::qi_str::rc_cstr_from_string(response) as *const c_char
+}
+
+#[cfg(test)]
+mod route_decode_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_segment_is_identity() {
+        assert_eq!(percent_decode_segment(b"logout"), b"logout");
+        assert_eq!(percent_decode_segment(b"api"), b"api");
+    }
+
+    #[test]
+    fn plus_is_literal_in_path() {
+        // 路径里 '+' 是字面加号，不转空格（区别于查询串语义）
+        assert_eq!(percent_decode_segment(b"a+b"), b"a+b");
+    }
+
+    #[test]
+    fn decodes_chinese_utf8() {
+        // "登出" 的 UTF-8 百分号编码，大小写十六进制都要还原成原字节
+        assert_eq!(
+            percent_decode_segment(b"%E7%99%BB%E5%87%BA"),
+            "登出".as_bytes()
+        );
+        assert_eq!(
+            percent_decode_segment(b"%e7%99%bb%e5%87%ba"),
+            "登出".as_bytes()
+        );
+    }
+
+    #[test]
+    fn invalid_or_truncated_percent_is_literal_no_panic() {
+        // 非十六进制 → 原样保留 '%'
+        assert_eq!(percent_decode_segment(b"%ZZ"), b"%ZZ");
+        // 不足两位十六进制的半截转义 → 原样保留，绝不 panic
+        assert_eq!(percent_decode_segment(b"%"), b"%");
+        assert_eq!(percent_decode_segment(b"%E"), b"%E");
+        // 完整的单字节转义 %E7 → 还原成字节 0xE7（合法行为）
+        assert_eq!(percent_decode_segment(b"%E7"), &[0xE7u8]);
+    }
+
+    #[test]
+    fn register_and_match_chinese_route() {
+        // 注册中文路由（原样 UTF-8），用百分号编码请求命中
+        let m = "GET\0";
+        let p = "/登出\0";
+        assert_eq!(
+            qi_web_router_register(m.as_ptr() as *const c_char, p.as_ptr() as *const c_char, 7),
+            0
+        );
+        let req = "/%E7%99%BB%E5%87%BA\0";
+        let mr = qi_web_router_match(m.as_ptr() as *const c_char, req.as_ptr() as *const c_char);
+        assert!(!mr.is_null());
+        assert_eq!(qi_web_match_handler(mr), 7);
+        qi_web_match_free(mr);
+    }
+
+    #[test]
+    fn chinese_path_param_is_decoded() {
+        let m = "GET\0";
+        let p = "/用户/{名字}\0";
+        assert_eq!(
+            qi_web_router_register(m.as_ptr() as *const c_char, p.as_ptr() as *const c_char, 3),
+            0
+        );
+        // /用户/小奇 百分号编码
+        let req = "/%E7%94%A8%E6%88%B7/%E5%B0%8F%E5%A5%87\0";
+        let mr = qi_web_router_match(m.as_ptr() as *const c_char, req.as_ptr() as *const c_char);
+        assert!(!mr.is_null());
+        assert_eq!(qi_web_match_handler(mr), 3);
+        let params = unsafe { CStr::from_ptr(qi_web_match_params(mr)).to_str().unwrap() };
+        assert_eq!(params, "名字=小奇");
+        qi_web_match_free(mr);
+    }
+
+    #[test]
+    fn malformed_utf8_param_does_not_panic() {
+        // /用户/%E7%99 —— 前缀命中，参数是半截 UTF-8，lossy 后不 panic
+        let m = "GET\0";
+        let p = "/用户/{名字}\0";
+        qi_web_router_register(m.as_ptr() as *const c_char, p.as_ptr() as *const c_char, 5);
+        let req = "/%E7%94%A8%E6%88%B7/%E7%99\0";
+        let mr = qi_web_router_match(m.as_ptr() as *const c_char, req.as_ptr() as *const c_char);
+        assert!(!mr.is_null());
+        // 拿到合法 UTF-8 的参数串（U+FFFD 替换），不崩
+        let _ = unsafe { CStr::from_ptr(qi_web_match_params(mr)).to_str() };
+        qi_web_match_free(mr);
+    }
 }
