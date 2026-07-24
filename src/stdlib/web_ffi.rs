@@ -185,7 +185,10 @@ fn cached_body_fast_path(headers: &[u8], keep_alive: bool) -> i64 {
     if rest.iter().any(|&b| b == b'\r' || b == b'\n') {
         return 0;
     }
-    let id = match std::str::from_utf8(rest).ok().and_then(|s| s.trim().parse::<i64>().ok()) {
+    let id = match std::str::from_utf8(rest)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+    {
         Some(v) => v,
         None => return 0,
     };
@@ -429,7 +432,13 @@ fn serialize_sendfile_response(
             }
             Err(_) => {
                 let body = format!("404 Not Found: {}", path_str);
-                return build_http_response(404, b"Not Found", CT_TEXT, conn_header, body.as_bytes());
+                return build_http_response(
+                    404,
+                    b"Not Found",
+                    CT_TEXT,
+                    conn_header,
+                    body.as_bytes(),
+                );
             }
         }
     }
@@ -767,6 +776,118 @@ fn find_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
+/// Inspect an incrementally buffered HTTP/1.1 request without allocating the body.
+/// Returns 1 once the declared/decoded request body exceeds `max_body_bytes`, else 0.
+///
+/// Content-Length is rejected as soon as the headers arrive. For chunked requests,
+/// each available chunk-size line is accumulated before that chunk's payload is read,
+/// so a chunk that would cross the limit is rejected without buffering its data.
+#[no_mangle]
+pub extern "C" fn qi_web_request_body_exceeds_limit(bytes_handle: i64, max_body_bytes: i64) -> i64 {
+    if max_body_bytes < 0 {
+        return 0;
+    }
+    crate::stdlib::bytes_ffi::with_bytes(bytes_handle, |bytes| {
+        request_body_exceeds_limit(bytes, max_body_bytes as usize) as i64
+    })
+    .unwrap_or(0)
+}
+
+fn request_body_exceeds_limit(bytes: &[u8], max_body_bytes: usize) -> bool {
+    let boundary = match find_subslice(bytes, b"\r\n\r\n") {
+        Some(boundary) => boundary,
+        None => return false,
+    };
+    let headers = &bytes[..boundary];
+    if let Some(content_length) = find_content_length(headers) {
+        return content_length > max_body_bytes;
+    }
+    if !header_has_chunked_transfer_encoding(headers) {
+        return false;
+    }
+
+    let mut decoded_len = 0usize;
+    let mut pos = boundary + 4;
+    loop {
+        let line_end = match find_subslice(&bytes[pos..], b"\r\n") {
+            Some(relative) => pos + relative,
+            None => return false,
+        };
+        let size_field = bytes[pos..line_end]
+            .split(|&byte| byte == b';')
+            .next()
+            .unwrap_or_default();
+        let chunk_size = match parse_hex_usize(size_field) {
+            Some(size) => size,
+            None => return false,
+        };
+        if chunk_size == 0 {
+            return false;
+        }
+        decoded_len = decoded_len.saturating_add(chunk_size);
+        if decoded_len > max_body_bytes {
+            return true;
+        }
+
+        let data_start = line_end + 2;
+        let next_size = match data_start
+            .checked_add(chunk_size)
+            .and_then(|end| end.checked_add(2))
+        {
+            Some(next_size) => next_size,
+            None => return true,
+        };
+        if next_size > bytes.len() {
+            return false;
+        }
+        pos = next_size;
+    }
+}
+
+fn header_has_chunked_transfer_encoding(headers: &[u8]) -> bool {
+    headers.split(|&byte| byte == b'\n').any(|raw_line| {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let colon = match line.iter().position(|&byte| byte == b':') {
+            Some(colon) => colon,
+            None => return false,
+        };
+        let name = &line[..colon];
+        let value = &line[colon + 1..];
+        name.eq_ignore_ascii_case(b"transfer-encoding")
+            && value
+                .split(|&byte| byte == b',')
+                .any(|coding| trim_ascii_bytes(coding).eq_ignore_ascii_case(b"chunked"))
+    })
+}
+
+fn parse_hex_usize(bytes: &[u8]) -> Option<usize> {
+    let bytes = trim_ascii_bytes(bytes);
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = 0usize;
+    for &byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => (byte - b'0') as usize,
+            b'a'..=b'f' => (byte - b'a' + 10) as usize,
+            b'A'..=b'F' => (byte - b'A' + 10) as usize,
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+fn trim_ascii_bytes(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.first(), Some(b' ' | b'\t')) {
+        bytes = &bytes[1..];
+    }
+    while matches!(bytes.last(), Some(b' ' | b'\t')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
 // 借引用：返回 RequestParts 内部 RC C 串的指针。生命期跟 RequestParts 一致，
 // 调用方必须在调 qi_web_request_parts_free 之前别再读这些指针；
 // 若调用方（QI_ARC 插桩）retain 过，则 retain 的那份在 parts_free 之后依然有效。
@@ -1055,7 +1176,9 @@ pub extern "C" fn qi_web_router_match(
     // UTF-8 公约，绝不触发下游 from_utf8_unchecked 的未定义行为，也绝不 panic。
     let params_bytes: std::borrow::Cow<'_, [u8]> = match std::str::from_utf8(&params) {
         Ok(_) => std::borrow::Cow::Borrowed(&params),
-        Err(_) => std::borrow::Cow::Owned(String::from_utf8_lossy(&params).into_owned().into_bytes()),
+        Err(_) => {
+            std::borrow::Cow::Owned(String::from_utf8_lossy(&params).into_owned().into_bytes())
+        }
     };
     Box::into_raw(Box::new(MatchResult {
         handler_index,
@@ -1236,5 +1359,37 @@ mod route_decode_tests {
         // 拿到合法 UTF-8 的参数串（U+FFFD 替换），不崩
         let _ = unsafe { CStr::from_ptr(qi_web_match_params(mr)).to_str() };
         qi_web_match_free(mr);
+    }
+}
+
+#[cfg(test)]
+mod request_body_limit_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_oversized_content_length_from_headers_only() {
+        let request = b"POST /chat HTTP/1.1\r\nContent-Length: 257\r\n\r\n";
+        assert!(request_body_exceeds_limit(request, 256));
+    }
+
+    #[test]
+    fn allows_content_length_at_limit() {
+        let request = b"POST /chat HTTP/1.1\r\nContent-Length: 256\r\n\r\n";
+        assert!(!request_body_exceeds_limit(request, 256));
+    }
+
+    #[test]
+    fn rejects_chunk_that_crosses_limit_before_chunk_payload_arrives() {
+        let mut request =
+            b"POST /chat HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n80\r\n".to_vec();
+        request.extend(std::iter::repeat(b'x').take(128));
+        request.extend_from_slice(b"\r\n81\r\n");
+        assert!(request_body_exceeds_limit(&request, 256));
+    }
+
+    #[test]
+    fn incomplete_chunked_body_below_limit_is_not_rejected() {
+        let request = b"POST /chat HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n80\r\npartial";
+        assert!(!request_body_exceeds_limit(request, 256));
     }
 }

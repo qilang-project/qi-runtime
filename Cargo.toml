@@ -3,7 +3,7 @@
 
 [package]
 name = "qi-runtime"
-version = "0.1.0"
+version = "2026.7.24-1"
 edition = "2021"
 authors = ["Qi Language Team"]
 license = "MIT"
@@ -14,6 +14,8 @@ name = "qi_runtime"
 crate-type = ["staticlib", "rlib"]
 
 [features]
+default = ["runtime-rc-string"]
+runtime-rc-string = []
 # 桌面 GUI：把 qi-gui（tao/egui/winit/softbuffer 等）编进 libqi_runtime.a，
 # 并置 has_gui。默认关闭 —— 保持运行时轻量、可 zig 交叉编译（GUI 非交叉目标）。
 # 桌面构建 GUI 可用的运行时：cargo build --release --features gui

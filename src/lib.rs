@@ -35,7 +35,9 @@ pub mod error;
 pub mod executor;
 pub mod io;
 pub mod memory;
+pub mod runtime_worker;
 pub mod stdlib;
+pub mod tool_control;
 
 // Legacy modules for backward compatibility
 pub mod strings;
@@ -52,7 +54,9 @@ pub use environment::{RuntimeConfig, RuntimeEnvironment, RuntimeState};
 pub use error::{ChineseErrorMessages, ErrorHandler};
 pub use io::{FileSystemInterface, NetworkManager};
 pub use memory::{AllocationStrategy, MemoryManager};
+pub use runtime_worker::{WorkerMessage, WORKER_PROTOCOL_VERSION};
 pub use stdlib::{MathModule, StandardLibrary, StringModule};
+pub use tool_control::{FinishRecord, WaitResult};
 // Re-export async runtime FFI functions
 pub use async_runtime::ffi::{qi_runtime_await, qi_runtime_create_task, qi_runtime_spawn_task};
 

@@ -617,7 +617,9 @@ impl MCP服务器 {
     }
 
     /// 设置工具原始 inputSchema (完整 JSON Schema 字符串)
-    pub fn 设置工具原始schema(&mut self, 工具名: &str, schema: JsonValue) -> MCP结果<()> {
+    pub fn 设置工具原始schema(
+        &mut self, 工具名: &str, schema: JsonValue
+    ) -> MCP结果<()> {
         let 工具 = self
             .工具表
             .get_mut(工具名)

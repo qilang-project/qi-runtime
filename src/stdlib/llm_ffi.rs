@@ -4,19 +4,23 @@
 
 #![allow(non_snake_case)]
 
+use rand::RngCore;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as _;
 use std::ffi::CStr;
 use std::io::Read;
 use std::os::raw::c_char;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // LLM 会话池
 static LLM会话池: OnceLock<Mutex<HashMap<i64, LLM会话>>> = OnceLock::new();
 static 会话计数器: OnceLock<Mutex<i64>> = OnceLock::new();
 static LLM流池: OnceLock<Mutex<HashMap<i64, LLM流>>> = OnceLock::new();
 static 流计数器: OnceLock<Mutex<i64>> = OnceLock::new();
+static 可靠流池: OnceLock<Mutex<HashMap<i64, Arc<可靠流>>>> = OnceLock::new();
+static 已分配可靠流句柄: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
 
 fn 获取会话池() -> &'static Mutex<HashMap<i64, LLM会话>> {
     LLM会话池.get_or_init(|| Mutex::new(HashMap::new()))
@@ -34,6 +38,23 @@ fn 获取流计数器() -> &'static Mutex<i64> {
     流计数器.get_or_init(|| Mutex::new(0))
 }
 
+fn 获取可靠流池() -> &'static Mutex<HashMap<i64, Arc<可靠流>>> {
+    可靠流池.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn 分配可靠流句柄() -> i64 {
+    let mut 已分配 = 已分配可靠流句柄
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap();
+    loop {
+        let 句柄 = (rand::rngs::OsRng.next_u64() & i64::MAX as u64) as i64;
+        if 句柄 != 0 && 已分配.insert(句柄) {
+            return 句柄;
+        }
+    }
+}
+
 /// LLM 会话结构
 #[derive(Debug, Clone)]
 struct LLM会话 {
@@ -45,6 +66,8 @@ struct LLM会话 {
     模型: String,
     /// 对话历史，使用 OpenAI-compatible message JSON 表示，便于保存 tool_calls/tool 结果
     历史: Vec<Value>,
+    /// 每次历史变更递增，供可靠流提交做 compare-and-swap。
+    历史版本: i64,
     /// 可用工具定义
     工具列表: Vec<Value>,
     /// provider-safe 工具名 -> Qi 原始工具名
@@ -70,6 +93,7 @@ impl LLM会话 {
             密钥,
             模型,
             历史: Vec::new(),
+            历史版本: 0,
             工具列表: Vec::new(),
             工具名称映射: HashMap::new(),
             配置: HashMap::new(),
@@ -1135,6 +1159,321 @@ impl LLM流 {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum 可靠流决议 {
+    待定,
+    已提交,
+    已放弃,
+}
+
+struct 可靠流元数据 {
+    下个序号: i64,
+    状态: String,
+    终止: bool,
+    决议: 可靠流决议,
+    文本: String,
+    工具分块: Vec<(String, String, String)>,
+    用量: Option<(i64, i64, i64)>,
+}
+
+struct 可靠流 {
+    会话句柄: i64,
+    打开时历史版本: i64,
+    待提交消息: Vec<Value>,
+    接收器: crossbeam::channel::Receiver<String>,
+    发送器: crossbeam::channel::Sender<String>,
+    发送锁: Mutex<()>,
+    已取消: AtomicBool,
+    元数据: Mutex<可靠流元数据>,
+}
+
+impl 可靠流 {
+    fn 新建(
+        会话句柄: i64, 打开时历史版本: i64, 待提交消息: Vec<Value>
+    ) -> Arc<Self> {
+        let (发送器, 接收器) = crossbeam::channel::bounded(64);
+        Arc::new(Self {
+            会话句柄,
+            打开时历史版本,
+            待提交消息,
+            接收器,
+            发送器,
+            发送锁: Mutex::new(()),
+            已取消: AtomicBool::new(false),
+            元数据: Mutex::new(可靠流元数据 {
+                下个序号: 1,
+                状态: "opening".to_string(),
+                终止: false,
+                决议: 可靠流决议::待定,
+                文本: String::new(),
+                工具分块: Vec::new(),
+                用量: None,
+            }),
+        })
+    }
+
+    fn 发送事件(&self, 类型: &str, 载荷: Value, 终止状态: Option<&str>) -> bool {
+        let _发送守卫 = self.发送锁.lock().unwrap();
+        let 事件 = {
+            let mut 元数据 = self.元数据.lock().unwrap();
+            if 元数据.终止 {
+                return false;
+            }
+            if let Some(状态) = 终止状态 {
+                元数据.终止 = true;
+                元数据.状态 = 状态.to_string();
+            } else if 类型 == "response.started" {
+                元数据.状态 = "streaming".to_string();
+            }
+            let 序号 = 元数据.下个序号;
+            元数据.下个序号 += 1;
+            json!({"version": 2, "seq": 序号, "type": 类型, "payload": 载荷}).to_string()
+        };
+        self.发送器.send(事件).is_ok()
+    }
+
+    fn 发送终止异步(
+        self: &Arc<Self>, 类型: &'static str, 载荷: Value, 状态: &'static str
+    ) {
+        let 流 = self.clone();
+        thread::spawn(move || {
+            let _ = 流.发送事件(类型, 载荷, Some(状态));
+        });
+    }
+
+    fn 累积文本(&self, 文本: &str) {
+        self.元数据.lock().unwrap().文本.push_str(文本);
+    }
+
+    fn 累积工具(&self, tc: &Value) -> Value {
+        let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let mut 元数据 = self.元数据.lock().unwrap();
+        while 元数据.工具分块.len() <= idx {
+            元数据
+                .工具分块
+                .push((String::new(), String::new(), String::new()));
+        }
+        let (id, 名, 参数) = &mut 元数据.工具分块[idx];
+        if let Some(v) = tc.get("id").and_then(Value::as_str) {
+            if !v.is_empty() {
+                *id = v.to_string();
+            }
+        }
+        let 参数增量 = tc
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if let Some(v) = tc
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+        {
+            if !v.is_empty() {
+                *名 = v.to_string();
+            }
+        }
+        参数.push_str(参数增量);
+        json!({
+            "index": idx,
+            "id": id,
+            "name": 名,
+            "arguments_delta": 参数增量
+        })
+    }
+
+    fn 设置用量(&self, 用量: (i64, i64, i64)) {
+        self.元数据.lock().unwrap().用量 = Some(用量);
+    }
+
+    fn 从元数据组装助手消息(元数据: &可靠流元数据) -> Value {
+        let mut 消息 = json!({"role": "assistant"});
+        消息["content"] = if 元数据.文本.is_empty() && !元数据.工具分块.is_empty() {
+            Value::Null
+        } else {
+            json!(元数据.文本)
+        };
+        if !元数据.工具分块.is_empty() {
+            消息["tool_calls"] = Value::Array(
+                元数据
+                    .工具分块
+                    .iter()
+                    .map(|(id, 名, 参数)| {
+                        json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {"name": 名, "arguments": 参数}
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        消息
+    }
+
+    fn 快照(&self) -> Value {
+        let 元数据 = self.元数据.lock().unwrap();
+        json!({
+            "version": 2,
+            "state": 元数据.状态,
+            "terminal": 元数据.终止,
+            "cancel_requested": self.已取消.load(Ordering::Acquire),
+            "committed": 元数据.决议 == 可靠流决议::已提交,
+            "aborted": 元数据.决议 == 可靠流决议::已放弃,
+            "history_revision": self.打开时历史版本,
+            "text": 元数据.文本,
+            "usage": 元数据.用量.map(|(p, c, t)| json!({
+                "prompt_tokens": p, "completion_tokens": c, "total_tokens": t
+            })).unwrap_or(Value::Null)
+        })
+    }
+}
+
+fn 可靠流错误(流: &Arc<可靠流>, 代码: &str, 消息: impl Into<String>) {
+    流.发送事件(
+        "error",
+        json!({"code": 代码, "message": 消息.into()}),
+        Some("error"),
+    );
+}
+
+fn 处理OpenAI事件(流: &Arc<可靠流>, 数据: &str, 已完成选择: &mut bool) -> bool {
+    if 数据 == "[DONE]" {
+        if !*已完成选择 {
+            可靠流错误(
+                流,
+                "missing_finish_state",
+                "收到 [DONE]，但没有完成的 choice/finish_reason",
+            );
+            return true;
+        }
+        let 用量未知 = 流.元数据.lock().unwrap().用量.is_none();
+        if 用量未知 {
+            流.发送事件("usage", json!({"status": "usage_unknown"}), None);
+        }
+        流.发送事件("response.completed", json!({}), Some("completed"));
+        return true;
+    }
+
+    let 帧: Value = match serde_json::from_str(数据) {
+        Ok(v) => v,
+        Err(e) => {
+            可靠流错误(流, "invalid_sse_json", format!("无效 SSE JSON: {}", e));
+            return true;
+        }
+    };
+    if let Some(错误) = 帧.get("error") {
+        可靠流错误(流, "provider_error", 错误.to_string());
+        return true;
+    }
+    if let Some(用量值) = 帧.get("usage").filter(|v| !v.is_null()) {
+        let p = 用量值
+            .get("prompt_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let c = 用量值
+            .get("completion_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let t = 用量值
+            .get("total_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(p + c);
+        流.设置用量((p, c, t));
+        流.发送事件(
+            "usage",
+            json!({"status": "known", "prompt_tokens": p, "completion_tokens": c, "total_tokens": t}),
+            None,
+        );
+    }
+    if let Some(选择) = 帧.get("choices").and_then(Value::as_array) {
+        for choice in 选择 {
+            if choice.get("finish_reason").is_some_and(|v| !v.is_null()) {
+                *已完成选择 = true;
+            }
+            if let Some(delta) = choice.get("delta") {
+                if let Some(文本) = delta.get("content").and_then(Value::as_str) {
+                    if !文本.is_empty() {
+                        流.累积文本(文本);
+                        流.发送事件("text.delta", json!({"text": 文本}), None);
+                    }
+                }
+                if let Some(工具) = delta.get("tool_calls").and_then(Value::as_array) {
+                    for tc in 工具 {
+                        let 载荷 = 流.累积工具(tc);
+                        流.发送事件("tool_call.delta", 载荷, None);
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn 运行可靠流工作线程(流: Arc<可靠流>, 会话: LLM会话, 请求体: Value) {
+    let mut 响应 = match 会话.发送请求体(请求体) {
+        Ok(v) => v,
+        Err(e) => {
+            if !流.已取消.load(Ordering::Acquire) {
+                可靠流错误(&流, "transport_error", e);
+            }
+            return;
+        }
+    };
+    if 流.已取消.load(Ordering::Acquire) {
+        return;
+    }
+    流.发送事件(
+        "response.started",
+        json!({"status": 响应.status().as_u16()}),
+        None,
+    );
+
+    let mut 缓冲 = String::new();
+    let mut 已完成选择 = false;
+    loop {
+        if 流.已取消.load(Ordering::Acquire) {
+            return;
+        }
+        let mut 字节 = [0u8; 4096];
+        let 数量 = match 响应.read(&mut 字节) {
+            Ok(n) => n,
+            Err(e) => {
+                if !流.已取消.load(Ordering::Acquire) {
+                    可靠流错误(&流, "transport_error", format!("读取流失败: {}", e));
+                }
+                return;
+            }
+        };
+        if 数量 == 0 {
+            break;
+        }
+        缓冲.push_str(&String::from_utf8_lossy(&字节[..数量]));
+        while let Some((位置, 分隔长度)) = LLM流::查找事件分隔符(&缓冲) {
+            let 事件 = 缓冲[..位置].to_string();
+            缓冲.drain(..位置 + 分隔长度);
+            let mut 数据 = String::new();
+            for 行 in 事件.lines() {
+                if let Some(内容) = 行.trim_start().strip_prefix("data:") {
+                    if !数据.is_empty() {
+                        数据.push('\n');
+                    }
+                    数据.push_str(内容.trim_start());
+                }
+            }
+            if 数据.is_empty() {
+                continue;
+            }
+            if 处理OpenAI事件(&流, &数据, &mut 已完成选择) {
+                return;
+            }
+        }
+    }
+    if !流.已取消.load(Ordering::Acquire) {
+        可靠流错误(&流, "unexpected_eof", "流在 [DONE] 前结束");
+    }
+}
+
 fn 转为C字符串指针(文本: String) -> *mut c_char {
     // 去掉内部 NUL（与旧 CString 语义一致，避免 C 侧 strlen 截断歧义）
     if 文本.contains('\0') {
@@ -1184,6 +1523,7 @@ fn 保存流历史(流: &LLM流) {
                 .历史
                 .push(json!({ "role": "assistant", "content": 流.累计 }));
         }
+        会话.历史版本 += 1;
     }
 }
 
@@ -1386,6 +1726,7 @@ pub extern "C" fn qi_llm_chat(session_handle: i64, prompt: *const c_char) -> *mu
                         "role": "assistant",
                         "content": 响应.clone()
                     }));
+                    会话.历史版本 += 1;
 
                     return 转为C字符串指针(响应);
                 }
@@ -1472,6 +1813,7 @@ pub extern "C" fn qi_llm_chat_image(
                         "role": "assistant",
                         "content": 响应.clone()
                     }));
+                    会话.历史版本 += 1;
 
                     return 转为C字符串指针(响应);
                 }
@@ -1483,6 +1825,260 @@ pub extern "C" fn qi_llm_chat_image(
     }
 
     转为C字符串指针("LLM调用失败: 无效会话句柄".to_string())
+}
+
+/// 打开 v2 OpenAI-compatible SSE 流。request_json 可传完整请求体，或传
+/// {"prompt":"...","tools":true} 由 runtime 基于当前会话构造请求体。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_v2_open(session_handle: i64, request_json: *const c_char) -> i64 {
+    if request_json.is_null() {
+        return -1;
+    }
+    let 请求文本 = unsafe { CStr::from_ptr(request_json) }
+        .to_string_lossy()
+        .to_string();
+    let 请求参数: Value = match serde_json::from_str(&请求文本) {
+        Ok(Value::Object(v)) => Value::Object(v),
+        _ => return -1,
+    };
+    let (会话, 历史版本) = {
+        let 会话池 = 获取会话池().lock().unwrap();
+        match 会话池.get(&session_handle) {
+            Some(v) => (v.clone(), v.历史版本),
+            None => return -1,
+        }
+    };
+    if 会话.提供商 != "openai" {
+        return -2;
+    }
+
+    let 最大令牌 = match 请求参数.get("max_tokens") {
+        Some(v) => match v.as_i64() {
+            Some(n) if n > 0 && n <= i32::MAX as i64 => Some(n),
+            _ => return -1,
+        },
+        None => None,
+    };
+
+    let (mut 请求体, 待提交消息) = if 请求参数.get("messages").is_some() {
+        let 消息 = match 请求参数.get("messages").and_then(Value::as_array) {
+            Some(v) => v.clone(),
+            None => return -1,
+        };
+        let 待提交 = if 消息.len() >= 会话.历史.len() && 消息[..会话.历史.len()] == 会话.历史[..]
+        {
+            消息[会话.历史.len()..].to_vec()
+        } else {
+            return -1;
+        };
+        (请求参数, 待提交)
+    } else {
+        let 提示 = match 请求参数.get("prompt").and_then(Value::as_str) {
+            Some(v) => v.to_string(),
+            None => return -1,
+        };
+        let 带工具 = 请求参数
+            .get("tools")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        (
+            会话.构建请求体(&提示, true, 带工具),
+            vec![json!({"role": "user", "content": 提示})],
+        )
+    };
+    if let Some(最大令牌) = 最大令牌 {
+        请求体["max_tokens"] = json!(最大令牌);
+    }
+    请求体["stream"] = json!(true);
+    if 请求体.get("stream_options").is_none() {
+        请求体["stream_options"] = json!({"include_usage": true});
+    }
+
+    let 流 = 可靠流::新建(session_handle, 历史版本, 待提交消息);
+    let 句柄 = 分配可靠流句柄();
+    获取可靠流池().lock().unwrap().insert(句柄, 流.clone());
+    thread::spawn(move || 运行可靠流工作线程(流, 会话, 请求体));
+    句柄
+}
+
+/// 阻塞读取一个规范化事件 JSON。流终止且事件已耗尽时返回空字符串。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_v2_next_event(stream_handle: i64) -> *mut c_char {
+    let 流 = {
+        let 池 = 获取可靠流池().lock().unwrap();
+        池.get(&stream_handle).cloned()
+    };
+    let Some(流) = 流 else {
+        return 转为C字符串指针(String::new());
+    };
+    {
+        let _发送守卫 = 流.发送锁.lock().unwrap();
+        if 流.元数据.lock().unwrap().终止 && 流.接收器.is_empty() {
+            return 转为C字符串指针(String::new());
+        }
+    }
+    match 流.接收器.recv() {
+        Ok(事件) => 转为C字符串指针(事件),
+        Err(_) => 转为C字符串指针(String::new()),
+    }
+}
+
+/// 最多阻塞 timeout_ms 毫秒读取一个事件。超时返回非终止 poll.timeout 事件；
+/// 流终止且事件已耗尽时仍返回空字符串，以保持 next_event 的终止语义。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_v2_next_event_timeout(
+    stream_handle: i64,
+    timeout_ms: i64,
+) -> *mut c_char {
+    let 流 = {
+        let 池 = 获取可靠流池().lock().unwrap();
+        池.get(&stream_handle).cloned()
+    };
+    let Some(流) = 流 else {
+        return 转为C字符串指针(String::new());
+    };
+    {
+        let _发送守卫 = 流.发送锁.lock().unwrap();
+        if 流.元数据.lock().unwrap().终止 && 流.接收器.is_empty() {
+            return 转为C字符串指针(String::new());
+        }
+    }
+    let 等待毫秒 = timeout_ms.max(0) as u64;
+    match 流
+        .接收器
+        .recv_timeout(std::time::Duration::from_millis(等待毫秒))
+    {
+        Ok(事件) => 转为C字符串指针(事件),
+        Err(crossbeam::channel::RecvTimeoutError::Timeout) => 转为C字符串指针(
+            json!({"version": 2, "type": "poll.timeout", "payload": {"timeout_ms": 等待毫秒}})
+                .to_string(),
+        ),
+        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+            转为C字符串指针(String::new())
+        }
+    }
+}
+
+/// 请求取消并立即排入唯一 cancelled 终止事件，唤醒阻塞的事件读取者。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_v2_cancel(stream_handle: i64, reason: *const c_char) -> i64 {
+    let 流 = {
+        let 池 = 获取可靠流池().lock().unwrap();
+        池.get(&stream_handle).cloned()
+    };
+    let Some(流) = 流 else { return -1 };
+    let 原因 = if reason.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(reason) }
+            .to_string_lossy()
+            .to_string()
+    };
+    流.已取消.store(true, Ordering::Release);
+    流.发送终止异步("cancelled", json!({"reason": 原因}), "cancelled");
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_v2_snapshot(stream_handle: i64) -> *mut c_char {
+    let 流 = {
+        let 池 = 获取可靠流池().lock().unwrap();
+        池.get(&stream_handle).cloned()
+    };
+    match 流 {
+        Some(v) => 转为C字符串指针(v.快照().to_string()),
+        None => 转为C字符串指针(json!({"version": 2, "state": "invalid"}).to_string()),
+    }
+}
+
+/// 完整成功后以 expected_revision 做历史 CAS。成功返回新版本，冲突返回 -2。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_v2_commit(stream_handle: i64, expected_revision: i64) -> i64 {
+    let 流 = {
+        let 池 = 获取可靠流池().lock().unwrap();
+        池.get(&stream_handle).cloned()
+    };
+    let Some(流) = 流 else { return -1 };
+    let mut 元数据 = 流.元数据.lock().unwrap();
+    if !元数据.终止 || 元数据.状态 != "completed" || 元数据.决议 == 可靠流决议::已放弃
+    {
+        return -3;
+    }
+    if 元数据.决议 == 可靠流决议::已提交 {
+        return -4;
+    }
+    let 助手消息 = 可靠流::从元数据组装助手消息(&元数据);
+    let mut 会话池 = 获取会话池().lock().unwrap();
+    let Some(会话) = 会话池.get_mut(&流.会话句柄) else {
+        return -1;
+    };
+    if 会话.历史版本 != expected_revision || expected_revision != 流.打开时历史版本 {
+        return -2;
+    }
+    会话.历史.extend(流.待提交消息.clone());
+    会话.历史.push(助手消息);
+    if let Some(用量) = 元数据.用量 {
+        会话.最近用量 = 用量;
+        会话.预算记账();
+    }
+    会话.历史版本 += 1;
+    let 新版本 = 会话.历史版本;
+    元数据.决议 = 可靠流决议::已提交;
+    新版本
+}
+
+/// 放弃流结果，不修改历史。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_v2_abort(stream_handle: i64) -> i64 {
+    let 流 = {
+        let 池 = 获取可靠流池().lock().unwrap();
+        池.get(&stream_handle).cloned()
+    };
+    let Some(流) = 流 else { return -1 };
+    let mut 元数据 = 流.元数据.lock().unwrap();
+    if 元数据.决议 == 可靠流决议::已提交 {
+        return -2;
+    }
+    元数据.决议 = 可靠流决议::已放弃;
+    1
+}
+
+/// 仅释放句柄；不提交历史。仍在运行的流会先取消。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_v2_close(stream_handle: i64) -> i64 {
+    let 流 = 获取可靠流池().lock().unwrap().remove(&stream_handle);
+    let Some(流) = 流 else { return -1 };
+    let 终止 = 流.元数据.lock().unwrap().终止;
+    if !终止 {
+        流.已取消.store(true, Ordering::Release);
+    }
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn qi_llm_history_revision(session_handle: i64) -> i64 {
+    获取会话池()
+        .lock()
+        .unwrap()
+        .get(&session_handle)
+        .map(|v| v.历史版本)
+        .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn qi_llm_runtime_capability(capability: *const c_char) -> i64 {
+    if capability.is_null() {
+        return 0;
+    }
+    let 名称 = unsafe { CStr::from_ptr(capability) }.to_string_lossy();
+    match 名称.as_ref() {
+        "stream_v2"
+        | "stream_v2_openai_sse"
+        | "stream_v2_cancel"
+        | "stream_v2_timed_poll"
+        | "history_revision_cas" => 1,
+        _ => 0,
+    }
 }
 
 /// 打开流式 LLM 对话。走磁带闸（见 打开流带磁带）：回放/缓存命中不打 HTTP。
@@ -1714,6 +2310,7 @@ pub extern "C" fn qi_llm_chat_with_tools(
                         "content": 提示
                     }));
                     会话.历史.push(消息.clone());
+                    会话.历史版本 += 1;
                     return 转为C字符串指针(消息.to_string());
                 }
                 Err(错误) => return 转为C字符串指针(format!("工具对话失败: {}", 错误)),
@@ -1732,6 +2329,7 @@ pub extern "C" fn qi_llm_continue_with_tools(session_handle: i64) -> *mut c_char
         match 会话.继续工具API() {
             Ok(消息) => {
                 会话.历史.push(消息.clone());
+                会话.历史版本 += 1;
                 return 转为C字符串指针(消息.to_string());
             }
             Err(错误) => return 转为C字符串指针(format!("继续工具对话失败: {}", 错误)),
@@ -1962,6 +2560,7 @@ pub extern "C" fn qi_llm_add_tool_result(
             }
 
             会话.历史.push(工具消息);
+            会话.历史版本 += 1;
             return 1;
         }
     }
@@ -2017,6 +2616,7 @@ pub extern "C" fn qi_llm_clear_history(session_handle: i64) -> i64 {
 
     if let Some(会话) = 会话池.get_mut(&session_handle) {
         会话.历史.clear();
+        会话.历史版本 += 1;
         return 1;
     }
 
@@ -2083,6 +2683,7 @@ pub extern "C" fn qi_llm_set_history_json(session_handle: i64, history_json: *co
     if let Some(会话) = 会话池.get_mut(&session_handle) {
         let 条数 = 新历史.len() as i64;
         会话.历史 = 新历史;
+        会话.历史版本 += 1;
         条数
     } else {
         -1
@@ -2211,6 +2812,7 @@ pub extern "C" fn qi_llm_chat_async(session_handle: i64, prompt: *const c_char) 
                                 "role": "assistant",
                                 "content": 响应.clone()
                             }));
+                            会话.历史版本 += 1;
                         }
                     }
 
@@ -2304,6 +2906,10 @@ mod 磁带 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
 
     fn 建会话(提供商: &str) -> LLM会话 {
         let mut 会话 = LLM会话::创建(
@@ -2324,6 +2930,403 @@ mod tests {
                 "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
             }
         }));
+    }
+
+    fn 启动SSE服务(
+        响应体: &'static str, 请求数: usize, 响应前等待: Duration
+    ) -> String {
+        let 监听 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let 地址 = 监听.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..请求数 {
+                let (mut 连接, _) = 监听.accept().unwrap();
+                let mut 缓冲 = [0u8; 8192];
+                let _ = 连接.read(&mut 缓冲);
+                if !响应前等待.is_zero() {
+                    thread::sleep(响应前等待);
+                }
+                let 响应 = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    响应体.len(),
+                    响应体
+                );
+                let _ = 连接.write_all(响应.as_bytes());
+                let _ = 连接.flush();
+            }
+        });
+        format!("http://{}", 地址)
+    }
+
+    fn 启动悬挂SSE服务() -> String {
+        let 监听 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let 地址 = 监听.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut 连接, _) = 监听.accept().unwrap();
+            let mut 缓冲 = [0u8; 8192];
+            let _ = 连接.read(&mut 缓冲);
+            let _ = 连接.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            let _ = 连接.flush();
+            thread::sleep(Duration::from_secs(3));
+        });
+        format!("http://{}", 地址)
+    }
+
+    fn 创建测试会话(端点: &str) -> i64 {
+        let endpoint = CString::new(端点).unwrap();
+        let model = CString::new("test-model").unwrap();
+        qi_llm_create_session(endpoint.as_ptr(), model.as_ptr(), std::ptr::null())
+    }
+
+    fn 打开V2流(会话: i64, 请求: Value) -> i64 {
+        let 请求 = CString::new(请求.to_string()).unwrap();
+        qi_llm_stream_v2_open(会话, 请求.as_ptr())
+    }
+
+    fn 取C字符串(指针: *mut c_char) -> String {
+        assert!(!指针.is_null());
+        let 文本 = unsafe { CStr::from_ptr(指针) }
+            .to_string_lossy()
+            .to_string();
+        qi_llm_free_string(指针);
+        文本
+    }
+
+    fn 读到终止(流: i64) -> Vec<Value> {
+        let mut 事件 = Vec::new();
+        loop {
+            let 文本 = 取C字符串(qi_llm_stream_v2_next_event(流));
+            if 文本.is_empty() {
+                break;
+            }
+            let 值: Value = serde_json::from_str(&文本).unwrap();
+            let 终止 = matches!(
+                值["type"].as_str(),
+                Some("response.completed" | "error" | "cancelled")
+            );
+            事件.push(值);
+            if 终止 {
+                break;
+            }
+        }
+        事件
+    }
+
+    fn 成功SSE() -> &'static str {
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        )
+    }
+
+    #[test]
+    fn stream_v2_成功_用量_显式提交() {
+        let 端点 = 启动SSE服务(成功SSE(), 1, Duration::ZERO);
+        let 会话 = 创建测试会话(&端点);
+        let 流 = 打开V2流(会话, json!({"prompt": "hi"}));
+        assert!(流 > 0);
+        let 事件 = 读到终止(流);
+        let 类型: Vec<_> = 事件.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            类型,
+            vec![
+                "response.started",
+                "text.delta",
+                "usage",
+                "response.completed"
+            ]
+        );
+        assert_eq!(
+            qi_llm_get_history_count(会话),
+            0,
+            "close/完成前不得自动提交"
+        );
+        assert_eq!(qi_llm_history_revision(会话), 0);
+        assert_eq!(qi_llm_stream_v2_commit(流, 0), 1);
+        assert_eq!(qi_llm_get_history_count(会话), 2);
+        assert_eq!(qi_llm_budget_used(会话), 5);
+        assert_eq!(qi_llm_stream_v2_close(流), 1);
+        qi_llm_close_session(会话);
+    }
+
+    #[test]
+    fn stream_v2_句柄不可枚举且关闭后不会复用() {
+        let 监听 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let 端点 = format!("http://{}", 监听.local_addr().unwrap());
+        drop(监听);
+        let 会话 = 创建测试会话(&端点);
+        let mut 句柄列表 = Vec::new();
+
+        for i in 0..8 {
+            let 句柄 = 打开V2流(会话, json!({"prompt": format!("request-{i}")}));
+            assert!(句柄 > 0);
+            assert!(!句柄列表.contains(&句柄), "关闭后的句柄不得复用");
+            句柄列表.push(句柄);
+            assert_eq!(qi_llm_stream_v2_close(句柄), 1);
+            assert_eq!(qi_llm_stream_v2_close(句柄), -1, "旧句柄必须保持失效");
+            let 快照: Value =
+                serde_json::from_str(&取C字符串(qi_llm_stream_v2_snapshot(句柄))).unwrap();
+            assert_eq!(快照["state"], json!("invalid"));
+        }
+
+        assert!(
+            句柄列表.windows(2).any(|pair| pair[1] != pair[0] + 1),
+            "stream-v2 句柄不得是可枚举的递增序列"
+        );
+        qi_llm_close_session(会话);
+    }
+
+    #[test]
+    fn stream_v2_max_tokens传播且非法值不发请求() {
+        let 监听 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let 地址 = 监听.local_addr().unwrap();
+        监听.set_nonblocking(true).unwrap();
+        let 会话 = 创建测试会话(&format!("http://{}", 地址));
+
+        assert_eq!(
+            打开V2流(会话, json!({"prompt": "zero", "max_tokens": 0})),
+            -1
+        );
+        assert_eq!(
+            打开V2流(会话, json!({"prompt": "negative", "max_tokens": -1})),
+            -1
+        );
+        assert_eq!(
+            打开V2流(
+                会话,
+                json!({"prompt": "too-large", "max_tokens": i32::MAX as i64 + 1})
+            ),
+            -1
+        );
+        thread::sleep(Duration::from_millis(30));
+        assert!(监听.accept().is_err(), "非法 max_tokens 不得触发网络连接");
+
+        监听.set_nonblocking(false).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut 连接, _) = 监听.accept().unwrap();
+            let mut 缓冲 = [0u8; 8192];
+            let 数量 = 连接.read(&mut 缓冲).unwrap();
+            let 请求 = String::from_utf8_lossy(&缓冲[..数量]);
+            let 请求体 = 请求.split("\r\n\r\n").nth(1).unwrap_or("");
+            tx.send(serde_json::from_str::<Value>(请求体).unwrap())
+                .unwrap();
+            let 响应体 = 成功SSE();
+            let 响应 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                响应体.len(), 响应体
+            );
+            连接.write_all(响应.as_bytes()).unwrap();
+        });
+        let 流 = 打开V2流(会话, json!({"prompt": "bounded", "max_tokens": 7}));
+        assert!(流 > 0);
+        let 请求体 = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(请求体["max_tokens"], json!(7));
+        读到终止(流);
+        qi_llm_stream_v2_close(流);
+        qi_llm_close_session(会话);
+    }
+
+    #[test]
+    fn stream_v2_工具增量被规范化并提交() {
+        let 体 = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Paris\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let 端点 = 启动SSE服务(体, 1, Duration::ZERO);
+        let 会话 = 创建测试会话(&端点);
+        let 流 = 打开V2流(会话, json!({"prompt": "weather", "tools": true}));
+        let 事件 = 读到终止(流);
+        let 工具事件: Vec<_> = 事件
+            .iter()
+            .filter(|v| v["type"] == json!("tool_call.delta"))
+            .collect();
+        assert_eq!(工具事件.len(), 2);
+        assert_eq!(工具事件[0]["payload"]["id"], json!("call_1"));
+        assert_eq!(qi_llm_stream_v2_commit(流, 0), 1);
+        let 历史: Value = serde_json::from_str(&取C字符串(qi_llm_get_history_json(会话))).unwrap();
+        assert_eq!(
+            历史[1]["tool_calls"][0]["function"]["name"],
+            json!("weather")
+        );
+        assert_eq!(
+            历史[1]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"city\":\"Paris\"}")
+        );
+        qi_llm_stream_v2_close(流);
+        qi_llm_close_session(会话);
+    }
+
+    #[test]
+    fn stream_v2_EOF前无DONE是错误() {
+        let 体 = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let 端点 = 启动SSE服务(体, 1, Duration::ZERO);
+        let 会话 = 创建测试会话(&端点);
+        let 流 = 打开V2流(会话, json!({"prompt": "hi"}));
+        let 事件 = 读到终止(流);
+        let 最后 = 事件.last().unwrap();
+        assert_eq!(最后["type"], json!("error"));
+        assert_eq!(最后["payload"]["code"], json!("unexpected_eof"));
+        assert_eq!(qi_llm_stream_v2_commit(流, 0), -3);
+        assert_eq!(qi_llm_get_history_count(会话), 0);
+        qi_llm_stream_v2_close(流);
+        qi_llm_close_session(会话);
+    }
+
+    #[test]
+    fn stream_v2_取消会唤醒阻塞读取() {
+        let 端点 = 启动悬挂SSE服务();
+        let 会话 = 创建测试会话(&端点);
+        let 流 = 打开V2流(会话, json!({"prompt": "wait"}));
+        let 首事件: Value =
+            serde_json::from_str(&取C字符串(qi_llm_stream_v2_next_event(流))).unwrap();
+        assert_eq!(首事件["type"], json!("response.started"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let 文本 = 取C字符串(qi_llm_stream_v2_next_event(流));
+            tx.send(文本).unwrap();
+        });
+        thread::sleep(Duration::from_millis(50));
+        let 原因 = CString::new("test cancel").unwrap();
+        assert_eq!(qi_llm_stream_v2_cancel(流, 原因.as_ptr()), 1);
+        let 事件: Value =
+            serde_json::from_str(&rx.recv_timeout(Duration::from_millis(500)).unwrap()).unwrap();
+        assert_eq!(事件["type"], json!("cancelled"));
+        assert_eq!(事件["payload"]["reason"], json!("test cancel"));
+        qi_llm_stream_v2_close(流);
+        qi_llm_close_session(会话);
+    }
+
+    #[test]
+    fn stream_v2_定时读取在首事件前唤醒且流可继续取消() {
+        let 端点 = 启动SSE服务(成功SSE(), 1, Duration::from_millis(250));
+        let 会话 = 创建测试会话(&端点);
+        let 流 = 打开V2流(会话, json!({"prompt": "wait"}));
+        let 开始 = Instant::now();
+        let 超时: Value =
+            serde_json::from_str(&取C字符串(qi_llm_stream_v2_next_event_timeout(流, 40))).unwrap();
+        assert_eq!(超时["type"], json!("poll.timeout"));
+        assert!(开始.elapsed() < Duration::from_millis(200));
+
+        let 原因 = CString::new("deadline").unwrap();
+        assert_eq!(qi_llm_stream_v2_cancel(流, 原因.as_ptr()), 1);
+        let 终止: Value =
+            serde_json::from_str(&取C字符串(qi_llm_stream_v2_next_event_timeout(流, 500))).unwrap();
+        assert_eq!(终止["type"], json!("cancelled"));
+        assert_eq!(终止["payload"]["reason"], json!("deadline"));
+        assert_eq!(qi_llm_stream_v2_commit(流, 0), -3);
+        qi_llm_stream_v2_close(流);
+        qi_llm_close_session(会话);
+    }
+
+    #[test]
+    fn stream_v2_请求超时产生error终止() {
+        let 端点 = 启动SSE服务(成功SSE(), 1, Duration::from_secs(2));
+        let 会话 = 创建测试会话(&端点);
+        let 键 = CString::new("timeout_secs").unwrap();
+        let 值 = CString::new("1").unwrap();
+        assert_eq!(qi_llm_set_config(会话, 键.as_ptr(), 值.as_ptr()), 1);
+        let 开始 = Instant::now();
+        let 流 = 打开V2流(会话, json!({"prompt": "timeout"}));
+        let 事件 = 读到终止(流);
+        assert_eq!(事件.last().unwrap()["type"], json!("error"));
+        assert!(开始.elapsed() < Duration::from_secs(2));
+        qi_llm_stream_v2_close(流);
+        qi_llm_close_session(会话);
+    }
+
+    #[test]
+    fn stream_v2_abort与历史版本冲突() {
+        let 端点 = 启动SSE服务(成功SSE(), 2, Duration::ZERO);
+        let 会话 = 创建测试会话(&端点);
+
+        let 放弃流 = 打开V2流(会话, json!({"prompt": "abort"}));
+        读到终止(放弃流);
+        assert_eq!(qi_llm_stream_v2_abort(放弃流), 1);
+        assert_eq!(qi_llm_stream_v2_commit(放弃流, 0), -3);
+        assert_eq!(qi_llm_get_history_count(会话), 0);
+
+        let 冲突流 = 打开V2流(会话, json!({"prompt": "conflict"}));
+        读到终止(冲突流);
+        assert_eq!(qi_llm_clear_history(会话), 1);
+        assert_eq!(qi_llm_history_revision(会话), 1);
+        assert_eq!(qi_llm_stream_v2_commit(冲突流, 0), -2);
+        assert_eq!(qi_llm_get_history_count(会话), 0);
+
+        qi_llm_stream_v2_close(放弃流);
+        qi_llm_stream_v2_close(冲突流);
+        qi_llm_close_session(会话);
+    }
+
+    #[test]
+    fn stream_v2_commit与abort并发时只有一个决议生效() {
+        for _ in 0..64 {
+            let 会话 = 创建测试会话("http://127.0.0.1:43510");
+            let 流 = 可靠流::新建(会话, 0, vec![json!({"role": "user", "content": "race"})]);
+            {
+                let mut 元数据 = 流.元数据.lock().unwrap();
+                元数据.状态 = "completed".to_string();
+                元数据.终止 = true;
+                元数据.文本 = "winner".to_string();
+            }
+            let 句柄 = 分配可靠流句柄();
+            获取可靠流池().lock().unwrap().insert(句柄, 流);
+
+            let 屏障 = Arc::new(std::sync::Barrier::new(3));
+            let 提交屏障 = 屏障.clone();
+            let 提交线程 = thread::spawn(move || {
+                提交屏障.wait();
+                qi_llm_stream_v2_commit(句柄, 0)
+            });
+            let 放弃屏障 = 屏障.clone();
+            let 放弃线程 = thread::spawn(move || {
+                放弃屏障.wait();
+                qi_llm_stream_v2_abort(句柄)
+            });
+            屏障.wait();
+
+            let 提交结果 = 提交线程.join().unwrap();
+            let 放弃结果 = 放弃线程.join().unwrap();
+            let 快照: Value =
+                serde_json::from_str(&取C字符串(qi_llm_stream_v2_snapshot(句柄))).unwrap();
+            match (提交结果, 放弃结果) {
+                (1, -2) => {
+                    assert_eq!(qi_llm_get_history_count(会话), 2);
+                    assert_eq!(qi_llm_history_revision(会话), 1);
+                    assert_eq!(快照["committed"], json!(true));
+                    assert_eq!(快照["aborted"], json!(false));
+                }
+                (-3, 1) => {
+                    assert_eq!(qi_llm_get_history_count(会话), 0);
+                    assert_eq!(qi_llm_history_revision(会话), 0);
+                    assert_eq!(快照["committed"], json!(false));
+                    assert_eq!(快照["aborted"], json!(true));
+                }
+                结果 => panic!("commit/abort 必须恰有一个成功，实际为 {结果:?}"),
+            }
+
+            assert_eq!(qi_llm_stream_v2_close(句柄), 1);
+            qi_llm_close_session(会话);
+        }
+    }
+
+    #[test]
+    fn stream_v2_能力报告且拒绝未实现provider() {
+        let 能力 = CString::new("stream_v2").unwrap();
+        let 未知 = CString::new("stream_v3").unwrap();
+        assert_eq!(qi_llm_runtime_capability(能力.as_ptr()), 1);
+        assert_eq!(qi_llm_runtime_capability(未知.as_ptr()), 0);
+
+        let 会话 = 创建测试会话("http://127.0.0.1:43510");
+        let 键 = CString::new("provider").unwrap();
+        let 值 = CString::new("anthropic").unwrap();
+        assert_eq!(qi_llm_set_config(会话, 键.as_ptr(), 值.as_ptr()), 1);
+        assert_eq!(打开V2流(会话, json!({"prompt": "unsupported"})), -2);
+        qi_llm_close_session(会话);
     }
 
     // ── OpenAI（现状路径，回归保护） ──

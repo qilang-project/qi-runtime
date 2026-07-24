@@ -78,7 +78,11 @@ pub(crate) fn 取出TCP流(handle: i64) -> Option<std::net::TcpStream> {
     // 兜底：极端并发下别的线程还持着克隆（瞬态 IO 中），退回 dup fd
     // （try_clone_stream），残余 Arc 随其使用结束自然释放。
     match std::sync::Arc::try_unwrap(arc) {
-        Ok(mu) => Some(mu.into_inner().unwrap_or_else(|e| e.into_inner()).into_stream()),
+        Ok(mu) => Some(
+            mu.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .into_stream(),
+        ),
         Err(arc) => {
             let conn = arc.lock().unwrap_or_else(|e| e.into_inner());
             conn.try_clone_stream().ok()
@@ -754,6 +758,20 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
+    fn bind_udp_ephemeral(host: &CString) -> (i64, u16) {
+        let handle = qi_network_udp_bind(host.as_ptr(), 0);
+        assert!(handle > 0, "failed to bind OS-assigned UDP port");
+
+        let port = 取UDP(handle)
+            .and_then(|socket| socket.local_addr().ok())
+            .map(|address| address.port())
+            .unwrap_or_else(|| {
+                qi_network_udp_close(handle);
+                panic!("failed to read OS-assigned UDP port");
+            });
+        (handle, port)
+    }
+
     #[test]
     fn test_network_init() {
         qi_network_init();
@@ -798,12 +816,8 @@ mod tests {
     #[test]
     fn test_udp_blocked_recv_does_not_freeze_pool() {
         let 主机 = CString::new("127.0.0.1").unwrap();
-        // 随机高位端口（>3000），避开常用端口
-        let 端口a: u16 = 46731;
-        let 端口b: u16 = 46732;
-        let a = qi_network_udp_bind(主机.as_ptr(), 端口a);
-        let b = qi_network_udp_bind(主机.as_ptr(), 端口b);
-        assert!(a > 0 && b > 0, "bind 失败（端口被占？换端口重跑）");
+        let (a, 端口a) = bind_udp_ephemeral(&主机);
+        let (b, 端口b) = bind_udp_ephemeral(&主机);
 
         // 线程 1：A 无超时阻塞等包（旧实现会在此攥住全局池锁）
         let 收线程 = std::thread::spawn(move || {
@@ -842,7 +856,10 @@ mod tests {
 
         // 给 A 发一个包解除阻塞，回收线程与句柄
         let 解 = CString::new("bye").unwrap();
-        assert_eq!(qi_network_udp_send_string(b, 解.as_ptr(), 主机.as_ptr(), 端口a), 3);
+        assert_eq!(
+            qi_network_udp_send_string(b, 解.as_ptr(), 主机.as_ptr(), 端口a),
+            3
+        );
         assert_eq!(收线程.join().unwrap(), 3);
         assert_eq!(qi_network_udp_close(a), 1);
         assert_eq!(qi_network_udp_close(b), 1);

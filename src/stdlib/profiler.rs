@@ -243,12 +243,38 @@ pub fn prof_stat(name: *const c_char) -> Option<(u64, u128)> {
 }
 
 #[cfg(test)]
+struct TestSessionGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestSessionGuard {
+    fn drop(&mut self) {
+        table().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        DEPTH.with(|d| d.borrow_mut().clear());
+    }
+}
+
+#[cfg(test)]
+fn test_session() -> TestSessionGuard {
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    table().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    DEPTH.with(|d| d.borrow_mut().clear());
+    TestSessionGuard { _lock: lock }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::CString;
 
     #[test]
     fn 基础_累计与调用次数() {
+        let _session = test_session();
         let n = CString::new("测试函数A").unwrap();
         let p = n.as_ptr();
         for _ in 0..5 {
@@ -264,6 +290,7 @@ mod tests {
 
     #[test]
     fn 递归_只在最外层累计() {
+        let _session = test_session();
         let n = CString::new("测试递归B").unwrap();
         let p = n.as_ptr();
         // 手工模拟深度 3 的递归：enter enter enter exit exit exit
@@ -282,5 +309,41 @@ mod tests {
         // 宽松上界：远小于「每层都计」的和。
         assert!(total >= 40_000, "至少最外层墙钟");
         assert!(total < 200_000_000, "只计最外层一次（不因递归重复膨胀）");
+    }
+
+    #[test]
+    fn 并发名称与测试会话互不污染() {
+        let a = CString::new("并发函数A").unwrap();
+        let b = CString::new("并发函数B").unwrap();
+        let a_key = a.as_ptr() as usize;
+        let b_key = b.as_ptr() as usize;
+
+        {
+            let _session = test_session();
+            let ta = std::thread::spawn(move || {
+                for _ in 0..37 {
+                    let p = a_key as *const c_char;
+                    let t = qi_prof_enter(p);
+                    qi_prof_exit(p, t);
+                }
+            });
+            let tb = std::thread::spawn(move || {
+                for _ in 0..53 {
+                    let p = b_key as *const c_char;
+                    let t = qi_prof_enter(p);
+                    qi_prof_exit(p, t);
+                }
+            });
+            ta.join().unwrap();
+            tb.join().unwrap();
+            assert_eq!(prof_stat(a.as_ptr()).unwrap().0, 37);
+            assert_eq!(prof_stat(b.as_ptr()).unwrap().0, 53);
+        }
+
+        let _session = test_session();
+        let t = qi_prof_enter(a.as_ptr());
+        qi_prof_exit(a.as_ptr(), t);
+        assert_eq!(prof_stat(a.as_ptr()).unwrap().0, 1);
+        assert!(prof_stat(b.as_ptr()).is_none());
     }
 }

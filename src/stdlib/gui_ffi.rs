@@ -66,7 +66,12 @@ extern "C" {
         headers_csv: *const c_char,
         rows_data: *const c_char,
     );
-    fn qi_gui_egui_bar_chart_impl(id: *const c_char, values_csv: *const c_char, width: i64, height: i64);
+    fn qi_gui_egui_bar_chart_impl(
+        id: *const c_char,
+        values_csv: *const c_char,
+        width: i64,
+        height: i64,
+    );
     fn qi_gui_egui_image_impl(path: *const c_char, width: i64, height: i64);
     fn qi_gui_egui_set_theme_impl(dark: i32);
     fn qi_gui_egui_set_zoom_impl(percent: i64);

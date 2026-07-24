@@ -97,7 +97,11 @@ impl WebSocketConnection {
     }
 
     /// 发送 WebSocket 帧（&self：可并发；send_lock 串行化写、防帧交错）
-    pub fn send_frame(&self, opcode: WebSocketOpcode, payload: &[u8]) -> Result<(), std::io::Error> {
+    pub fn send_frame(
+        &self,
+        opcode: WebSocketOpcode,
+        payload: &[u8],
+    ) -> Result<(), std::io::Error> {
         let mut frame = Vec::new();
 
         // 第一字节: FIN + opcode
