@@ -807,29 +807,18 @@ pub extern "C" fn qi_websocket_recv_text(handle: i64) -> *mut c_char {
     let Some(conn) = 取WS(handle) else {
         return crate::stdlib::qi_str::rc_cstr_from_str("");
     };
+    // 分片累积缓冲：浏览器发大消息时会切成 FIN=0 的首帧 + 若干 Continuation
+    let mut 拼接: Vec<u8> = Vec::new();
+    let mut 拼接中 = false;
     loop {
         match conn.recv_frame() {
             Ok(frame) => {
-                // 自动回复 ping
-                if frame.opcode == WebSocketOpcode::Ping {
-                    let _ = conn.send_pong(&frame.payload);
-                    continue; // 继续接收下一帧
-                }
-
-                if frame.opcode == WebSocketOpcode::Text {
-                    if let Ok(text) = String::from_utf8(frame.payload) {
-                        return crate::stdlib::qi_str::rc_cstr_from_string(text);
+                match 处理一帧(&conn, handle, frame, &mut 拼接, &mut 拼接中) {
+                    帧结果::完整(text) => {
+                        return crate::stdlib::qi_str::rc_cstr_from_string(text)
                     }
-                }
-
-                // 收到关闭帧：回一个 Close 再切断，并把池条目摘掉。
-                // 只标记断开的话条目会一直留在池里攥着 fd（lsof 里就是那些
-                // 永远不消失的 CLOSED），连接开够了服务端就再也升级不动。
-                if frame.opcode == WebSocketOpcode::Close {
-                    let _ = conn.send_close(1000, "");
-                    conn.切断();
-                    摘除WS(handle);
-                    return crate::stdlib::qi_str::rc_cstr_from_str("");
+                    帧结果::继续 => continue,
+                    帧结果::结束 => return crate::stdlib::qi_str::rc_cstr_from_str(""),
                 }
             }
             Err(_) => {
@@ -842,6 +831,79 @@ pub extern "C" fn qi_websocket_recv_text(handle: i64) -> *mut c_char {
     }
 
     crate::stdlib::qi_str::rc_cstr_from_str("")
+}
+
+enum 帧结果 {
+    完整(String),
+    继续,
+    结束,
+}
+
+/// 一帧的处置，含**分片重组**。
+///
+/// 这是被上传功能挖出来的真 bug：浏览器发大消息（Chrome 大约 128KB 以上）会切成
+/// 「FIN=0 的 Text 首帧 + 若干 Continuation 帧」。以前这里只认 `opcode == Text`
+/// 就直接返回 payload，于是大消息只拿到第一片 —— JSON 解析必然失败，而失败是
+/// **静默**的（调用方拿到一段残缺文本，解码返回 0，当成坏帧丢掉）。
+/// 表现是「小文件传得上去，大文件永远卡在 0%」，服务端日志一个字都没有。
+fn 处理一帧(
+    conn: &WebSocketConnection,
+    handle: i64,
+    frame: WebSocketFrame,
+    拼接: &mut Vec<u8>,
+    拼接中: &mut bool,
+) -> 帧结果 {
+    // 控制帧可以插在分片中间，不能打断累积
+    if frame.opcode == WebSocketOpcode::Ping {
+        let _ = conn.send_pong(&frame.payload);
+        return 帧结果::继续;
+    }
+    if frame.opcode == WebSocketOpcode::Pong {
+        return 帧结果::继续;
+    }
+    if frame.opcode == WebSocketOpcode::Close {
+        // 收到关闭帧：回一个 Close 再切断，并把池条目摘掉。
+        // 只标记断开的话条目会一直留在池里攥着 fd（lsof 里就是那些
+        // 永远不消失的 CLOSED），连接开够了服务端就再也升级不动。
+        let _ = conn.send_close(1000, "");
+        conn.切断();
+        摘除WS(handle);
+        return 帧结果::结束;
+    }
+
+    match frame.opcode {
+        WebSocketOpcode::Text => {
+            if frame.fin {
+                // 常态：一帧就是一条完整消息
+                return match String::from_utf8(frame.payload) {
+                    Ok(text) => 帧结果::完整(text),
+                    Err(_) => 帧结果::继续,
+                };
+            }
+            // 分片首帧
+            拼接.clear();
+            拼接.extend_from_slice(&frame.payload);
+            *拼接中 = true;
+            帧结果::继续
+        }
+        WebSocketOpcode::Continuation => {
+            if !*拼接中 {
+                return 帧结果::继续; // 没有首帧的续帧：协议错，忽略
+            }
+            拼接.extend_from_slice(&frame.payload);
+            if !frame.fin {
+                return 帧结果::继续;
+            }
+            *拼接中 = false;
+            let 全部 = std::mem::take(拼接);
+            match String::from_utf8(全部) {
+                Ok(text) => 帧结果::完整(text),
+                Err(_) => 帧结果::继续,
+            }
+        }
+        // Binary 走 qi_websocket_recv，这里不管
+        _ => 帧结果::继续,
+    }
 }
 
 /// 带超时的接收文本：最多等 timeout_ms 毫秒。
@@ -863,6 +925,12 @@ pub extern "C" fn qi_websocket_recv_text_timeout(handle: i64, timeout_ms: i64) -
     } else {
         timeout_ms as u64
     };
+    // 与阻塞版共用同一套分片重组（见 处理一帧）。
+    //
+    // 超时的语义是「这一轮没等到**完整消息**」：分片收到一半时超时，
+    // 已收的片会丢掉 —— 调用方下一轮重新等就是了，不会把半条消息当完整的用。
+    let mut 拼接: Vec<u8> = Vec::new();
+    let mut 拼接中 = false;
     loop {
         match conn.等待可读(毫秒) {
             Ok(true) => {}
@@ -875,25 +943,11 @@ pub extern "C" fn qi_websocket_recv_text_timeout(handle: i64, timeout_ms: i64) -
             }
         }
         match conn.recv_frame() {
-            Ok(frame) => {
-                if frame.opcode == WebSocketOpcode::Ping {
-                    let _ = conn.send_pong(&frame.payload);
-                    continue;
-                }
-                if frame.opcode == WebSocketOpcode::Text {
-                    if let Ok(text) = String::from_utf8(frame.payload) {
-                        return crate::stdlib::qi_str::rc_cstr_from_string(text);
-                    }
-                    continue;
-                }
-                if frame.opcode == WebSocketOpcode::Close {
-                    let _ = conn.send_close(1000, "");
-                    conn.切断();
-                    摘除WS(handle);
-                    return crate::stdlib::qi_str::rc_cstr_from_str("");
-                }
-                // Pong / Binary / Continuation：不是业务文本，接着等
-            }
+            Ok(frame) => match 处理一帧(&conn, handle, frame, &mut 拼接, &mut 拼接中) {
+                帧结果::完整(text) => return crate::stdlib::qi_str::rc_cstr_from_string(text),
+                帧结果::继续 => continue,
+                帧结果::结束 => return crate::stdlib::qi_str::rc_cstr_from_str(""),
+            },
             Err(_) => {
                 conn.切断();
                 摘除WS(handle);
@@ -1020,6 +1074,124 @@ pub extern "C" fn qi_websocket_unregister(handle: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 真跑一遍握手后的连接：用一对 TcpStream 当两端，服务端侧发帧，
+    /// 看 处理一帧 的重组逻辑对不对。
+    fn 造一对() -> (WebSocketConnection, std::net::TcpStream) {
+        let 监听 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let 地址 = 监听.local_addr().expect("addr");
+        let 客户 = std::net::TcpStream::connect(地址).expect("connect");
+        let (服务, _) = 监听.accept().expect("accept");
+        (
+            WebSocketConnection::from_upgraded_stream(服务, true),
+            客户,
+        )
+    }
+
+    /// 客户端方向的帧（带 mask，和浏览器一样）
+    fn 客户端帧(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.push(if fin { 0x80 | opcode } else { opcode });
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        if payload.len() < 126 {
+            f.push(0x80 | payload.len() as u8);
+        } else if payload.len() < 65536 {
+            f.push(0x80 | 126);
+            f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            f.push(0x80 | 127);
+            f.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        f.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            f.push(b ^ mask[i % 4]);
+        }
+        f
+    }
+
+    /// 分片重组 —— 上传功能挖出来的真 bug 的回归。
+    ///
+    /// 浏览器发大消息（Chrome 约 128KB 以上）会切成「FIN=0 的 Text 首帧 +
+    /// 若干 Continuation」。以前只认 opcode==Text 就直接返回 payload，
+    /// 于是大消息只拿到第一片 —— JSON 解析必然失败，而且是**静默**的：
+    /// 表现是「小文件传得上去，大文件永远卡在 0%」，日志一个字都没有。
+    #[test]
+    fn 分片消息要重组成一条() {
+        use std::io::Write;
+        let (服务, mut 客户) = 造一对();
+        客户
+            .write_all(&客户端帧(0x1, false, b"{\"a\":1,"))
+            .expect("写首片");
+        客户
+            .write_all(&客户端帧(0x0, false, b"\"b\":2,"))
+            .expect("写中片");
+        客户.write_all(&客户端帧(0x0, true, b"\"c\":3}")).expect("写尾片");
+
+        let mut 拼接 = Vec::new();
+        let mut 拼接中 = false;
+        let mut 出 = None;
+        for _ in 0..3 {
+            let frame = 服务.recv_frame().expect("收帧");
+            if let 帧结果::完整(text) = 处理一帧(&服务, 0, frame, &mut 拼接, &mut 拼接中) {
+                出 = Some(text);
+            }
+        }
+        assert_eq!(出.as_deref(), Some("{\"a\":1,\"b\":2,\"c\":3}"));
+    }
+
+    /// 控制帧可以插在分片中间，不能打断累积（协议允许，浏览器也真会这么干）
+    #[test]
+    fn 分片中间插ping不打断重组() {
+        use std::io::Write;
+        let (服务, mut 客户) = 造一对();
+        客户.write_all(&客户端帧(0x1, false, "前".as_bytes())).expect("首片");
+        客户.write_all(&客户端帧(0x9, true, b"ping")).expect("ping");
+        客户.write_all(&客户端帧(0x0, true, "后".as_bytes())).expect("尾片");
+
+        let mut 拼接 = Vec::new();
+        let mut 拼接中 = false;
+        let mut 出 = None;
+        for _ in 0..3 {
+            let frame = 服务.recv_frame().expect("收帧");
+            if let 帧结果::完整(text) = 处理一帧(&服务, 0, frame, &mut 拼接, &mut 拼接中) {
+                出 = Some(text);
+            }
+        }
+        assert_eq!(出.as_deref(), Some("前后"));
+    }
+
+    /// 不分片的常态一帧照旧
+    #[test]
+    fn 单帧消息原样返回() {
+        use std::io::Write;
+        let (服务, mut 客户) = 造一对();
+        客户.write_all(&客户端帧(0x1, true, b"hello")).expect("写");
+        let frame = 服务.recv_frame().expect("收帧");
+        let mut 拼接 = Vec::new();
+        let mut 拼接中 = false;
+        match 处理一帧(&服务, 0, frame, &mut 拼接, &mut 拼接中) {
+            帧结果::完整(t) => assert_eq!(t, "hello"),
+            _ => panic!("单帧就该直接给出完整消息"),
+        }
+    }
+
+    /// 超过 64KB 的一帧（走 64 位长度字段）也要收全
+    #[test]
+    fn 大单帧走64位长度() {
+        use std::io::Write;
+        let 大 = "x".repeat(200_000);
+        let (服务, mut 客户) = 造一对();
+        std::thread::spawn(move || {
+            let _ = 客户.write_all(&客户端帧(0x1, true, 大.as_bytes()));
+        });
+        let frame = 服务.recv_frame().expect("收帧");
+        let mut 拼接 = Vec::new();
+        let mut 拼接中 = false;
+        match 处理一帧(&服务, 0, frame, &mut 拼接, &mut 拼接中) {
+            帧结果::完整(t) => assert_eq!(t.len(), 200_000),
+            _ => panic!("大单帧要一次给全"),
+        }
+    }
 
     #[test]
     fn test_base64_encode() {

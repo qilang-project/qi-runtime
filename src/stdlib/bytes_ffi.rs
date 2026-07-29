@@ -378,6 +378,42 @@ pub extern "C" fn qi_bytes_write_file(handle: i64, path_ptr: *const c_char) -> i
     }
 }
 
+/// 把切片**追加**到文件尾部（文件不存在就新建）。返回写入字节数，失败 -1。
+///
+/// 补的是上传这类「边收边落盘」的缺口：以前只有 写入文件（整体覆盖），
+/// 想追加就得先把整个文件读进内存再写回去 —— 一个 8MB 的图片会在内存里
+/// 来回搬十几趟。输入输出.追加文件 只吃字符串，二进制过不去（非法 UTF-8）。
+#[no_mangle]
+pub extern "C" fn qi_bytes_append_file(handle: i64, path_ptr: *const c_char) -> i64 {
+    if path_ptr.is_null() {
+        return -1;
+    }
+    let path = unsafe { CStr::from_ptr(path_ptr).to_string_lossy().to_string() };
+    let data: Vec<u8> = if handle < 0 {
+        match persistent_arc(handle) {
+            Some(a) => (*a).clone(),
+            None => return -1,
+        }
+    } else {
+        match clone_bytes(handle) {
+            Some(v) => v,
+            None => return -1,
+        }
+    };
+    use std::io::Write;
+    let 打开 = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path);
+    match 打开 {
+        Ok(mut f) => match f.write_all(&data) {
+            Ok(_) => data.len() as i64,
+            Err(_) => -1,
+        },
+        Err(_) => -1,
+    }
+}
+
 /// 释放由 to_string / to_hex / to_base64 返回的 C 字符串（header-aware rc_cstr）
 #[no_mangle]
 pub extern "C" fn qi_bytes_free_string(s: *mut c_char) {

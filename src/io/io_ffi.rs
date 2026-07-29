@@ -104,6 +104,24 @@ pub extern "C" fn qi_io_delete_file(path: *const c_char) -> i64 {
     }
 }
 
+/// 重命名 / 移动文件。成功返回 1，失败 0。
+///
+/// 上传这类「先落到临时文件、收完再挪到正式位置」的流程要用它。以前只能
+/// 读出来再写过去 —— 大文件白搬一遍内存，而且中途崩了会留下半个正式文件。
+/// 跨设备移动（/tmp 和数据目录不在一个分区）会失败，那种情况调用方自己复制。
+#[no_mangle]
+pub extern "C" fn qi_io_rename(from: *const c_char, to: *const c_char) -> i64 {
+    if from.is_null() || to.is_null() {
+        return 0;
+    }
+    let 源 = unsafe { CStr::from_ptr(from).to_string_lossy().to_string() };
+    let 目标 = unsafe { CStr::from_ptr(to).to_string_lossy().to_string() };
+    match std::fs::rename(&源, &目标) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}
+
 /// 创建文件
 #[no_mangle]
 pub extern "C" fn qi_io_create_file(path: *const c_char) -> i64 {
