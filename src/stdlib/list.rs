@@ -340,6 +340,38 @@ pub extern "C" fn qi_list_string_push(list_id: i64, value: *const c_char) -> i64
     0
 }
 
+/// 字符串列表 → `数组<字符串>`（新数组，元素是新 RC 串）。
+///
+/// 补的是一个很硌人的缺口：`分割`、数据库查询、`列表库` 攒出来的都是**列表句柄**
+/// （一个整数），而 `对于 x 在 y` 和 HTML 模板的 `对于={项 在 表}` 要的是
+/// `数组<字符串>`。以前只能一个个 获取字符串 手抄进定长数组，或者干脆写错 ——
+/// 把列表句柄直接丢给 对于，循环体一次都不进，还不报错。
+#[no_mangle]
+pub extern "C" fn qi_list_string_to_array(list_id: i64) -> *mut std::os::raw::c_void {
+    let 项: Vec<String> = {
+        let lists = LISTS.lock().unwrap();
+        match *lists {
+            Some(ref map) => match map.get(&(list_id as u64)) {
+                Some(ListValue::String(list)) => list.clone(),
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        }
+    };
+    let 槽: Vec<i64> = 项
+        .iter()
+        .map(|s| crate::stdlib::qi_str::rc_cstr_from_str(s) as i64)
+        .collect();
+    // 布局与 JSON 的 字段字符串数组 一致：第 0 个 i64 是长度，后面依次是元素指针
+    let n = 槽.len();
+    let p = super::rc_obj::qi_obj_alloc(((n + 1) * 8) as i64);
+    unsafe {
+        *(p as *mut i64) = n as i64;
+        std::ptr::copy_nonoverlapping(槽.as_ptr(), (p as *mut i64).add(1), n);
+    }
+    p as *mut std::os::raw::c_void
+}
+
 /// 从字符串列表获取元素
 #[no_mangle]
 pub extern "C" fn qi_list_string_get(list_id: i64, index: i64) -> *mut c_char {

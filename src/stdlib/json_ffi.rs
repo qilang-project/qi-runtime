@@ -429,6 +429,42 @@ pub extern "C" fn qi_json_get_array(obj_id: i64, key: *const c_char) -> i64 {
     0
 }
 
+/// 取数组里下标为 index 的**数组**元素，返回新句柄（需 qi_json_free）。
+///
+/// 补一个真实的缺口：对象上有 获取数组，数组元素里却只有 array_get_object，
+/// 而它 `is_object()` 一卡，嵌套数组（[[…],[…]]，比如「每项槽位数组的数组」）
+/// 根本读不出来 —— 只能退回把子数组序列化成字符串再塞进去，两边都难看。
+#[no_mangle]
+pub extern "C" fn qi_json_array_get_array(array_id: i64, index: i64) -> i64 {
+    if array_id <= 0 || index < 0 {
+        return 0;
+    }
+
+    let cloned = {
+        let storage = JSON_VALUES.lock().unwrap();
+        match *storage {
+            Some(ref map) => match map.get(&(array_id as u64)) {
+                Some(Value::Array(array)) => match array.get(index as usize) {
+                    Some(inner) if inner.is_array() => Some(inner.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            None => None,
+        }
+    };
+
+    if let Some(inner) = cloned {
+        let new_id = next_json_id();
+        let mut storage = JSON_VALUES.lock().unwrap();
+        if let Some(ref mut map) = *storage {
+            map.insert(new_id, inner);
+            return new_id as i64;
+        }
+    }
+    0
+}
+
 // ============================================================================
 // JSON数组操作 (JSON Array Operations)
 // ============================================================================
