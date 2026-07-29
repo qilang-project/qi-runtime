@@ -139,6 +139,47 @@ impl WebSocketConnection {
         Ok(())
     }
 
+    /// 等一帧数据最多 毫秒 毫秒：有数据可读返回 Ok(true)，超时 Ok(false)，对端断开 Err。
+    ///
+    /// 手法是「探一个字节再塞回去」：带超时读 1 字节，读到就 push 进 预读 头部，
+    /// 随后正常的 recv_frame 会先吃 预读、再从 socket 接着读，帧边界丝毫不受影响。
+    /// 不能直接给整个 recv_frame 设超时 —— 那样超时可能落在帧头和 payload 之间，
+    /// 半个帧留在缓冲区里，后面每一帧都错位。
+    ///
+    /// 超时只在这一个字节上生效，读到之后立刻清掉，所以 recv_frame 仍是纯阻塞的。
+    fn 等待可读(&self, 毫秒: u64) -> Result<bool, std::io::Error> {
+        {
+            let 剩 = self.预读.lock().unwrap_or_else(|e| e.into_inner());
+            if !剩.is_empty() {
+                return Ok(true);
+            }
+        }
+        self.stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(毫秒.max(1))))?;
+        let mut 一字节 = [0u8; 1];
+        let 结果 = (&self.stream).read(&mut 一字节);
+        let _ = self.stream.set_read_timeout(None);
+        match 结果 {
+            Ok(0) => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "对端已关闭",
+            )),
+            Ok(_) => {
+                let mut 剩 = self.预读.lock().unwrap_or_else(|e| e.into_inner());
+                剩.insert(0, 一字节[0]);
+                Ok(true)
+            }
+            // Unix 上超时是 WouldBlock，Windows 上是 TimedOut
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// 发送 WebSocket 帧（&self：可并发；send_lock 串行化写、防帧交错）
     pub fn send_frame(
         &self,
@@ -801,6 +842,65 @@ pub extern "C" fn qi_websocket_recv_text(handle: i64) -> *mut c_char {
     }
 
     crate::stdlib::qi_str::rc_cstr_from_str("")
+}
+
+/// 带超时的接收文本：最多等 timeout_ms 毫秒。
+///
+/// 返回空串有两种含义，调用方用 `qi_websocket_is_connected` 区分：
+///   仍连接 → 只是这一轮没消息（超时），可以去干别的（查邮箱、跑定时器）再回来等；
+///   已断开 → 对端走了，退出循环。
+///
+/// 这是「服务端主动推」的地基：连接循环不再死等客户端事件，
+/// 而是「等一小会儿客户端 → 处理服务端消息 → 再等一小会儿」，
+/// 于是定时器、异步任务结果、后台完成回调都有机会插进来（对标 Phoenix handle_info）。
+#[no_mangle]
+pub extern "C" fn qi_websocket_recv_text_timeout(handle: i64, timeout_ms: i64) -> *mut c_char {
+    let Some(conn) = 取WS(handle) else {
+        return crate::stdlib::qi_str::rc_cstr_from_str("");
+    };
+    let 毫秒 = if timeout_ms <= 0 {
+        1
+    } else {
+        timeout_ms as u64
+    };
+    loop {
+        match conn.等待可读(毫秒) {
+            Ok(true) => {}
+            // 超时：连接完好，只是没消息
+            Ok(false) => return crate::stdlib::qi_str::rc_cstr_from_str(""),
+            Err(_) => {
+                conn.切断();
+                摘除WS(handle);
+                return crate::stdlib::qi_str::rc_cstr_from_str("");
+            }
+        }
+        match conn.recv_frame() {
+            Ok(frame) => {
+                if frame.opcode == WebSocketOpcode::Ping {
+                    let _ = conn.send_pong(&frame.payload);
+                    continue;
+                }
+                if frame.opcode == WebSocketOpcode::Text {
+                    if let Ok(text) = String::from_utf8(frame.payload) {
+                        return crate::stdlib::qi_str::rc_cstr_from_string(text);
+                    }
+                    continue;
+                }
+                if frame.opcode == WebSocketOpcode::Close {
+                    let _ = conn.send_close(1000, "");
+                    conn.切断();
+                    摘除WS(handle);
+                    return crate::stdlib::qi_str::rc_cstr_from_str("");
+                }
+                // Pong / Binary / Continuation：不是业务文本，接着等
+            }
+            Err(_) => {
+                conn.切断();
+                摘除WS(handle);
+                return crate::stdlib::qi_str::rc_cstr_from_str("");
+            }
+        }
+    }
 }
 
 /// 发送 ping
