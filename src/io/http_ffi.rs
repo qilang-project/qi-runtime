@@ -365,6 +365,20 @@ pub extern "C" fn qi_http_request_set_timeout(handle: i64, timeout_ms: i64) -> i
     }
 }
 
+/// 设置超时，单位**秒**。
+///
+/// `qi_http_request_set_timeout` 收的是毫秒，而它的名字里没有单位 ——
+/// `设置超时(请求, 180)` 看着像三分钟，实际是 0.18 秒，请求当场挂掉，
+/// 报出来的还是笼统的 "error sending request"，完全看不出是超时。
+/// 调 LLM 出图这种动辄几十秒的接口最容易踩。
+#[no_mangle]
+pub extern "C" fn qi_http_request_set_timeout_secs(handle: i64, timeout_s: i64) -> i64 {
+    if timeout_s <= 0 {
+        return 0;
+    }
+    qi_http_request_set_timeout(handle, timeout_s.saturating_mul(1000))
+}
+
 /// 执行 HTTP 请求（真 reqwest —— 带上 set_header 设的自定义头 + body + timeout）。
 /// 返回响应**体**字符串（需要调用 qi_http_free_string 释放）。
 ///
