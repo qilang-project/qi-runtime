@@ -11,13 +11,6 @@ use super::pool::{PoolConfig, WorkerPool};
 use super::scheduler::Scheduler;
 use super::task::{TaskHandle, TaskId, TaskInner, TaskMetadata, TaskPriority};
 
-#[derive(Default)]
-struct ExecutorMetrics {
-    active_tasks: AtomicU64,
-    queued_tasks: AtomicU64,
-    completed_tasks: AtomicU64,
-}
-
 /// Handle to the executor
 pub type ExecutorHandle = Arc<Executor>;
 
@@ -58,7 +51,7 @@ impl Executor {
         F: Future<Output = ()> + Send + 'static,
     {
         let task_id = TaskId::new();
-        let inner = Arc::new(TaskInner::new(task_id, priority));
+        let inner = Arc::new(TaskInner::new());
 
         // Spawn using tokio's runtime
         let join_handle = tokio::spawn(future);

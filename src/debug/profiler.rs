@@ -338,7 +338,7 @@ impl Profiler {
             .as_micros() as u64;
 
         // Collect final memory snapshot
-        let final_memory = self.get_memory_snapshot()?;
+        let _final_memory = self.get_memory_snapshot()?;
 
         // Generate performance summary
         let summary = self.generate_performance_summary(&session, total_duration);
@@ -529,7 +529,7 @@ impl Profiler {
     fn generate_performance_summary(
         &self,
         session: &ProfileSession,
-        total_duration: u64,
+        _total_duration: u64,
     ) -> PerformanceSummary {
         let all_timings: Vec<FunctionTiming> =
             session.function_times.values().flatten().cloned().collect();

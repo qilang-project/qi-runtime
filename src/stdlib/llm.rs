@@ -355,131 +355,17 @@ pub struct 生成结果 {
     pub token数: usize,
 }
 
-/// 检索增强生成 (RAG)
-#[derive(Debug)]
-pub struct 检索增强生成 {
-    /// 知识库
-    知识库: 知识库,
-    /// 提示模板
-    模板: 提示模板,
-    /// 模型配置
-    配置: 模型配置,
-}
-
-impl 检索增强生成 {
-    /// 创建新的 RAG 系统
-    pub fn 创建(知识库: 知识库, 模板: 提示模板, 配置: 模型配置) -> Self {
-        Self {
-            知识库, 模板, 配置
-        }
-    }
-
-    /// 生成回答
-    pub fn 生成(&self, 问题: &str, 检索数量: usize) -> 大模型结果<生成结果> {
-        // 1. 从知识库检索相关文档
-        let 检索结果 = self.知识库.检索(问题, 检索数量)?;
-
-        // 2. 构建上下文
-        let 上下文: Vec<String> = 检索结果.iter().map(|r| r.文档.内容.clone()).collect();
-        let 上下文文本 = 上下文.join("\n\n");
-
-        // 3. 填充模板
-        let mut 参数 = HashMap::new();
-        参数.insert("问题".to_string(), 问题.to_string());
-        参数.insert("上下文".to_string(), 上下文文本);
-
-        let 提示 = self.模板.填充(&参数)?;
-
-        // 4. 调用 LLM 生成回答
-        // TODO: 实际实现需要调用 LLM API
-        let 回答 = format!("基于上下文回答: {}", 问题);
-
-        Ok(生成结果 {
-            文本: 回答,
-            token数: 100, // 模拟值
-        })
-    }
-}
-
-/// 智能代理动作
-#[derive(Debug, Clone)]
-pub enum 代理动作 {
-    /// 思考
-    思考(String),
-    /// 执行工具
-    执行工具 {
-        工具名: String,
-        参数: HashMap<String, String>,
-    },
-    /// 回答
-    回答(String),
-}
-
-/// 代理工具
-pub trait 代理工具接口: std::fmt::Debug {
-    /// 工具名称
-    fn 名称(&self) -> &str;
-
-    /// 工具描述
-    fn 描述(&self) -> &str;
-
-    /// 执行工具
-    fn 执行(&self, 参数: &HashMap<String, String>) -> 大模型结果<String>;
-}
-
-/// 智能代理 (Agent)
-#[derive(Debug)]
-pub struct 智能代理 {
-    /// 代理名称
-    名称: String,
-    /// 系统提示
-    系统提示: String,
-    /// 可用工具
-    工具列表: Vec<Box<dyn 代理工具接口>>,
-    /// 模型配置
-    配置: 模型配置,
-}
-
-impl 智能代理 {
-    /// 创建新的智能代理
-    pub fn 创建(名称: String, 系统提示: String, 配置: 模型配置) -> Self {
-        Self {
-            名称,
-            系统提示,
-            工具列表: Vec::new(),
-            配置,
-        }
-    }
-
-    /// 添加工具
-    pub fn 添加工具(&mut self, 工具: Box<dyn 代理工具接口>) {
-        self.工具列表.push(工具);
-    }
-
-    /// 运行代理
-    pub fn 运行(&self, 任务: &str) -> 大模型结果<String> {
-        // TODO: 实际实现需要实现 ReAct 循环
-        // 1. 思考 (Thought)
-        // 2. 行动 (Action) - 选择并执行工具
-        // 3. 观察 (Observation) - 获取工具结果
-        // 4. 重复直到得出最终答案
-
-        Ok(format!("代理 {} 完成任务: {}", self.名称, 任务))
-    }
-
-    /// 获取可用工具列表
-    pub fn 获取工具列表(&self) -> Vec<&str> {
-        self.工具列表.iter().map(|t| t.名称()).collect()
-    }
-}
+// 这里原本有 检索增强生成(RAG) 和 智能代理(Agent) 两个结构体，`生成()` 恒返回
+// "基于上下文回答: {问题}"、`运行()` 恒返回 "代理 X 完成任务: Y" —— 全是桩，
+// 而且没有任何 FFI 把它们暴露给 qi 代码，纯粹是等着谁接上去的雷。
+// 真正的 RAG / 代理在 qi-harness（用 qi 写的），检索用 vindex_ffi，
+// 模型调用用 llm_ffi。这两个桩已删。
 
 /// 大模型模块
 #[derive(Debug)]
 pub struct 大模型模块 {
     /// 默认嵌入器配置
     嵌入器配置: 嵌入器配置,
-    /// 默认模型配置
-    模型配置: 模型配置,
 }
 
 impl 大模型模块 {
@@ -487,7 +373,6 @@ impl 大模型模块 {
     pub fn 创建() -> Self {
         Self {
             嵌入器配置: 嵌入器配置::default(),
-            模型配置: 模型配置::default(),
         }
     }
 
@@ -505,16 +390,6 @@ impl 大模型模块 {
     /// 创建提示模板
     pub fn 创建模板(&self, 模板内容: String) -> 提示模板 {
         提示模板::创建(模板内容)
-    }
-
-    /// 创建 RAG 系统
-    pub fn 创建RAG(&self, 知识库: 知识库, 模板: 提示模板) -> 检索增强生成 {
-        检索增强生成::创建(知识库, 模板, self.模型配置.clone())
-    }
-
-    /// 创建智能代理
-    pub fn 创建代理(&self, 名称: String, 系统提示: String) -> 智能代理 {
-        智能代理::创建(名称, 系统提示, self.模型配置.clone())
     }
 }
 
@@ -577,31 +452,7 @@ mod tests {
         assert!(结果.contains("AI是人工智能"));
     }
 
-    #[test]
-    fn 测试RAG() {
-        let 模块 = 大模型模块::创建();
-        let mut 知识库 = 模块.创建知识库();
-
-        知识库
-            .添加文档("量子是什么".to_string(), HashMap::new())
-            .unwrap();
-        知识库
-            .添加文档("量子力学基础".to_string(), HashMap::new())
-            .unwrap();
-
-        let 模板 = 模块.创建模板("问题: {问题}\n上下文: {上下文}\n回答:".to_string());
-        let rag = 模块.创建RAG(知识库, 模板);
-
-        let 结果 = rag.生成("什么是量子", 2).unwrap();
-        assert!(!结果.文本.is_empty());
-    }
-
-    #[test]
-    fn 测试智能代理() {
-        let 模块 = 大模型模块::创建();
-        let 代理 = 模块.创建代理("助手".to_string(), "你是一个有帮助的AI助手".to_string());
-
-        let 结果 = 代理.运行("完成一个任务").unwrap();
-        assert!(结果.contains("助手"));
-    }
+    // 测试RAG / 测试智能代理 两个用例随桩一起删了：它们断言的是
+    // "基于上下文回答: X" 和 "代理 X 完成任务" 这两句假答案，
+    // 桩没了就没有被测对象了。真实现的测试在 qi-harness。
 }

@@ -178,12 +178,6 @@ impl SystemModule {
         })
     }
 
-    /// Get memory information
-    fn get_memory_info(&self) -> RuntimeResult<(u64, u64)> {
-        // Fallback implementation - return zeros
-        Ok((0, 0))
-    }
-
     /// Get system uptime
     fn get_system_uptime(&self) -> RuntimeResult<u64> {
         // Fallback implementation - return zero

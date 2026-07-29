@@ -96,7 +96,6 @@ pub struct Runtime {
     executor: Arc<Executor>,
     scheduler: Arc<Scheduler>,
     pool: Arc<WorkerPool>,
-    state_manager: Arc<StateManager>,
 }
 
 impl Runtime {
@@ -116,14 +115,11 @@ impl Runtime {
 
         let executor = Arc::new(Executor::new(Arc::clone(&pool), Arc::clone(&scheduler))?);
 
-        let state_manager = Arc::new(StateManager::new());
-
         Ok(Self {
             config,
             executor,
             scheduler,
             pool,
-            state_manager,
         })
     }
 

@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_gc_creation_and_init() {
-        let mut gc = GarbageCollector::new(GcConfig::default());
+        let gc = GarbageCollector::new(GcConfig::default());
         assert_eq!(gc.current_cycle(), 0);
         gc.initialize().unwrap();
         assert_eq!(gc.current_cycle(), 0);
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_mark_and_sweep_collects_unreachable() {
-        let mut gc = GarbageCollector::new(GcConfig::default());
+        let gc = GarbageCollector::new(GcConfig::default());
         gc.initialize().unwrap();
 
         let a = 0x1000 as *const u8;

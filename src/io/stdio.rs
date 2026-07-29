@@ -9,8 +9,6 @@ use std::io::{self, Read, Write};
 /// Standard I/O interface
 #[derive(Debug)]
 pub struct StandardIo {
-    /// Input buffer
-    input_buffer: String,
     /// Output buffer
     output_buffer: String,
     /// Error buffer
@@ -23,7 +21,6 @@ impl StandardIo {
     /// Create new standard I/O interface
     pub fn new() -> Self {
         Self {
-            input_buffer: String::new(),
             output_buffer: String::new(),
             error_buffer: String::new(),
             use_buffering: true,
@@ -33,7 +30,6 @@ impl StandardIo {
     /// Create standard I/O with buffering disabled
     pub fn unbuffered() -> Self {
         Self {
-            input_buffer: String::new(),
             output_buffer: String::new(),
             error_buffer: String::new(),
             use_buffering: false,

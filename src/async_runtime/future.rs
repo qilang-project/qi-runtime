@@ -2,8 +2,6 @@
 //!
 //! Provides Future<T> support for async operations
 
-#[cfg(test)]
-use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex};
 

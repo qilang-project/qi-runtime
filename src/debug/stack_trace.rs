@@ -288,7 +288,7 @@ impl StackTraceCollector {
         // Check cache first
         {
             let cache = self.symbol_cache.lock().unwrap();
-            if let Some(cached_name) = cache.get(&ip_addr) {
+            if cache.contains_key(&ip_addr) {
                 // Return cached symbol (simplified for now)
                 return Ok(None);
             }

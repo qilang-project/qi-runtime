@@ -656,7 +656,8 @@ pub extern "C" fn qi_http_server_handle_request(
 /// 简化版本：只需要服务器句柄和响应内容
 #[no_mangle]
 pub extern "C" fn qi_http_server_send_response(
-    server_handle: i64,
+    // 简化版直接写当前连接，不按句柄分发；留在签名里是为了 ABI 稳定
+    _server_handle: i64,
     response_body: *const c_char,
 ) -> i64 {
     if response_body.is_null() {

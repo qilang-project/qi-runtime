@@ -362,7 +362,6 @@ impl DebugSystem {
         self.config = config;
 
         // Update component configurations
-        let stack_config = StackTraceConfig::default();
         // Note: We would need to update the stack collector config here
         // but it requires mutable access, so this is a simplified version
 

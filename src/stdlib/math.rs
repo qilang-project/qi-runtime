@@ -478,7 +478,6 @@ impl MathModule {
 
         let mut result = String::new();
         let mut large_unit_index = 0;
-        let large_units = ["", "万", "亿", "兆"];
 
         while num > 0 {
             if num % 10000 != 0 {
@@ -486,13 +485,15 @@ impl MathModule {
                 if !result.is_empty() && large_unit_index > 0 {
                     result = format!(
                         "{}{}{}",
-                        segment_result, large_units[large_unit_index], result
+                        segment_result,
+                        self.大单位(large_unit_index),
+                        result
                     );
                 } else {
                     result = format!("{}{}", segment_result, result);
                 }
             } else if !result.is_empty() && large_unit_index > 0 {
-                result = format!("{}{}", large_units[large_unit_index], result);
+                result = format!("{}{}", self.大单位(large_unit_index), result);
             }
 
             num /= 10000;
@@ -500,6 +501,17 @@ impl MathModule {
         }
 
         result
+    }
+
+    /// 万/亿/兆：段序号 0 是「个位段」，没有单位；超出表长也返回空
+    fn 大单位(&self, 段序号: usize) -> String {
+        if 段序号 == 0 {
+            return String::new();
+        }
+        match self.chinese_large_units.get(段序号 - 1) {
+            Some(c) => c.to_string(),
+            None => String::new(),
+        }
     }
 
     /// Convert 4-digit number to Chinese
@@ -512,7 +524,6 @@ impl MathModule {
         let mut temp_num = num;
         let mut need_zero = false;
 
-        let units = ["", "十", "百", "千"];
         for i in 0..4 {
             let digit = temp_num % 10;
             if digit != 0 {
@@ -520,10 +531,12 @@ impl MathModule {
                     result = format!("{}零", result);
                     need_zero = false;
                 }
-                result = format!(
-                    "{}{}{}",
-                    self.chinese_digits[digit as usize], units[i], result
-                );
+                // i == 0 是个位，没有单位；往上依次是 十/百/千
+                let 单位: String = match i {
+                    0 => String::new(),
+                    _ => self.chinese_units[i - 1].to_string(),
+                };
+                result = format!("{}{}{}", self.chinese_digits[digit as usize], 单位, result);
             } else if !result.is_empty() {
                 need_zero = true;
             }

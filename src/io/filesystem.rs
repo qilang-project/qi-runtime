@@ -118,8 +118,6 @@ pub struct FileSystemInterface {
     default_buffer_size: usize,
     /// I/O statistics
     statistics: std::sync::Mutex<IoStatistics>,
-    /// Default timeout for operations
-    default_timeout: Option<Duration>,
 }
 
 impl FileSystemInterface {
@@ -128,7 +126,6 @@ impl FileSystemInterface {
         Ok(Self {
             default_buffer_size: buffer_size,
             statistics: std::sync::Mutex::new(IoStatistics::new()),
-            default_timeout: Some(Duration::from_secs(30)),
         })
     }
 

@@ -135,9 +135,6 @@ mod tests {
     fn test_current_dir() {
         let result = qi_env_current_dir();
         assert!(!result.is_null());
-
-        unsafe {
-            qi_env_free_string(result);
-        }
+        qi_env_free_string(result);
     }
 }

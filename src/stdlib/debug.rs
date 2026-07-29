@@ -569,8 +569,6 @@ pub struct DebugInfo {
 
 /// Format timestamp for display
 fn format_timestamp(timestamp: u64) -> String {
-    let datetime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp);
-
     // Simple formatting - in a real implementation you'd use chrono or similar
     format!("{}", timestamp)
 }

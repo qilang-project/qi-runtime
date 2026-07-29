@@ -72,26 +72,14 @@ pub enum TaskStatus {
 
 /// Internal task state
 pub(crate) struct TaskInner {
-    id: TaskId,
-    priority: TaskPriority,
     status: AtomicUsize,
 }
 
 impl TaskInner {
-    pub fn new(id: TaskId, priority: TaskPriority) -> Self {
+    pub fn new() -> Self {
         Self {
-            id,
-            priority,
             status: AtomicUsize::new(TaskStatus::Pending as usize),
         }
-    }
-
-    pub fn id(&self) -> TaskId {
-        self.id
-    }
-
-    pub fn priority(&self) -> TaskPriority {
-        self.priority
     }
 
     pub fn status(&self) -> TaskStatus {
@@ -242,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_task_status_transitions() {
-        let inner = TaskInner::new(TaskId::new(), TaskPriority::Normal);
+        let inner = TaskInner::new();
         assert_eq!(inner.status(), TaskStatus::Pending);
         inner.set_status(TaskStatus::Running);
         assert_eq!(inner.status(), TaskStatus::Running);

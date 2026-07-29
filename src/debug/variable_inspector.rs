@@ -293,12 +293,15 @@ impl VariableInspector {
         {
             let registry = self.variable_registry.lock().unwrap();
             if let Some(variable) = registry.get(name) {
-                let result = self.create_inspection_result(variable, 0)?;
+                let mut result = self.create_inspection_result(variable, 0)?;
 
                 let end_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_micros() as u64;
+                // create_inspection_result 填不了这个字段（它不知道调用方何时开始计时），
+                // 由这里补上 —— 两端时间戳本来就已经取好了
+                result.metadata.inspection_time_us = end_time.saturating_sub(start_time);
 
                 self.debug.info(&format!("Inspected variable: {}", name))?;
                 return Ok(result);
@@ -444,7 +447,7 @@ impl VariableInspector {
             metadata: InspectionMetadata {
                 depth,
                 nested_count: nested.len(),
-                inspection_time_us: 0, // TODO: Implement timing
+                inspection_time_us: 0, // 由 inspect_variable 在返回前补上
                 memory_usage_bytes: 0, // TODO: Implement memory tracking
             },
         })

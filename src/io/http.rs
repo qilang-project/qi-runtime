@@ -419,8 +419,6 @@ impl TcpConnection {
 /// HTTP client
 #[derive(Debug)]
 pub struct HttpClient {
-    /// Default timeout
-    default_timeout: Duration,
     /// I/O statistics
     statistics: std::sync::Mutex<IoStatistics>,
 }
@@ -429,15 +427,6 @@ impl HttpClient {
     /// Create new HTTP client
     pub fn new() -> Self {
         Self {
-            default_timeout: Duration::from_secs(30),
-            statistics: std::sync::Mutex::new(IoStatistics::new()),
-        }
-    }
-
-    /// Create HTTP client with default timeout
-    pub fn with_timeout(timeout: Duration) -> Self {
-        Self {
-            default_timeout: timeout,
             statistics: std::sync::Mutex::new(IoStatistics::new()),
         }
     }
@@ -481,7 +470,7 @@ impl HttpClient {
     }
 
     /// Simulate HTTP request (placeholder implementation)
-    fn simulate_http_request(&self, request: &HttpRequest) -> IoResult<HttpResponse> {
+    fn simulate_http_request(&self, _request: &HttpRequest) -> IoResult<HttpResponse> {
         // This is a simulation - in a real implementation we would make actual HTTP requests
         let response_time = std::time::Duration::from_millis(150);
 
@@ -507,8 +496,6 @@ impl Default for HttpClient {
 /// TCP manager
 #[derive(Debug)]
 pub struct TcpManager {
-    /// Default timeout
-    default_timeout: Duration,
     /// I/O statistics
     statistics: std::sync::Mutex<IoStatistics>,
 }
@@ -517,30 +504,19 @@ impl TcpManager {
     /// Create new TCP manager
     pub fn new() -> Self {
         Self {
-            default_timeout: Duration::from_secs(30),
-            statistics: std::sync::Mutex::new(IoStatistics::new()),
-        }
-    }
-
-    /// Create TCP manager with default timeout
-    pub fn with_timeout(timeout: Duration) -> Self {
-        Self {
-            default_timeout: timeout,
             statistics: std::sync::Mutex::new(IoStatistics::new()),
         }
     }
 
     /// Create TCP connection
     pub fn connect(&self, config: TcpConnectionConfig) -> IoResult<TcpConnection> {
-        let start_time = Instant::now();
         let result = TcpConnection::connect(config);
 
         match &result {
             Ok(_) => {
-                let elapsed = start_time.elapsed();
                 let mut stats = self.statistics.lock().unwrap();
+                // 统计里只有次数，没有耗时/字节数的位置，所以这里不测耗时
                 stats.record_network_operations();
-                // Network operations don't have byte counts easily accessible
             }
             Err(_) => {
                 let mut stats = self.statistics.lock().unwrap();

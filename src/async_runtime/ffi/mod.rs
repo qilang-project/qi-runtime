@@ -102,7 +102,8 @@ fn ensure_runtime_initialized() {
 #[no_mangle]
 pub extern "C" fn qi_runtime_create_task(
     function_ptr: *const c_void,
-    arg_count: i64,
+    // 参数个数目前不参与建任务（实参由闭包自己捕获），保留在签名里是为了 ABI 稳定
+    _arg_count: i64,
 ) -> TaskHandle {
     ensure_runtime_initialized();
     if debug_enabled() {
@@ -247,7 +248,7 @@ pub extern "C" fn qi_runtime_await(task: TaskHandle) -> *mut c_void {
 
 /// Spawn an async task to start execution
 #[no_mangle]
-pub extern "C" fn qi_runtime_spawn_task(task: TaskHandle) -> i32 {
+pub extern "C" fn qi_runtime_spawn_task(_task: TaskHandle) -> i32 {
     ensure_runtime_initialized();
 
     // For now, just return success
@@ -339,10 +340,6 @@ pub extern "C" fn qi_runtime_spawn_goroutine_with_args(
             crate::stdlib::exception_ffi::record_goroutine_exception(msg);
         }
     });
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    crate::stdlib::exception_ffi::goroutine_panic_message(payload).0
 }
 
 // ── 可等待协程（句柄）─────────────────────────────────────────────────────
@@ -482,7 +479,6 @@ static NEXT_TIMER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 struct ChannelInstance {
     sender: Arc<Mutex<Sender<*mut c_void>>>,
     receiver: Arc<Mutex<Receiver<*mut c_void>>>,
-    buffer_size: i32,
 }
 
 unsafe impl Send for ChannelInstance {}
@@ -513,7 +509,6 @@ pub extern "C" fn qi_runtime_create_channel(buffer_size: i64) -> *mut c_void {
     let channel = Arc::new(ChannelInstance {
         sender: Arc::new(Mutex::new(sender)),
         receiver: Arc::new(Mutex::new(receiver)),
-        buffer_size: buffer_size as i32,
     });
 
     let channel_id = NEXT_CHANNEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

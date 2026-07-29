@@ -26,7 +26,7 @@ static GC_STOP: AtomicBool = AtomicBool::new(false);
 static mut GC_THREAD: Option<std::thread::JoinHandle<()>> = None;
 
 /// 启动后台 GC 收集线程（幂等）。
-fn 启动后台GC() {
+fn 启动后台回收() {
     unsafe {
         if GC_THREAD.is_some() {
             return;
@@ -83,7 +83,7 @@ fn 启动后台GC() {
 
 /// 停止后台 GC 线程并 join。必须在 RUNTIME.take() 之前调：
 /// 否则收集线程可能正持 RwLock 的读锁，take 掉 RwLock 是 UB。
-fn 停止后台GC() {
+fn 停止后台回收() {
     GC_STOP.store(true, Ordering::SeqCst);
     unsafe {
         if let Some(h) = GC_THREAD.take() {
@@ -112,7 +112,7 @@ pub extern "C" fn qi_runtime_initialize() -> c_int {
                 unsafe {
                     RUNTIME = Some(RwLock::new(runtime));
                 }
-                启动后台GC();
+                启动后台回收();
             }
             Err(e) => {
                 eprintln!("Runtime 创建失败: {}", e);
@@ -128,7 +128,7 @@ pub extern "C" fn qi_runtime_initialize() -> c_int {
 #[no_mangle]
 pub extern "C" fn qi_runtime_shutdown() -> c_int {
     qi_runtime_flush_stdout(); // 刷出所有线程未完的打印行
-    停止后台GC(); // 先停收集线程并 join，确保它不再持读锁，再安全 take 掉 RUNTIME
+    停止后台回收(); // 先停收集线程并 join，确保它不再持读锁，再安全 take 掉 RUNTIME
     unsafe {
         if let Some(runtime_mutex) = RUNTIME.take() {
             if let Ok(mut runtime) = runtime_mutex.write() {
@@ -845,68 +845,11 @@ pub extern "C" fn qi_runtime_file_write_string(
 // Network Operations
 // ============================================================================
 
-/// Make HTTP GET request (caller must free the result)
-#[no_mangle]
-pub extern "C" fn qi_runtime_http_get(url: *const c_char) -> *mut c_char {
-    if url.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    unsafe {
-        if let Ok(url_str) = CStr::from_ptr(url).to_str() {
-            // For this simplified implementation, we simulate a successful HTTP response
-            // In a full implementation, we would use the network interface
-            let mock_response =
-                r#"{"message": "Mock HTTP response from Qi runtime", "status": "success"}"#;
-
-            // Update I/O operation count
-            if let Some(runtime_mutex) = RUNTIME.as_ref() {
-                if let Ok(runtime) = runtime_mutex.read() {
-                    runtime.increment_io_operations();
-                }
-            }
-
-            return crate::stdlib::qi_str::rc_cstr_from_str(mock_response);
-        } else {
-            eprintln!("HTTP请求失败: 无效的UTF-8 URL字符串");
-        }
-    }
-
-    std::ptr::null_mut()
-}
-
-/// Make HTTP POST request (caller must free the result)
-#[no_mangle]
-pub extern "C" fn qi_runtime_http_post(url: *const c_char, data: *const c_char) -> *mut c_char {
-    if url.is_null() || data.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    unsafe {
-        if let (Ok(url_str), Ok(data_str)) =
-            (CStr::from_ptr(url).to_str(), CStr::from_ptr(data).to_str())
-        {
-            // For this simplified implementation, we simulate a successful HTTP response
-            let mock_response = format!(
-                r#"{{"message": "Mock POST response", "received_data": "{}", "status": "success"}}"#,
-                data_str
-            );
-
-            // Update I/O operation count
-            if let Some(runtime_mutex) = RUNTIME.as_ref() {
-                if let Ok(runtime) = runtime_mutex.read() {
-                    runtime.increment_io_operations();
-                }
-            }
-
-            return crate::stdlib::qi_str::rc_cstr_from_string(mock_response);
-        } else {
-            eprintln!("HTTP POST请求失败: 无效的UTF-8字符串");
-        }
-    }
-
-    std::ptr::null_mut()
-}
+// HTTP GET / POST 曾经在这里各有一个 `#[no_mangle]` 桩函数，恒返回
+// `{"message": "Mock HTTP response from Qi runtime"}`。它们从未注册进
+// module_registry，qi 代码根本调不到，纯粹是等着谁哪天顺手接上去的雷
+// —— 同款「模拟实现」已经坑过一次（HTTP 构建器恒返回 Hello World）。
+// 真正的 HTTP 客户端在 src/io/http_ffi.rs（reqwest），这里直接删掉。
 
 /// Open TCP connection (returns connection handle or negative on error)
 #[no_mangle]

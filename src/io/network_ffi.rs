@@ -70,26 +70,6 @@ fn 下一个句柄() -> i64 {
     连接句柄计数器.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-/// 从TCP连接池中取出连接并返回TcpStream（用于WebSocket升级）
-/// 这将从池中移除连接，调用者获得TcpStream的所有权
-pub(crate) fn 取出TCP流(handle: i64) -> Option<std::net::TcpStream> {
-    let (_, arc) = 获取连接池().remove(&handle)?;
-    // 常态：本连接只有当前 goroutine 在用，remove 后 Arc 唯一，直接拆箱。
-    // 兜底：极端并发下别的线程还持着克隆（瞬态 IO 中），退回 dup fd
-    // （try_clone_stream），残余 Arc 随其使用结束自然释放。
-    match std::sync::Arc::try_unwrap(arc) {
-        Ok(mu) => Some(
-            mu.into_inner()
-                .unwrap_or_else(|e| e.into_inner())
-                .into_stream(),
-        ),
-        Err(arc) => {
-            let conn = arc.lock().unwrap_or_else(|e| e.into_inner());
-            conn.try_clone_stream().ok()
-        }
-    }
-}
-
 /// 克隆TCP连接的流（保留原连接在池中）
 pub(crate) fn 克隆TCP流(handle: i64) -> Option<std::net::TcpStream> {
     let arc = 取连接(handle)?;
@@ -775,9 +755,7 @@ mod tests {
     #[test]
     fn test_network_init() {
         qi_network_init();
-        unsafe {
-            assert!(全局网络接口.get().is_some());
-        }
+        assert!(全局网络接口.get().is_some());
     }
 
     #[test]
