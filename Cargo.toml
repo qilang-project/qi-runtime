@@ -3,7 +3,7 @@
 
 [package]
 name = "qi-runtime"
-version = "2026.7.24-1"
+version = "2026.7.29-1"
 edition = "2021"
 authors = ["Qi Language Team"]
 license = "MIT"
