@@ -1020,6 +1020,30 @@ fn 新建qi数组(槽: &[i64]) -> *mut std::os::raw::c_void {
     p as *mut std::os::raw::c_void
 }
 
+/// 对象的键列表 → Qi 字符串数组。
+///
+/// 补的是一个基本缺口：JSON 模块能按名字取字段，却**没法把一个对象的键遍历一遍**。
+/// 「把上来的表单载荷合并进已有的值」这类活儿因此写不了 —— 只能整体替换，
+/// 于是框架自己塞进载荷的保留键也会跟着变成业务数据。
+#[no_mangle]
+pub extern "C" fn qi_json_object_keys(obj_id: i64) -> *mut std::os::raw::c_void {
+    let 键: Vec<String> = {
+        let storage = JSON_VALUES.lock().unwrap();
+        match *storage {
+            Some(ref map) => match map.get(&(obj_id as u64)) {
+                Some(Value::Object(obj)) => obj.keys().cloned().collect(),
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        }
+    };
+    let 槽: Vec<i64> = 键
+        .iter()
+        .map(|k| crate::stdlib::qi_str::rc_cstr_from_str(k) as i64)
+        .collect();
+    新建qi数组(&槽)
+}
+
 fn 取字段数组(obj_id: i64, key: *const c_char) -> Option<Vec<Value>> {
     if obj_id <= 0 || key.is_null() {
         return None;
