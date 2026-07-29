@@ -31,6 +31,14 @@ fn 取WS(handle: i64) -> Option<Arc<WebSocketConnection>> {
         .cloned()
 }
 
+/// 从池里摘掉一个句柄（连接已经断了，别留着攥 fd）
+fn 摘除WS(handle: i64) {
+    获取WS连接池()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&handle);
+}
+
 fn 获取WS句柄计数器() -> &'static Mutex<i64> {
     WS句柄计数器.get_or_init(|| Mutex::new(1000)) // 从 1000 开始避免与 TCP 句柄冲突
 }
@@ -83,17 +91,52 @@ pub struct WebSocketConnection {
     is_server: bool, // true = 服务器端, false = 客户端
     is_connected: std::sync::atomic::AtomicBool,
     send_lock: Mutex<()>,
+    /// 握手响应之后、被同一次 read 顺带读进来的字节。
+    ///
+    /// 客户端连上后服务端常常「101 响应」和「第一帧」挨着发，TCP 会把它们合进
+    /// 同一个报文段。握手那次 read 是按缓冲区大小读的，会把第一帧一起吃掉；
+    /// 不留着的话 recv_frame 就永远在等一个已经被丢掉的帧 —— 表现为连上了却
+    /// 收不到任何东西，且时有时无（取决于两次写有没有被合包）。
+    预读: Mutex<Vec<u8>>,
 }
 
 impl WebSocketConnection {
     /// 从已升级的 TCP 连接创建 WebSocket 连接
     pub fn from_upgraded_stream(stream: TcpStream, is_server: bool) -> Self {
+        Self::from_upgraded_stream_with_pending(stream, is_server, Vec::new())
+    }
+
+    /// 带「握手时多读到的字节」创建（见 预读 字段说明）
+    pub fn from_upgraded_stream_with_pending(
+        stream: TcpStream,
+        is_server: bool,
+        pending: Vec<u8>,
+    ) -> Self {
         WebSocketConnection {
             stream,
             is_server,
             is_connected: std::sync::atomic::AtomicBool::new(true),
             send_lock: Mutex::new(()),
+            预读: Mutex::new(pending),
         }
+    }
+
+    /// 读满 buf：先把 预读 里剩的用掉，不够再从 socket 读
+    fn 读满(&self, buf: &mut [u8]) -> Result<(), std::io::Error> {
+        let mut 已填 = 0usize;
+        {
+            let mut 剩 = self.预读.lock().unwrap_or_else(|e| e.into_inner());
+            if !剩.is_empty() {
+                已填 = 剩.len().min(buf.len());
+                buf[..已填].copy_from_slice(&剩[..已填]);
+                剩.drain(..已填);
+            }
+        }
+        if 已填 < buf.len() {
+            let mut 读 = &self.stream;
+            读.read_exact(&mut buf[已填..])?;
+        }
+        Ok(())
     }
 
     /// 发送 WebSocket 帧（&self：可并发；send_lock 串行化写、防帧交错）
@@ -145,9 +188,8 @@ impl WebSocketConnection {
 
     /// 接收 WebSocket 帧（&self：用 &TcpStream 读，不加锁、不挡并发写）
     pub fn recv_frame(&self) -> Result<WebSocketFrame, std::io::Error> {
-        let mut 读 = &self.stream;
         let mut header = [0u8; 2];
-        读.read_exact(&mut header)?;
+        self.读满(&mut header)?;
 
         let fin = (header[0] & 0x80) != 0;
         let opcode = WebSocketOpcode::from_u8(header[0] & 0x0F).ok_or_else(|| {
@@ -160,18 +202,18 @@ impl WebSocketConnection {
         // 读取扩展长度
         if payload_len == 126 {
             let mut ext_len = [0u8; 2];
-            读.read_exact(&mut ext_len)?;
+            self.读满(&mut ext_len)?;
             payload_len = u16::from_be_bytes(ext_len) as u64;
         } else if payload_len == 127 {
             let mut ext_len = [0u8; 8];
-            读.read_exact(&mut ext_len)?;
+            self.读满(&mut ext_len)?;
             payload_len = u64::from_be_bytes(ext_len);
         }
 
         // 读取 mask key（如果存在）
         let mask_key = if masked {
             let mut key = [0u8; 4];
-            读.read_exact(&mut key)?;
+            self.读满(&mut key)?;
             Some(key)
         } else {
             None
@@ -179,7 +221,7 @@ impl WebSocketConnection {
 
         // 读取 payload
         let mut payload = vec![0u8; payload_len as usize];
-        读.read_exact(&mut payload)?;
+        self.读满(&mut payload)?;
 
         // 如果有 mask，解码
         if let Some(key) = mask_key {
@@ -237,6 +279,22 @@ impl WebSocketConnection {
         self.is_connected
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// 真正切断 socket（双向 shutdown），并标记断开。
+    ///
+    /// 光发 Close 帧不够：对端多半正阻塞在 read 上，只有 FIN 才能让那个 read
+    /// 立刻返回。只靠 Arc drop 也不行 —— 别的线程可能还持有克隆（服务端就是
+    /// 「TCP 池一份 + WS 池一份」），于是 fd 卡在 CLOSED 不回收、对端的连接
+    /// 循环永远醒不过来，几个连接就把服务端占满。
+    pub fn 切断(&self) {
+        self.标记断开();
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// HTTP 头结束位置（\r\n\r\n 之后第一个字节的下标）；没读全返回 None
+fn 找到空行(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
 /// 生成随机 mask key
@@ -537,22 +595,43 @@ pub extern "C" fn qi_websocket_connect(url: *const c_char) -> i64 {
         return -4;
     }
 
-    // 读取响应
-    let mut response = vec![0u8; 1024];
-    let n = match stream.read(&mut response) {
-        Ok(n) => n,
-        Err(_) => return -5,
-    };
+    // 读取握手响应。
+    //
+    // 一次 read 未必正好读到响应结尾：服务端常常「101 响应」后紧接着就推第一帧，
+    // TCP 会把两者合进同一个报文段。所以要循环读到 \r\n\r\n，并且把响应之后
+    // 多读到的字节交给连接对象留着 —— 丢掉的话第一帧就没了，recv 永远在等一个
+    // 已经被吃掉的帧（表现为连上却收不到东西，而且时有时无）。
+    let mut 已收: Vec<u8> = Vec::with_capacity(1024);
+    let 响应结尾;
+    loop {
+        let mut 块 = [0u8; 1024];
+        let n = match stream.read(&mut 块) {
+            Ok(0) => return -5, // 对端在握手中途关了
+            Ok(n) => n,
+            Err(_) => return -5,
+        };
+        已收.extend_from_slice(&块[..n]);
+        if let Some(pos) = 找到空行(&已收) {
+            响应结尾 = pos;
+            break;
+        }
+        if 已收.len() > 64 * 1024 {
+            return -5; // 响应头大得离谱，当作坏数据
+        }
+    }
 
-    let response_str = String::from_utf8_lossy(&response[..n]);
+    let response_str = String::from_utf8_lossy(&已收[..响应结尾]);
 
     // 验证响应
     if !response_str.contains("101") || !response_str.to_lowercase().contains("upgrade") {
         return -6;
     }
 
+    // 响应之后的字节属于 WebSocket 帧流，留给 recv_frame 先消费
+    let 预读 = 已收[响应结尾..].to_vec();
+
     // 创建 WebSocket 连接
-    let ws_conn = WebSocketConnection::from_upgraded_stream(stream, false);
+    let ws_conn = WebSocketConnection::from_upgraded_stream_with_pending(stream, false, 预读);
 
     let mut 句柄计数 = 获取WS句柄计数器().lock().unwrap();
     *句柄计数 += 1;
@@ -702,15 +781,20 @@ pub extern "C" fn qi_websocket_recv_text(handle: i64) -> *mut c_char {
                     }
                 }
 
-                // 收到关闭帧
+                // 收到关闭帧：回一个 Close 再切断，并把池条目摘掉。
+                // 只标记断开的话条目会一直留在池里攥着 fd（lsof 里就是那些
+                // 永远不消失的 CLOSED），连接开够了服务端就再也升级不动。
                 if frame.opcode == WebSocketOpcode::Close {
-                    conn.标记断开();
+                    let _ = conn.send_close(1000, "");
+                    conn.切断();
+                    摘除WS(handle);
                     return crate::stdlib::qi_str::rc_cstr_from_str("");
                 }
             }
             Err(_) => {
-                // 读取错误，标记连接已断开
-                conn.标记断开();
+                // 读取错误（对端 FIN / 连接重置）：同样要摘掉，否则 fd 泄漏
+                conn.切断();
+                摘除WS(handle);
                 break;
             }
         }
@@ -750,6 +834,9 @@ pub extern "C" fn qi_websocket_close(handle: i64, code: u16, reason: *const c_ch
         .remove(&handle);
     if let Some(conn) = conn {
         let _ = conn.send_close(code, &reason_str);
+        // 发完 Close 帧立刻 shutdown：对端阻塞在 read 上，等它自己发现要很久
+        // （或者永远发现不了）。RFC 允许主动方在发出 Close 后直接关闭。
+        conn.切断();
         1
     } else {
         0
