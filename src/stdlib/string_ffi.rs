@@ -659,3 +659,70 @@ mod tests {
         assert_eq!(count, 6); // 你好，世界！
     }
 }
+
+/// 两串公共前缀的字节长度（对齐到 UTF-8 字符边界）。
+///
+/// 给实时页面的增量下发用：每次事件服务端都重渲染整段 HTML，全量发一遍很浪费
+/// （家有小奇一次点击 13.5KB）。用「公共前缀 + 公共后缀 + 中间替换段」就能把
+/// 常见的小改动压到几十字节。放在 runtime 里做是因为在 qi 侧逐字符比对是
+/// O(n²)（字符取 每次都从头扫）。
+#[no_mangle]
+pub extern "C" fn qi_string_common_prefix(a_ptr: *const c_char, b_ptr: *const c_char) -> i64 {
+    if a_ptr.is_null() || b_ptr.is_null() {
+        return 0;
+    }
+    unsafe {
+        let (a, b) = match (
+            CStr::from_ptr(a_ptr).to_str(),
+            CStr::from_ptr(b_ptr).to_str(),
+        ) {
+            (Ok(x), Ok(y)) => (x, y),
+            _ => return 0,
+        };
+        let (ab, bb) = (a.as_bytes(), b.as_bytes());
+        let 上限 = ab.len().min(bb.len());
+        let mut i = 0usize;
+        while i < 上限 && ab[i] == bb[i] {
+            i += 1;
+        }
+        // 退回到字符边界：i 落在续接字节（10xxxxxx）上说明切在字符中间
+        while i > 0 && i < ab.len() && (ab[i] & 0xC0) == 0x80 {
+            i -= 1;
+        }
+        i as i64
+    }
+}
+
+/// 两串公共后缀的字节长度（对齐到字符边界，且不与前缀重叠）。
+/// 前缀字节数 由调用方先算好传进来，保证 前缀+后缀 <= 两串各自长度。
+#[no_mangle]
+pub extern "C" fn qi_string_common_suffix(
+    a_ptr: *const c_char,
+    b_ptr: *const c_char,
+    前缀字节: i64,
+) -> i64 {
+    if a_ptr.is_null() || b_ptr.is_null() {
+        return 0;
+    }
+    unsafe {
+        let (a, b) = match (
+            CStr::from_ptr(a_ptr).to_str(),
+            CStr::from_ptr(b_ptr).to_str(),
+        ) {
+            (Ok(x), Ok(y)) => (x, y),
+            _ => return 0,
+        };
+        let (ab, bb) = (a.as_bytes(), b.as_bytes());
+        let p = (前缀字节.max(0) as usize).min(ab.len()).min(bb.len());
+        let 上限 = (ab.len() - p).min(bb.len() - p);
+        let mut i = 0usize;
+        while i < 上限 && ab[ab.len() - 1 - i] == bb[bb.len() - 1 - i] {
+            i += 1;
+        }
+        // 退到字符边界：后缀起点不能落在续接字节上
+        while i > 0 && (ab[ab.len() - i] & 0xC0) == 0x80 {
+            i -= 1;
+        }
+        i as i64
+    }
+}
