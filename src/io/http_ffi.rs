@@ -99,6 +99,57 @@ pub extern "C" fn qi_http_post(url: *const c_char, body: *const c_char) -> *mut 
     }
 }
 
+/// 下载二进制到文件（HTTP GET → 直接落盘）
+///
+/// 上面那些请求函数返回的都是 `*mut c_char`，也就是 qi 的 `字符串`；
+/// 二进制过一遍 UTF-8 必坏（`to_string_lossy` 会把非法字节换成 U+FFFD），
+/// 所以 wav/mp3/图片/模型权重一个都下不了。这里按**字节**写文件，
+/// 中间不做任何编码转换。
+///
+/// 返回写入的字节数；失败返回负数：
+///   -1 参数为空　-2 请求失败　-3 HTTP 状态非 2xx　-4 写文件失败
+///
+/// **状态码单独判掉是要紧的**：404 之类返回的是一个 HTML 错误页，
+/// 不看状态就会把那页 HTML 存成 .wav，等到播放才发现，排查起来很绕。
+#[no_mangle]
+pub extern "C" fn qi_http_download_file(url: *const c_char, path: *const c_char) -> i64 {
+    if url.is_null() || path.is_null() {
+        return -1;
+    }
+
+    let (地址, 目标) = unsafe {
+        (
+            CStr::from_ptr(url).to_string_lossy().to_string(),
+            CStr::from_ptr(path).to_string_lossy().to_string(),
+        )
+    };
+
+    let 客户端 = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return -2,
+    };
+
+    let 响应 = match 客户端.get(&地址).send() {
+        Ok(r) => r,
+        Err(_) => return -2,
+    };
+    if !响应.status().is_success() {
+        return -3;
+    }
+    let 字节 = match 响应.bytes() {
+        Ok(b) => b,
+        Err(_) => return -2,
+    };
+
+    match std::fs::write(&目标, &字节) {
+        Ok(()) => 字节.len() as i64,
+        Err(_) => -4,
+    }
+}
+
 /// HTTP PUT 请求
 #[no_mangle]
 pub extern "C" fn qi_http_put(url: *const c_char, body: *const c_char) -> *mut c_char {
@@ -455,6 +506,41 @@ mod tests {
     fn test_http_init() {
         let result = qi_http_init();
         assert_eq!(result, 1);
+    }
+
+    // 下载的**成功**路径要联网，所以这里只测错误路径 —— 但错误路径恰恰是
+    // 最容易写错、后果最难查的那一半：把 404 的 HTML 错误页存成 .wav，
+    // 要等到播放才发现。
+    //
+    // 用 127.0.0.1:1 而不是某个不存在的域名：连接立刻被拒，不走 DNS，
+    // 在没有外网的 CI 上也是稳定的几毫秒。
+    #[test]
+    fn 下载失败时不能留下半个文件() {
+        let 目标 = std::env::temp_dir().join("qi下载失败测试.bin");
+        let _ = std::fs::remove_file(&目标);
+
+        let 网址 = CString::new("http://127.0.0.1:1/不存在").unwrap();
+        let 路径 = CString::new(目标.to_string_lossy().as_ref()).unwrap();
+        let 结果 = qi_http_download_file(网址.as_ptr(), 路径.as_ptr());
+
+        assert_eq!(结果, -2, "连不上应当返回 -2");
+        assert!(!目标.exists(), "请求失败时不该创建文件");
+    }
+
+    #[test]
+    fn 下载参数为空返回负一() {
+        let 路径 = CString::new("/tmp/qi下载空参测试.bin").unwrap();
+        assert_eq!(
+            qi_http_download_file(std::ptr::null(), 路径.as_ptr()),
+            -1,
+            "网址为空"
+        );
+        let 网址 = CString::new("http://127.0.0.1:1/x").unwrap();
+        assert_eq!(
+            qi_http_download_file(网址.as_ptr(), std::ptr::null()),
+            -1,
+            "路径为空"
+        );
     }
 
     #[test]
