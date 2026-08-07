@@ -491,6 +491,69 @@ pub extern "C" fn qi_http_get_status(url: *const c_char) -> i64 {
     }
 }
 
+/// 执行请求，把响应体**按字节**写进文件。
+///
+/// 上面的 `qi_http_request_execute` 返回 `*mut c_char`（qi 的 `字符串`），二进制
+/// 过一遍 UTF-8 必坏 —— wav / mp3 / 图片一个都下不了。`qi_http_download_file`
+/// 能按字节落盘，但它只做 GET，而本地 TTS 那类接口是 **POST + JSON 请求体**
+/// 才换得回音频。这个函数补上中间那一格：请求照旧用 创建请求/设置请求头/
+/// 设置请求体 构建，只是取回来的东西直接进磁盘，不经过字符串。
+///
+/// 返回写入的字节数；失败返回负数：
+///   -1 句柄不存在或路径为空　-2 请求失败　-3 HTTP 状态非 2xx　-4 写文件失败
+///
+/// 状态码单独判掉是要紧的：出错时服务端返回的是一段 JSON 错误说明，
+/// 不看状态就会把那段 JSON 存成 .wav，一直到播放才发现。
+#[no_mangle]
+pub extern "C" fn qi_http_request_execute_to_file(handle: i64, path: *const c_char) -> i64 {
+    if path.is_null() {
+        return -1;
+    }
+    let 目标 = unsafe { CStr::from_ptr(path).to_string_lossy().to_string() };
+
+    let 请求 = {
+        let mut 请求池 = 获取请求池().lock().unwrap();
+        请求池.remove(&handle)
+    };
+    let 请求 = match 请求 {
+        Some(r) => r,
+        None => return -1,
+    };
+
+    let 客户端 = match reqwest::blocking::Client::builder()
+        .timeout(请求.timeout)
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return -2,
+    };
+    let 方法 = reqwest::Method::from_bytes(请求.method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+    let mut 构建器 = 客户端.request(方法, &请求.url);
+    for (k, v) in 请求.headers.iter() {
+        构建器 = 构建器.header(k, v);
+    }
+    if let Some(体) = 请求.body {
+        构建器 = 构建器.body(体);
+    }
+
+    let 响应 = match 构建器.send() {
+        Ok(r) => r,
+        Err(_) => return -2,
+    };
+    if !响应.status().is_success() {
+        return -3;
+    }
+    let 字节 = match 响应.bytes() {
+        Ok(b) => b,
+        Err(_) => return -2,
+    };
+    match std::fs::write(&目标, &字节) {
+        Ok(()) => 字节.len() as i64,
+        Err(_) => -4,
+    }
+}
+
 /// 释放 HTTP 响应字符串（委托 rc_cstr_release：非 RC 指针一次性警告后静默泄漏，不崩溃）
 #[no_mangle]
 pub extern "C" fn qi_http_free_string(s: *mut c_char) {
