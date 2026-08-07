@@ -355,6 +355,27 @@ pub extern "C" fn qi_bytes_free(handle: i64) -> i64 {
 /// 把字节切片原样写入文件（二进制安全——multipart 上传落盘、图片存储等）。
 /// 成功返回写入字节数，失败返回 -1。支持持久负句柄。
 /// 数据先克隆出来、**在池锁外做磁盘 IO**（勿持池锁写盘，见 TCP/UDP/WS 池教训）。
+/// 按字节读整个文件，返回切片句柄；失败返回 -1。
+///
+/// 写文件早就有了，读一直缺 —— 于是二进制文件（图片、音频）只出不进：
+/// 想把落盘的 jpg 转成 base64 发给视觉模型，绕遍标准库都没有路
+/// （IO.读取文件 走字符串，二进制过一遍 UTF-8 必坏）。
+#[no_mangle]
+pub extern "C" fn qi_bytes_read_file(path_ptr: *const c_char) -> i64 {
+    if path_ptr.is_null() {
+        return -1;
+    }
+    let path = unsafe { CStr::from_ptr(path_ptr).to_string_lossy().to_string() };
+    match std::fs::read(&path) {
+        Ok(data) => {
+            let h = next_handle();
+            pool().insert(h, data);
+            h
+        }
+        Err(_) => -1,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn qi_bytes_write_file(handle: i64, path_ptr: *const c_char) -> i64 {
     if path_ptr.is_null() {
