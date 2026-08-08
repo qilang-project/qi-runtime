@@ -812,15 +812,11 @@ pub extern "C" fn qi_websocket_recv_text(handle: i64) -> *mut c_char {
     let mut 拼接中 = false;
     loop {
         match conn.recv_frame() {
-            Ok(frame) => {
-                match 处理一帧(&conn, handle, frame, &mut 拼接, &mut 拼接中) {
-                    帧结果::完整(text) => {
-                        return crate::stdlib::qi_str::rc_cstr_from_string(text)
-                    }
-                    帧结果::继续 => continue,
-                    帧结果::结束 => return crate::stdlib::qi_str::rc_cstr_from_str(""),
-                }
-            }
+            Ok(frame) => match 处理一帧(&conn, handle, frame, &mut 拼接, &mut 拼接中) {
+                帧结果::完整(text) => return crate::stdlib::qi_str::rc_cstr_from_string(text),
+                帧结果::继续 => continue,
+                帧结果::结束 => return crate::stdlib::qi_str::rc_cstr_from_str(""),
+            },
             Err(_) => {
                 // 读取错误（对端 FIN / 连接重置）：同样要摘掉，否则 fd 泄漏
                 conn.切断();
@@ -1082,10 +1078,7 @@ mod tests {
         let 地址 = 监听.local_addr().expect("addr");
         let 客户 = std::net::TcpStream::connect(地址).expect("connect");
         let (服务, _) = 监听.accept().expect("accept");
-        (
-            WebSocketConnection::from_upgraded_stream(服务, true),
-            客户,
-        )
+        (WebSocketConnection::from_upgraded_stream(服务, true), 客户)
     }
 
     /// 客户端方向的帧（带 mask，和浏览器一样）
@@ -1125,14 +1118,17 @@ mod tests {
         客户
             .write_all(&客户端帧(0x0, false, b"\"b\":2,"))
             .expect("写中片");
-        客户.write_all(&客户端帧(0x0, true, b"\"c\":3}")).expect("写尾片");
+        客户
+            .write_all(&客户端帧(0x0, true, b"\"c\":3}"))
+            .expect("写尾片");
 
         let mut 拼接 = Vec::new();
         let mut 拼接中 = false;
         let mut 出 = None;
         for _ in 0..3 {
             let frame = 服务.recv_frame().expect("收帧");
-            if let 帧结果::完整(text) = 处理一帧(&服务, 0, frame, &mut 拼接, &mut 拼接中) {
+            if let 帧结果::完整(text) = 处理一帧(&服务, 0, frame, &mut 拼接, &mut 拼接中)
+            {
                 出 = Some(text);
             }
         }
@@ -1144,16 +1140,21 @@ mod tests {
     fn 分片中间插ping不打断重组() {
         use std::io::Write;
         let (服务, mut 客户) = 造一对();
-        客户.write_all(&客户端帧(0x1, false, "前".as_bytes())).expect("首片");
+        客户
+            .write_all(&客户端帧(0x1, false, "前".as_bytes()))
+            .expect("首片");
         客户.write_all(&客户端帧(0x9, true, b"ping")).expect("ping");
-        客户.write_all(&客户端帧(0x0, true, "后".as_bytes())).expect("尾片");
+        客户
+            .write_all(&客户端帧(0x0, true, "后".as_bytes()))
+            .expect("尾片");
 
         let mut 拼接 = Vec::new();
         let mut 拼接中 = false;
         let mut 出 = None;
         for _ in 0..3 {
             let frame = 服务.recv_frame().expect("收帧");
-            if let 帧结果::完整(text) = 处理一帧(&服务, 0, frame, &mut 拼接, &mut 拼接中) {
+            if let 帧结果::完整(text) = 处理一帧(&服务, 0, frame, &mut 拼接, &mut 拼接中)
+            {
                 出 = Some(text);
             }
         }
