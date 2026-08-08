@@ -908,6 +908,61 @@ impl LLM会话 {
         Self::提取文本(&消息)
     }
 
+    /// 一次请求多个候选回答（OpenAI 的 `n` 参数），返回全部候选的 content 文本。
+    ///
+    /// Provider 差别与计费含义：
+    /// - openai 家族（默认分支）：请求体带 `"n": n`，服务端一次采样 n 个 choices，
+    ///   prompt tokens 只计一次、completion tokens 按候选累加 —— 最省钱的形态。
+    /// - anthropic / gemini 没有 n 语义：退化为**串行调 n 次**（各次独立采样）凑齐
+    ///   数组，计费等于 n 次完整请求（prompt tokens 也乘 n），耗时线性叠加。
+    ///
+    /// 只负责取候选，不写历史 —— 历史语义由 FFI 层统一处理（只第一个候选入历史）。
+    fn 调用多候选API(&mut self, 提示: &str, n: i64) -> Result<Vec<String>, String> {
+        let n = n.max(1);
+        match self.提供商.as_str() {
+            "anthropic" | "gemini" => {
+                // 无 n 语义的提供商：串行 n 次独立采样（每次各自过预算闸并记账）。
+                let mut 候选列表 = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    候选列表.push(self.调用API(提示)?);
+                }
+                Ok(候选列表)
+            }
+            _ => {
+                self.预算检查()?;
+                let mut 请求体 = self.构建请求体(提示, false, false);
+                请求体["n"] = json!(n);
+                let 响应体 = self.请求响应(请求体)?;
+
+                self.最近用量 = self.提取用量(&响应体);
+                self.预算记账();
+                Self::提取全部候选(&响应体)
+            }
+        }
+    }
+
+    /// 解析 OpenAI 响应的**全部** choices（对话多候选专用，不再只看 choices[0]）：
+    /// 每个 choice 取 message.content 文本；content 为 null（如纯 tool_calls）取空串。
+    fn 提取全部候选(响应体: &Value) -> Result<Vec<String>, String> {
+        let choices = 响应体
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| "响应格式错误：无法提取 choices".to_string())?;
+        if choices.is_empty() {
+            return Err("响应格式错误：choices 为空".to_string());
+        }
+        Ok(choices
+            .iter()
+            .map(|c| {
+                c.get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect())
+    }
+
     /// 多模态图像对话：文本 + 单图 URL。内部以 OpenAI 多模态 content 数组为规范表示，
     /// 各提供商在 构建请求体带内容 分支里翻译形状。返回 (规范 user content, 回答文本)，
     /// user content 交由调用方入历史（后续追问带上下文）。
@@ -1736,6 +1791,66 @@ pub extern "C" fn qi_llm_chat(session_handle: i64, prompt: *const c_char) -> *mu
                 }
             }
         }
+    }
+
+    转为C字符串指针("LLM调用失败: 无效会话句柄".to_string())
+}
+
+/// 一次请求多个候选回答（OpenAI 的 `n` 参数）
+///
+/// 参数:
+/// - session_handle: 会话句柄
+/// - prompt: 用户提示
+/// - n: 候选个数（< 1 按 1 处理）
+///
+/// 返回: JSON 数组文本，每个元素是一个候选的 content 字符串
+/// （需要调用 qi_llm_free_string 释放）；失败返回 "LLM调用失败: ..." 文本（非 JSON 数组）。
+///
+/// Provider 差别与计费含义：
+/// - openai 家族：请求体带 `"n": n`，一次请求服务端采样 n 个候选，
+///   prompt tokens 只计一次，completion tokens 按候选累加。
+/// - anthropic / gemini 没有 n 语义：退化为**串行调 n 次**（各次独立采样），
+///   计费等于 n 次完整请求（prompt tokens 也乘 n），耗时线性叠加。
+///
+/// 会话历史语义：多候选下历史只能走一条线 —— **只把第一个候选**作为 assistant
+/// 消息追加进历史（连同 user 提示），其余候选只作为返回值交给调用方；
+/// 否则历史就分叉了，后续对话无法确定接在哪个候选之后。
+#[no_mangle]
+pub extern "C" fn qi_llm_chat_choices(
+    session_handle: i64,
+    prompt: *const c_char,
+    n: i64,
+) -> *mut c_char {
+    if prompt.is_null() {
+        return 转为C字符串指针("LLM调用失败: 提示为空".to_string());
+    }
+
+    let mut 会话池 = 获取会话池().lock().unwrap();
+
+    if let Some(会话) = 会话池.get_mut(&session_handle) {
+        let 提示 = unsafe { CStr::from_ptr(prompt) }
+            .to_string_lossy()
+            .to_string();
+
+        return match 会话.调用多候选API(&提示, n) {
+            Ok(候选列表) => {
+                // 只把第一个候选进历史（见函数文档），其余候选仅作返回值。
+                会话.历史.push(json!({
+                    "role": "user",
+                    "content": 提示.clone()
+                }));
+                会话.历史.push(json!({
+                    "role": "assistant",
+                    "content": 候选列表[0].clone()
+                }));
+                会话.历史版本 += 1;
+
+                转为C字符串指针(
+                    serde_json::to_string(&候选列表).unwrap_or_else(|_| "[]".to_string()),
+                )
+            }
+            Err(错误) => 转为C字符串指针(format!("LLM调用失败: {}", 错误)),
+        };
     }
 
     转为C字符串指针("LLM调用失败: 无效会话句柄".to_string())
@@ -2957,6 +3072,37 @@ mod tests {
         format!("http://{}", 地址)
     }
 
+    /// QI_LLM_REPLAY 等磁带开关是进程级环境变量，并行测试间会互相污染：
+    /// 设/删开关的测试 与 真打 mock 网络的测试 必须共持这把锁串行化。
+    fn 环境锁() -> &'static Mutex<()> {
+        static 锁: OnceLock<Mutex<()>> = OnceLock::new();
+        锁.get_or_init(|| Mutex::new(()))
+    }
+
+    /// 非流式 JSON mock：一次性 HTTP 服务，回 application/json 响应体，
+    /// 并把收到的请求体 JSON 发回给测试断言（如 "n" 字段）。
+    fn 启动JSON服务(响应体: String) -> (String, std::sync::mpsc::Receiver<Value>) {
+        let 监听 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let 地址 = 监听.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut 连接, _) = 监听.accept().unwrap();
+            let mut 缓冲 = [0u8; 16384];
+            let 数量 = 连接.read(&mut 缓冲).unwrap_or(0);
+            let 请求 = String::from_utf8_lossy(&缓冲[..数量]);
+            let 请求体 = 请求.split("\r\n\r\n").nth(1).unwrap_or("{}");
+            let _ = tx.send(serde_json::from_str::<Value>(请求体).unwrap_or(json!({})));
+            let 响应 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                响应体.len(),
+                响应体
+            );
+            let _ = 连接.write_all(响应.as_bytes());
+            let _ = 连接.flush();
+        });
+        (format!("http://{}", 地址), rx)
+    }
+
     fn 启动悬挂SSE服务() -> String {
         let 监听 = TcpListener::bind("127.0.0.1:0").unwrap();
         let 地址 = 监听.local_addr().unwrap();
@@ -3363,6 +3509,60 @@ mod tests {
         assert_eq!(会话2.请求端点(), "https://example.com/v1/chat/completions");
     }
 
+    // ── 对话多候选（OpenAI n 参数） ──
+
+    #[test]
+    fn 多候选_解析全部choices() {
+        // mock 一个带 3 个 choices 的非流式响应，断言全部候选都被解析（不再只看 choices[0]）
+        let 响应 = json!({
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "候选一"}},
+                {"index": 1, "message": {"role": "assistant", "content": "候选二"}},
+                {"index": 2, "message": {"role": "assistant", "content": Value::Null}}
+            ]
+        });
+        let 候选 = LLM会话::提取全部候选(&响应).unwrap();
+        // null content → 空串
+        assert_eq!(候选, vec!["候选一", "候选二", ""]);
+        // 缺 choices / choices 为空 → Err（不 panic）
+        assert!(LLM会话::提取全部候选(&json!({})).is_err());
+        assert!(LLM会话::提取全部候选(&json!({"choices": []})).is_err());
+    }
+
+    #[test]
+    fn 多候选_FFI请求带n且历史只进第一个候选() {
+        let _守卫 = 环境锁().lock().unwrap();
+        let 响应 = json!({
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "床前明月光"}},
+                {"index": 1, "message": {"role": "assistant", "content": "举头望明月"}},
+                {"index": 2, "message": {"role": "assistant", "content": "低头思故乡"}}
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 9, "total_tokens": 14}
+        });
+        let (端点, rx) = 启动JSON服务(响应.to_string());
+        let 会话 = 创建测试会话(&端点);
+        let 提示 = CString::new("写一句诗").unwrap();
+
+        let 文本 = 取C字符串(qi_llm_chat_choices(会话, 提示.as_ptr(), 3));
+        let 数组: Value = serde_json::from_str(&文本).expect("返回值必须是 JSON 数组文本");
+        assert_eq!(数组, json!(["床前明月光", "举头望明月", "低头思故乡"]));
+
+        // 请求体必须带 "n": 3（openai 家族一次请求多候选）
+        let 请求体 = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(请求体["n"], json!(3));
+
+        // 历史只进第一个候选（user + assistant 各一条，不分叉）
+        assert_eq!(qi_llm_get_history_count(会话), 2);
+        let 历史: Value = serde_json::from_str(&取C字符串(qi_llm_get_history_json(会话))).unwrap();
+        assert_eq!(历史[0]["content"], json!("写一句诗"));
+        assert_eq!(历史[1]["content"], json!("床前明月光"));
+
+        // 用量照常记账（一次请求的 total）
+        assert_eq!(qi_llm_budget_used(会话), 14);
+        qi_llm_close_session(会话);
+    }
+
     // ── Anthropic Messages API ──
 
     #[test]
@@ -3600,6 +3800,8 @@ mod tests {
 
     #[test]
     fn 嵌入_磁带回放命中不打网络() {
+        // QI_LLM_REPLAY 是进程级开关，会误伤并行中真打 mock 网络的测试 —— 持环境锁串行化。
+        let _守卫 = 环境锁().lock().unwrap();
         // 磁带指向临时文件，避免污染工作目录；REPLAY 下命中即返回，绝不上网。
         let 临时 = std::env::temp_dir().join(format!(
             "qi_llm_embed_tape_test_{}.json",
