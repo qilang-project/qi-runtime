@@ -14,12 +14,16 @@ name = "qi_runtime"
 crate-type = ["staticlib", "rlib"]
 
 [features]
-default = ["runtime-rc-string"]
+default = ["runtime-rc-string", "db-postgres", "db-mysql"]
 runtime-rc-string = []
 # 桌面 GUI：把 qi-gui（tao/egui/winit/softbuffer 等）编进 libqi_runtime.a，
 # 并置 has_gui。默认关闭 —— 保持运行时轻量、可 zig 交叉编译（GUI 非交叉目标）。
 # 桌面构建 GUI 可用的运行时：cargo build --release --features gui
 gui = ["dep:qi-gui"]
+# 数据库后端：默认开。只连 SQLite 的场景可 --no-default-features 关掉，
+# 少编两棵网络驱动树、二进制也小一圈（见 qi-web/docs/多数据库设计.md 风险表）。
+db-postgres = ["dep:postgres", "dep:postgres-types"]
+db-mysql = ["dep:mysql"]
 
 [build-dependencies]
 cc = "1.0"
@@ -80,6 +84,13 @@ configparser = { version = "3.1", features = ["indexmap"] }
 flate2 = "1.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 log = "0.4.20"
+# PostgreSQL / MySQL：都选**同步**驱动。异步驱动（sqlx/tokio-postgres 裸用）会把
+# async 传染到每个 FFI 上（block_on + runtime 句柄），与现有阻塞式数据库 FFI 打架。
+postgres = { version = "0.19", optional = true }
+postgres-types = { version = "0.2", optional = true }
+# default-rust 而非 default：走 flate2 纯 Rust 后端、不引 native-tls/OpenSSL ——
+# 保住 zig 交叉编译到 Linux 的能力。
+mysql = { version = "28", default-features = false, features = ["default-rust"], optional = true }
 
 [dev-dependencies]
 # filesystem.rs 测试用（预先存在的缺口：tests 引用了 tempfile 但未声明）
