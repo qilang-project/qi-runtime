@@ -81,8 +81,12 @@ impl TLS客户流 {
 
     /// 阻塞读一批密文并解密，把明文追加进 出。返回追加了多少字节。
     ///
-    /// 超时 只作用在 socket 读上；返回 Ok(0) 表示这次没解出明文
-    /// （可能只收到了协议层记录，比如密钥更新），调用方该继续泵。
+    /// 超时 只作用在 socket 读上。
+    ///
+    /// **返回 Ok(0) 不代表「没数据」** —— 一条 TLS 记录可能跨多次 socket 读，
+    /// 只收到半条时解不出任何明文。调用方必须继续泵（在自己的截止时间内），
+    /// 把 Ok(0) 当成「超时/无数据」会让大帧永远读不出来：小帧一次读完记录
+    /// 所以看着正常，几十 KB 的帧必然中途「读断」。
     pub fn 泵(
         &self, 出: &mut Vec<u8>, 超时: Option<Duration>
     ) -> Result<usize, std::io::Error> {
@@ -105,14 +109,32 @@ impl TLS客户流 {
         };
 
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut 游标 = std::io::Cursor::new(&密文[..n]);
-        conn.read_tls(&mut 游标)?;
-        conn.process_new_packets()
-            .map_err(|e| std::io::Error::other(format!("TLS 解密失败: {e}")))?;
-
         let 原长 = 出.len();
-        // read_to_end 在没有明文时返回 0，不阻塞（数据已在内存里）
-        let _ = conn.reader().read_to_end(出);
+
+        // ⚠ read_tls **不保证吃完整个游标**：它有内部缓冲上限，一次只收下一部分，
+        // 返回值才是真正收下的字节数。喂一次就把 密文 丢掉的话，剩下的字节永远
+        // 消失、TLS 流从此错位 —— 小帧看不出来（一个 read 正好装得下），
+        // 大帧必炸。实测症状是 wss 上收得到小的文本帧、一遇到几十 KB 的音频帧
+        // 就「读断」，而同一个端点用别的客户端一切正常。
+        //
+        // 所以要循环喂，并且**每喂一轮就把明文排空** —— 不排空的话 rustls 的
+        // 缓冲一直是满的，read_tls 会一直收下 0 字节，死循环。
+        let mut 已喂 = 0usize;
+        while 已喂 < n {
+            let mut 游标 = std::io::Cursor::new(&密文[已喂..n]);
+            let 本轮 = conn.read_tls(&mut 游标)?;
+            if 本轮 == 0 {
+                // 缓冲满且排不空（对端还没发完一条完整记录）—— 留着下次再喂，
+                // 但这批剩下的字节已经读出 socket 了，只能先解出来再说
+                break;
+            }
+            已喂 += 本轮;
+            conn.process_new_packets()
+                .map_err(|e| std::io::Error::other(format!("TLS 解密失败: {e}")))?;
+            // read_to_end 在没有明文时返回 WouldBlock（数据已在内存里，不阻塞），
+            // 错误无所谓：已读到的字节 read_to_end 会保留在 出 里
+            let _ = conn.reader().read_to_end(出);
+        }
 
         // 解包可能让状态机想回话（告警、密钥更新），顺手吐出去
         while conn.wants_write() {

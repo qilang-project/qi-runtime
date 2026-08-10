@@ -215,28 +215,39 @@ impl WebSocketConnection {
                 return Ok(true);
             }
         }
-        // TLS：没有「探一个字节」这回事（最小单位是一条 TLS 记录），
-        // 直接带超时泵一次 —— 解出来的明文进 预读，帧边界一样不受影响。
+        // TLS：没有「探一个字节」这回事（最小单位是一条 TLS 记录），改成带截止时间泵。
+        //
+        // ⚠ **泵一次拿到 0 明文 ≠ 没数据**。一条 TLS 记录可能跨多次 socket 读，
+        // 只收到半条时解不出任何明文。这里必须接着泵到**真的超时**为止 ——
+        // 把第一次的 0 当成超时返回 false，上层 接收文本超时 就会返回空串，
+        // 调用方按「对端断了」处理。小帧一次读完记录看不出问题，几十 KB 的帧
+        // 必然中途「读断」：wss 上收得到小文本帧、一遇到音频帧就断，正是这个。
         if let 传输::加密(t) = &self.传输 {
-            let mut 明文: Vec<u8> = Vec::new();
-            let 超时 = Some(std::time::Duration::from_millis(毫秒.max(1)));
-            return match t.泵(&mut 明文, 超时) {
-                Ok(_) => {
-                    if 明文.is_empty() {
+            let 截止 = std::time::Instant::now() + std::time::Duration::from_millis(毫秒.max(1));
+            loop {
+                let 余 = 截止.saturating_duration_since(std::time::Instant::now());
+                if 余.is_zero() {
+                    return Ok(false);
+                }
+                let mut 明文: Vec<u8> = Vec::new();
+                match t.泵(&mut 明文, Some(余)) {
+                    Ok(_) => {
+                        if 明文.is_empty() {
+                            continue; // 只收到半条记录，还没到截止时间，接着等
+                        }
+                        let mut 剩 = self.预读.lock().unwrap_or_else(|e| e.into_inner());
+                        剩.extend_from_slice(&明文);
+                        return Ok(true);
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
                         return Ok(false);
                     }
-                    let mut 剩 = self.预读.lock().unwrap_or_else(|e| e.into_inner());
-                    剩.extend_from_slice(&明文);
-                    Ok(true)
+                    Err(e) => return Err(e),
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    Ok(false)
-                }
-                Err(e) => Err(e),
-            };
+            }
         }
         let 明文流 = match &self.传输 {
             传输::明文(s) => s,
