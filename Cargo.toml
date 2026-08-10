@@ -22,8 +22,8 @@ runtime-rc-string = []
 gui = ["dep:qi-gui"]
 # 数据库后端：默认开。只连 SQLite 的场景可 --no-default-features 关掉，
 # 少编两棵网络驱动树、二进制也小一圈（见 qi-web/docs/多数据库设计.md 风险表）。
-db-postgres = ["dep:postgres", "dep:postgres-types"]
-db-mysql = ["dep:mysql"]
+db-postgres = ["dep:postgres", "dep:postgres-types", "dep:r2d2"]
+db-mysql = ["dep:mysql", "dep:r2d2"]
 
 [build-dependencies]
 cc = "1.0"
@@ -91,6 +91,10 @@ postgres-types = { version = "0.2", optional = true }
 # default-rust 而非 default：走 flate2 纯 Rust 后端、不引 native-tls/OpenSSL ——
 # 保住 zig 交叉编译到 Linux 的能力。
 mysql = { version = "28", default-features = false, features = ["default-rust"], optional = true }
+# 连接池。只用 r2d2 核心（一个 ManageConnection 实现），不用 r2d2_postgres /
+# r2d2_mysql —— 我们池化的是统一后的 `后端` 枚举，用官方适配器反而要按后端
+# 切成两个类型不同的池。纯 Rust，不妨碍 zig 交叉编译。
+r2d2 = { version = "0.8", optional = true }
 
 [dev-dependencies]
 # filesystem.rs 测试用（预先存在的缺口：tests 引用了 tempfile 但未声明）
