@@ -12,6 +12,7 @@ pub mod interface;
 pub mod io_ffi;
 pub mod network_ffi;
 pub mod stdio;
+pub mod tls_client;
 pub mod tls_ffi;
 pub mod websocket_ffi;
 

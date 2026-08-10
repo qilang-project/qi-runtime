@@ -86,8 +86,45 @@ pub struct WebSocketFrame {
 ///   - recv 不加锁（只有本连接的循环在读），所以它 park 在 read 时不挡任何写；
 ///   - send 用 send_lock 串行化（防多个广播线程往同一连接写导致帧交错），
 ///     且 send_lock 与 recv 无关 → 广播 push 到正在 recv 的连接立即成功，无需心跳。
+/// 传输层：明文 TCP 或 TLS。
+///
+/// 明文那支保持原样（`&TcpStream` 收发互不阻塞），TLS 那支把并发纪律
+/// 挪进 tls_client（阻塞读不持状态机锁）—— 两支都满足
+/// 「recv 阻塞时可并发 send」，上层逻辑一行不用分情况。
+pub enum 传输 {
+    明文(TcpStream),
+    加密(Box<crate::io::tls_client::TLS客户流>),
+}
+
+impl 传输 {
+    /// 握手期用：写完整一段（此时还没有并发，两支都直写）
+    fn 握手写(&self, 数据: &[u8]) -> Result<(), std::io::Error> {
+        match self {
+            传输::明文(s) => {
+                let mut 写 = s;
+                写.write_all(数据)?;
+                写.flush()
+            }
+            传输::加密(t) => t.发送(数据),
+        }
+    }
+
+    /// 握手期用：阻塞读一批字节追加进 出，返回追加了多少
+    fn 握手读(&self, 出: &mut Vec<u8>) -> Result<usize, std::io::Error> {
+        match self {
+            传输::明文(s) => {
+                let mut 块 = [0u8; 1024];
+                let n = (&mut &*s).read(&mut 块)?;
+                出.extend_from_slice(&块[..n]);
+                Ok(n)
+            }
+            传输::加密(t) => t.泵(出, None),
+        }
+    }
+}
+
 pub struct WebSocketConnection {
-    stream: TcpStream,
+    传输: 传输,
     is_server: bool, // true = 服务器端, false = 客户端
     is_connected: std::sync::atomic::AtomicBool,
     send_lock: Mutex<()>,
@@ -112,8 +149,13 @@ impl WebSocketConnection {
         is_server: bool,
         pending: Vec<u8>,
     ) -> Self {
+        Self::从传输(传输::明文(stream), is_server, pending)
+    }
+
+    /// 通用构造：明文或 TLS 都走这儿
+    pub fn 从传输(传输值: 传输, is_server: bool, pending: Vec<u8>) -> Self {
         WebSocketConnection {
-            stream,
+            传输: 传输值,
             is_server,
             is_connected: std::sync::atomic::AtomicBool::new(true),
             send_lock: Mutex::new(()),
@@ -133,8 +175,27 @@ impl WebSocketConnection {
             }
         }
         if 已填 < buf.len() {
-            let mut 读 = &self.stream;
-            读.read_exact(&mut buf[已填..])?;
+            match &self.传输 {
+                传输::明文(s) => {
+                    let mut 读 = s;
+                    读.read_exact(&mut buf[已填..])?;
+                }
+                // TLS 收不到「正好 n 字节」这种粒度：解密是按记录来的，一次泵出
+                // 的明文可能多于也可能少于所需。多的存回 预读，少的接着泵。
+                传输::加密(t) => {
+                    let mut 明文: Vec<u8> = Vec::new();
+                    while 明文.len() < buf.len() - 已填 {
+                        t.泵(&mut 明文, None)?;
+                    }
+                    let 要的 = buf.len() - 已填;
+                    buf[已填..].copy_from_slice(&明文[..要的]);
+                    if 明文.len() > 要的 {
+                        let mut 剩 = self.预读.lock().unwrap_or_else(|e| e.into_inner());
+                        // 追加在**末尾**：预读里原有的字节比这批更早到
+                        剩.extend_from_slice(&明文[要的..]);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -154,11 +215,37 @@ impl WebSocketConnection {
                 return Ok(true);
             }
         }
-        self.stream
-            .set_read_timeout(Some(std::time::Duration::from_millis(毫秒.max(1))))?;
+        // TLS：没有「探一个字节」这回事（最小单位是一条 TLS 记录），
+        // 直接带超时泵一次 —— 解出来的明文进 预读，帧边界一样不受影响。
+        if let 传输::加密(t) = &self.传输 {
+            let mut 明文: Vec<u8> = Vec::new();
+            let 超时 = Some(std::time::Duration::from_millis(毫秒.max(1)));
+            return match t.泵(&mut 明文, 超时) {
+                Ok(_) => {
+                    if 明文.is_empty() {
+                        return Ok(false);
+                    }
+                    let mut 剩 = self.预读.lock().unwrap_or_else(|e| e.into_inner());
+                    剩.extend_from_slice(&明文);
+                    Ok(true)
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            };
+        }
+        let 明文流 = match &self.传输 {
+            传输::明文(s) => s,
+            传输::加密(_) => unreachable!("上面已提前返回"),
+        };
+        明文流.set_read_timeout(Some(std::time::Duration::from_millis(毫秒.max(1))))?;
         let mut 一字节 = [0u8; 1];
-        let 结果 = (&self.stream).read(&mut 一字节);
-        let _ = self.stream.set_read_timeout(None);
+        let 结果 = (&mut &*明文流).read(&mut 一字节);
+        let _ = 明文流.set_read_timeout(None);
         match 结果 {
             Ok(0) => Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -221,9 +308,14 @@ impl WebSocketConnection {
 
         // send_lock 只护「写」这一段，防并发广播帧交错；不挡 recv。
         let _发送守卫 = self.send_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut 写 = &self.stream;
-        写.write_all(&frame)?;
-        写.flush()?;
+        match &self.传输 {
+            传输::明文(s) => {
+                let mut 写 = s;
+                写.write_all(&frame)?;
+                写.flush()?;
+            }
+            传输::加密(t) => t.发送(&frame)?,
+        }
         Ok(())
     }
 
@@ -329,7 +421,13 @@ impl WebSocketConnection {
     /// 循环永远醒不过来，几个连接就把服务端占满。
     pub fn 切断(&self) {
         self.标记断开();
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        match &self.传输 {
+            传输::明文(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            // TLS 先发 close_notify 再断，让对端知道是正常收尾而不是被截断
+            传输::加密(t) => t.关闭(),
+        }
     }
 }
 
@@ -340,17 +438,10 @@ fn 找到空行(buf: &[u8]) -> Option<usize> {
 
 /// 生成随机 mask key
 fn rand_mask_key() -> [u8; 4] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    [
-        (seed >> 24) as u8,
-        (seed >> 16) as u8,
-        (seed >> 8) as u8,
-        seed as u8,
-    ]
+    use rand::RngCore;
+    let mut key = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut key);
+    key
 }
 
 /// 计算 WebSocket Accept Key (使用 SHA-1)
@@ -599,6 +690,22 @@ pub extern "C" fn qi_websocket_upgrade_connection(
 /// 返回 WebSocket 句柄 (>0 成功, <0 失败)
 #[no_mangle]
 pub extern "C" fn qi_websocket_connect(url: *const c_char) -> i64 {
+    连接内部(url, std::ptr::null())
+}
+
+/// 带自定义请求头连接（头是 JSON 对象：{"Authorization":"Bearer …"}）。
+///
+/// **实时语音、MCP over wss 这类端点全靠握手头鉴权** —— 浏览器设不了自定义头，
+/// 所以它们的官方前端方案是走后端中继；而我们就是那个后端，必须能设。
+#[no_mangle]
+pub extern "C" fn qi_websocket_connect_headers(
+    url: *const c_char,
+    headers_json: *const c_char,
+) -> i64 {
+    连接内部(url, headers_json)
+}
+
+fn 连接内部(url: *const c_char, headers_json: *const c_char) -> i64 {
     if url.is_null() {
         return -1;
     }
@@ -610,16 +717,55 @@ pub extern "C" fn qi_websocket_connect(url: *const c_char) -> i64 {
         Some(parsed) => parsed,
         None => return -2,
     };
+    let 要加密 = url_str.trim().starts_with("wss://");
 
     // 连接到服务器
     let addr = format!("{}:{}", host, port);
-    let mut stream = match TcpStream::connect(&addr) {
+    let stream = match TcpStream::connect(&addr) {
         Ok(s) => s,
         Err(_) => return -3,
     };
 
+    // wss:// 先把 TLS 谈好，之后 WebSocket 握手是在密文通道里跑的
+    let 传输值 = if 要加密 {
+        match crate::io::tls_client::TLS客户流::握手(stream, &host) {
+            Ok(t) => 传输::加密(Box::new(t)),
+            Err(_) => return -7,
+        }
+    } else {
+        传输::明文(stream)
+    };
+
     // 生成随机 key
     let key = generate_websocket_key();
+
+    // 额外头。Host/Upgrade/Connection/Sec-WebSocket-* 由我们自己写，
+    // 调用方给的同名头忽略掉 —— 让业务能覆盖握手语义只会带来难查的坏连接。
+    let mut 额外 = String::new();
+    if !headers_json.is_null() {
+        let 文本 = unsafe { CStr::from_ptr(headers_json).to_string_lossy() };
+        if let Ok(serde_json::Value::Object(表)) = serde_json::from_str(&文本) {
+            for (k, v) in 表 {
+                let 小写 = k.to_lowercase();
+                if 小写 == "host"
+                    || 小写 == "upgrade"
+                    || 小写 == "connection"
+                    || 小写.starts_with("sec-websocket-")
+                {
+                    continue;
+                }
+                // 头值里塞 \r\n 就能注入任意头，必须挡（HTTP 头注入）
+                let 值 = match v {
+                    serde_json::Value::String(s) => s,
+                    其它 => 其它.to_string(),
+                };
+                if k.contains(['\r', '\n']) || 值.contains(['\r', '\n']) {
+                    return -8;
+                }
+                额外.push_str(&format!("{}: {}\r\n", k, 值));
+            }
+        }
+    }
 
     // 发送升级请求
     let request = format!(
@@ -628,11 +774,11 @@ pub extern "C" fn qi_websocket_connect(url: *const c_char) -> i64 {
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {}\r\n\
-         Sec-WebSocket-Version: 13\r\n\r\n",
-        path, host, port, key
+         Sec-WebSocket-Version: 13\r\n{}\r\n",
+        path, host, port, key, 额外
     );
 
-    if stream.write_all(request.as_bytes()).is_err() {
+    if 传输值.握手写(request.as_bytes()).is_err() {
         return -4;
     }
 
@@ -645,13 +791,17 @@ pub extern "C" fn qi_websocket_connect(url: *const c_char) -> i64 {
     let mut 已收: Vec<u8> = Vec::with_capacity(1024);
     let 响应结尾;
     loop {
-        let mut 块 = [0u8; 1024];
-        let n = match stream.read(&mut 块) {
-            Ok(0) => return -5, // 对端在握手中途关了
-            Ok(n) => n,
+        match 传输值.握手读(&mut 已收) {
+            Ok(0) => {
+                // TLS 可能只收到协议层记录、还没解出明文，继续泵；
+                // 明文那支读到 0 就是对端在握手中途关了
+                if matches!(传输值, 传输::明文(_)) {
+                    return -5;
+                }
+            }
+            Ok(_) => {}
             Err(_) => return -5,
-        };
-        已收.extend_from_slice(&块[..n]);
+        }
         if let Some(pos) = 找到空行(&已收) {
             响应结尾 = pos;
             break;
@@ -672,7 +822,7 @@ pub extern "C" fn qi_websocket_connect(url: *const c_char) -> i64 {
     let 预读 = 已收[响应结尾..].to_vec();
 
     // 创建 WebSocket 连接
-    let ws_conn = WebSocketConnection::from_upgraded_stream_with_pending(stream, false, 预读);
+    let ws_conn = WebSocketConnection::从传输(传输值, false, 预读);
 
     let mut 句柄计数 = 获取WS句柄计数器().lock().unwrap();
     *句柄计数 += 1;
@@ -717,14 +867,15 @@ fn parse_websocket_url(url: &str) -> Option<(String, u16, String)> {
 }
 
 /// 生成 WebSocket 客户端 key
+/// 握手 key 必须是**真随机的 16 字节**（RFC 6455）。
+///
+/// 原来是从纳秒时间戳移位派生的：同一毫秒内连出去的两条连接 key 会撞，
+/// 而且严格的服务端/中间件会因为熵不足拒绝握手。掩码同理 —— 掩码可预测
+/// 就削弱了它防代理缓存投毒的本意。
 fn generate_websocket_key() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-
-    let bytes: Vec<u8> = (0..16).map(|i| ((seed >> (i * 4)) & 0xFF) as u8).collect();
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
     base64_encode(&bytes)
 }
 
