@@ -43,6 +43,7 @@ pub mod rc_obj;
 pub mod reflect_ffi;
 pub mod regex_ffi;
 pub mod signal_ffi;
+pub mod sql_dialect;
 pub mod string;
 pub mod string_ffi;
 pub mod subprocess_ffi;
