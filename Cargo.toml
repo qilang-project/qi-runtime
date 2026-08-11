@@ -14,7 +14,7 @@ name = "qi_runtime"
 crate-type = ["staticlib", "rlib"]
 
 [features]
-default = ["runtime-rc-string", "db-postgres", "db-mysql", "redis"]
+default = ["runtime-rc-string", "db-postgres", "db-mysql", "redis", "grpc"]
 runtime-rc-string = []
 # 桌面 GUI：把 qi-gui（tao/egui/winit/softbuffer 等）编进 libqi_runtime.a，
 # 并置 has_gui。默认关闭 —— 保持运行时轻量、可 zig 交叉编译（GUI 非交叉目标）。
@@ -27,6 +27,11 @@ db-mysql = ["dep:mysql", "dep:r2d2"]
 # Redis：默认开。跟 SQL 后端共用 r2d2 池。关掉它 标准库.Redis 的调用会
 # 在链接期报 undefined symbol —— 是刻意的，比运行时才发现「连不上」好。
 redis = ["dep:redis", "dep:r2d2"]
+# gRPC / protobuf：默认开。protox 在**运行时**编译 .proto（不依赖 protoc
+# 二进制），prost-reflect 提供 DynamicMessage 做 JSON ↔ protobuf 互转。
+# 选动态描述符而不是编译期代码生成：qi 没有 build.rs 那一环，而且这样
+# qi 侧继续只跟 JSON 打交道，跟数据库层「JSON 当细腰」是同一个选择。
+grpc = ["dep:protox", "dep:prost-reflect", "dep:prost", "dep:prost-types"]
 
 [build-dependencies]
 cc = "1.0"
@@ -99,6 +104,10 @@ mysql = { version = "28", default-features = false, features = ["default-rust"],
 # 切成两个类型不同的池。纯 Rust，不妨碍 zig 交叉编译。
 r2d2 = { version = "0.8", optional = true }
 redis = { version = "1.5.0", features = ["r2d2", "tls-rustls", "tls-rustls-webpki-roots"], optional = true }
+protox = { version = "0.9.1", optional = true }
+prost-reflect = { version = "0.16.5", features = ["serde"], optional = true }
+prost = { version = "0.14.4", optional = true }
+prost-types = { version = "0.14.4", optional = true }
 
 [dev-dependencies]
 # filesystem.rs 测试用（预先存在的缺口：tests 引用了 tempfile 但未声明）

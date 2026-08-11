@@ -5,6 +5,7 @@
 
 pub mod file;
 pub mod filesystem;
+pub mod grpc_ffi;
 pub mod h2_ffi;
 pub mod http;
 pub mod http_ffi;

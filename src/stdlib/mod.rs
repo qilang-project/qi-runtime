@@ -36,6 +36,8 @@ pub mod path_ffi;
 pub mod plugin_ffi;
 pub mod process_ffi;
 pub mod profiler;
+#[cfg(feature = "grpc")]
+pub mod protobuf_ffi;
 pub mod qi_str;
 pub mod qi_str_ffi;
 pub mod random_ffi;

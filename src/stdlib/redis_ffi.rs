@@ -27,8 +27,6 @@
 //! `最后错误`：拿不准的时候查它。这跟数据库层「-1 + 自己判」的做法
 //! 是同一个路子，只是多给了一句人话。
 
-#![allow(non_snake_case)]
-
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -43,91 +41,91 @@ use crate::stdlib::qi_str::rc_cstr_from_string;
 
 /// 连接句柄从 3_000_000 起，订阅句柄从 3_500_000 起 —— 跟邮箱(900_000)、
 /// tokio TCP(1_000_000)、监听器(2_000_000) 的段位错开，混用时一眼看得出是谁。
-static 连接计数器: AtomicI64 = AtomicI64::new(3_000_000);
-static 订阅计数器: AtomicI64 = AtomicI64::new(3_500_000);
+static NEXT_CONN_ID: AtomicI64 = AtomicI64::new(3_000_000);
+static NEXT_SUB_ID: AtomicI64 = AtomicI64::new(3_500_000);
 
-static 连接池表: OnceLock<Mutex<HashMap<i64, Arc<连接>>>> = OnceLock::new();
-static 订阅表: OnceLock<Mutex<HashMap<i64, Arc<订阅>>>> = OnceLock::new();
+static CONNS: OnceLock<Mutex<HashMap<i64, Arc<Conn>>>> = OnceLock::new();
+static SUBS: OnceLock<Mutex<HashMap<i64, Arc<Sub>>>> = OnceLock::new();
 
 /// 一条订阅最多攒多少条没被取走的消息。攒到这儿说明消费方卡住了。
-const 订阅队上限: usize = 4096;
+const SUB_QUEUE_LIMIT: usize = 4096;
 
-struct 连接 {
-    池: r2d2::Pool<redis::Client>,
-    最后错误: Mutex<String>,
+struct Conn {
+    pool: r2d2::Pool<redis::Client>,
+    last_error: Mutex<String>,
 }
 
 /// 一条订阅：读线程往队里塞，qi 侧从队里取。socket 只有读线程碰。
-struct 订阅 {
-    队: Mutex<VecDeque<(String, String)>>,
-    有货: Condvar,
-    要停: AtomicBool,
-    活着: AtomicBool,
+struct Sub {
+    queue: Mutex<VecDeque<(String, String)>>,
+    ready: Condvar,
+    stopping: AtomicBool,
+    alive: AtomicBool,
 }
 
-struct 池配置 {
-    最大连接数: u32,
-    获取超时: Duration,
+struct PoolConfig {
+    max_size: u32,
+    timeout: Duration,
 }
 
-impl Default for 池配置 {
+impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            最大连接数: 8,
-            获取超时: Duration::from_millis(5000),
+            max_size: 8,
+            timeout: Duration::from_millis(5000),
         }
     }
 }
 
-fn 取连接表() -> &'static Mutex<HashMap<i64, Arc<连接>>> {
-    连接池表.get_or_init(|| Mutex::new(HashMap::new()))
+fn conns() -> &'static Mutex<HashMap<i64, Arc<Conn>>> {
+    CONNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn 取订阅表() -> &'static Mutex<HashMap<i64, Arc<订阅>>> {
-    订阅表.get_or_init(|| Mutex::new(HashMap::new()))
+fn subs() -> &'static Mutex<HashMap<i64, Arc<Sub>>> {
+    SUBS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn 查连接(句柄: i64) -> Option<Arc<连接>> {
-    取连接表()
+fn find_conn(id: i64) -> Option<Arc<Conn>> {
+    conns()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&句柄)
+        .get(&id)
         .cloned()
 }
 
-fn 读C串(p: *const c_char) -> String {
+fn read_cstr(p: *const c_char) -> String {
     if p.is_null() {
         return String::new();
     }
     unsafe { CStr::from_ptr(p).to_string_lossy().to_string() }
 }
 
-fn 出串(s: String) -> *mut c_char {
+fn out_str(s: String) -> *mut c_char {
     rc_cstr_from_string(s)
 }
 
-fn 空串() -> *mut c_char {
-    出串(String::new())
+fn empty_str() -> *mut c_char {
+    out_str(String::new())
 }
 
-impl 连接 {
-    fn 记错(&self, 消息: impl Into<String>) {
-        *self.最后错误.lock().unwrap_or_else(|e| e.into_inner()) = 消息.into();
+impl Conn {
+    fn set_error(&self, message: impl Into<String>) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = message.into();
     }
 
-    fn 清错(&self) {
-        self.最后错误
+    fn clear_error(&self) {
+        self.last_error
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
     }
 
     /// 借一条连接干活。池子拿不到连接（全忙 / Redis 挂了）就记错返回 None。
-    fn 借用(&self) -> Option<r2d2::PooledConnection<redis::Client>> {
-        match self.池.get() {
+    fn borrow_conn(&self) -> Option<r2d2::PooledConnection<redis::Client>> {
+        match self.pool.get() {
             Ok(c) => Some(c),
             Err(e) => {
-                self.记错(format!("取连接失败: {}", e));
+                self.set_error(format!("取连接失败: {}", e));
                 None
             }
         }
@@ -137,37 +135,37 @@ impl 连接 {
 /// 池参数跟数据库层同一套写法：`redis://127.0.0.1:46379/0?pool_max=16`。
 /// `pool_` 前缀的参数在交给 redis crate **之前**摘掉 —— 它见到不认识的
 /// 查询参数会直接拒绝解析 URL。
-fn 拆池参数(连接串: &str) -> (String, 池配置) {
-    let mut 配置 = 池配置::default();
-    let Some((前段, 查询)) = 连接串.split_once('?') else {
-        return (连接串.to_string(), 配置);
+fn split_pool_params(conn_str: &str) -> (String, PoolConfig) {
+    let mut config = PoolConfig::default();
+    let Some((prefix, query)) = conn_str.split_once('?') else {
+        return (conn_str.to_string(), config);
     };
 
-    let mut 留给驱动: Vec<&str> = Vec::new();
-    for 一项 in 查询.split('&').filter(|一项| !一项.is_empty()) {
-        let (键, 值) = 一项.split_once('=').unwrap_or((一项, ""));
-        match 键 {
+    let mut for_driver: Vec<&str> = Vec::new();
+    for item in query.split('&').filter(|item| !item.is_empty()) {
+        let (key, value) = item.split_once('=').unwrap_or((item, ""));
+        match key {
             // 写错一个池参数不该让整个应用连不上库 —— 解析不出就用默认值
             "pool_max" => {
-                if let Ok(数) = 值.parse::<u32>() {
-                    配置.最大连接数 = 数.max(1);
+                if let Ok(n) = value.parse::<u32>() {
+                    config.max_size = n.max(1);
                 }
             }
             "pool_timeout_ms" => {
-                if let Ok(毫秒) = 值.parse::<u64>() {
-                    配置.获取超时 = Duration::from_millis(毫秒.max(1));
+                if let Ok(ms) = value.parse::<u64>() {
+                    config.timeout = Duration::from_millis(ms.max(1));
                 }
             }
-            _ => 留给驱动.push(一项),
+            _ => for_driver.push(item),
         }
     }
 
-    let 干净串 = if 留给驱动.is_empty() {
-        前段.to_string()
+    let clean = if for_driver.is_empty() {
+        prefix.to_string()
     } else {
-        format!("{}?{}", 前段, 留给驱动.join("&"))
+        format!("{}?{}", prefix, for_driver.join("&"))
     };
-    (干净串, 配置)
+    (clean, config)
 }
 
 // ── 连接 ────────────────────────────────────────────────────────
@@ -178,44 +176,44 @@ fn 拆池参数(连接串: &str) -> (String, 池配置) {
 /// 所以「Redis 没起来」在 连接() 这一步就报，而不是等第一次 取() 才炸。
 #[no_mangle]
 pub extern "C" fn qi_redis_connect(url: *const c_char) -> i64 {
-    let 原串 = 读C串(url);
-    if 原串.is_empty() {
+    let raw = read_cstr(url);
+    if raw.is_empty() {
         return -1;
     }
-    let (干净串, 配置) = 拆池参数(&原串);
+    let (clean, config) = split_pool_params(&raw);
 
-    let 客户端 = match redis::Client::open(干净串.as_str()) {
+    let client = match redis::Client::open(clean.as_str()) {
         Ok(c) => c,
         Err(_) => return -1,
     };
-    let 池 = match r2d2::Pool::builder()
-        .max_size(配置.最大连接数)
+    let pool = match r2d2::Pool::builder()
+        .max_size(config.max_size)
         .min_idle(Some(1))
-        .connection_timeout(配置.获取超时)
-        .build(客户端)
+        .connection_timeout(config.timeout)
+        .build(client)
     {
         Ok(p) => p,
         Err(_) => return -1,
     };
 
-    let 句柄 = 连接计数器.fetch_add(1, Ordering::SeqCst);
-    取连接表().lock().unwrap_or_else(|e| e.into_inner()).insert(
-        句柄,
-        Arc::new(连接 {
-            池,
-            最后错误: Mutex::new(String::new()),
+    let id = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
+    conns().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        id,
+        Arc::new(Conn {
+            pool,
+            last_error: Mutex::new(String::new()),
         }),
     );
-    句柄
+    id
 }
 
 /// 关闭：把句柄从表里摘掉，池随最后一个使用者析构。
 #[no_mangle]
-pub extern "C" fn qi_redis_close(句柄: i64) -> i64 {
-    match 取连接表()
+pub extern "C" fn qi_redis_close(id: i64) -> i64 {
+    match conns()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(&句柄)
+        .remove(&id)
     {
         Some(_) => 0,
         None => -1,
@@ -224,24 +222,24 @@ pub extern "C" fn qi_redis_close(句柄: i64) -> i64 {
 
 /// PING。通返回 1，不通返回 0。
 #[no_mangle]
-pub extern "C" fn qi_redis_ping(句柄: i64) -> i64 {
-    let Some(连) = 查连接(句柄) else {
+pub extern "C" fn qi_redis_ping(id: i64) -> i64 {
+    let Some(conn) = find_conn(id) else {
         return 0;
     };
-    let Some(mut c) = 连.借用() else {
+    let Some(mut c) = conn.borrow_conn() else {
         return 0;
     };
     match redis::cmd("PING").query::<String>(&mut *c) {
-        Ok(回) if 回 == "PONG" => {
-            连.清错();
+        Ok(resp) if resp == "PONG" => {
+            conn.clear_error();
             1
         }
-        Ok(回) => {
-            连.记错(format!("PING 回了 {}", 回));
+        Ok(resp) => {
+            conn.set_error(format!("PING 回了 {}", resp));
             0
         }
         Err(e) => {
-            连.记错(e.to_string());
+            conn.set_error(e.to_string());
             0
         }
     }
@@ -249,16 +247,16 @@ pub extern "C" fn qi_redis_ping(句柄: i64) -> i64 {
 
 /// 最近一次失败的说明。没有错误时返回空串。
 #[no_mangle]
-pub extern "C" fn qi_redis_last_error(句柄: i64) -> *mut c_char {
-    let Some(连) = 查连接(句柄) else {
-        return 出串("句柄无效".to_string());
+pub extern "C" fn qi_redis_last_error(id: i64) -> *mut c_char {
+    let Some(conn) = find_conn(id) else {
+        return out_str("句柄无效".to_string());
     };
-    let 错 = 连
-        .最后错误
+    let err_text = conn
+        .last_error
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    出串(错)
+    out_str(err_text)
 }
 
 // ── 内部：把一次命令的结果收成 i64 / String ──────────────────────
@@ -266,23 +264,23 @@ pub extern "C" fn qi_redis_last_error(句柄: i64) -> *mut c_char {
 // 每个 FFI 都要「查句柄 → 借连接 → 跑命令 → 记错」这四步，抽出来免得
 // 二十几个函数各写一遍（写多了必然有一处忘了记错）。
 
-fn 做整数<F>(句柄: i64, 干: F) -> i64
+fn do_int<F>(id: i64, work: F) -> i64
 where
     F: FnOnce(&mut redis::Connection) -> redis::RedisResult<i64>,
 {
-    let Some(连) = 查连接(句柄) else {
+    let Some(conn) = find_conn(id) else {
         return -1;
     };
-    let Some(mut c) = 连.借用() else {
+    let Some(mut c) = conn.borrow_conn() else {
         return -1;
     };
-    match 干(&mut c) {
+    match work(&mut c) {
         Ok(v) => {
-            连.清错();
+            conn.clear_error();
             v
         }
         Err(e) => {
-            连.记错(e.to_string());
+            conn.set_error(e.to_string());
             -1
         }
     }
@@ -290,56 +288,56 @@ where
 
 /// 字符串类结果。键不存在返回空串（**不算错**，最后错误会被清掉），
 /// 值不是合法 UTF-8 也返回空串但记错 —— 两者靠 最后错误 区分。
-fn 做可选串<F>(句柄: i64, 干: F) -> *mut c_char
+fn do_opt_str<F>(id: i64, work: F) -> *mut c_char
 where
     F: FnOnce(&mut redis::Connection) -> redis::RedisResult<Option<Vec<u8>>>,
 {
-    let Some(连) = 查连接(句柄) else {
-        return 空串();
+    let Some(conn) = find_conn(id) else {
+        return empty_str();
     };
-    let Some(mut c) = 连.借用() else {
-        return 空串();
+    let Some(mut c) = conn.borrow_conn() else {
+        return empty_str();
     };
-    match 干(&mut c) {
+    match work(&mut c) {
         Ok(None) => {
-            连.清错();
-            空串()
+            conn.clear_error();
+            empty_str()
         }
-        Ok(Some(字节)) => match String::from_utf8(字节) {
+        Ok(Some(raw_bytes)) => match String::from_utf8(raw_bytes) {
             Ok(s) => {
-                连.清错();
-                出串(s)
+                conn.clear_error();
+                out_str(s)
             }
             Err(_) => {
-                连.记错("值不是合法 UTF-8（要存二进制请先自己 base64）");
-                空串()
+                conn.set_error("值不是合法 UTF-8（要存二进制请先自己 base64）");
+                empty_str()
             }
         },
         Err(e) => {
-            连.记错(e.to_string());
-            空串()
+            conn.set_error(e.to_string());
+            empty_str()
         }
     }
 }
 
-fn 做JSON<F>(句柄: i64, 干: F) -> *mut c_char
+fn do_json<F>(id: i64, work: F) -> *mut c_char
 where
     F: FnOnce(&mut redis::Connection) -> redis::RedisResult<JsonValue>,
 {
-    let Some(连) = 查连接(句柄) else {
-        return 出串("[]".to_string());
+    let Some(conn) = find_conn(id) else {
+        return out_str("[]".to_string());
     };
-    let Some(mut c) = 连.借用() else {
-        return 出串("[]".to_string());
+    let Some(mut c) = conn.borrow_conn() else {
+        return out_str("[]".to_string());
     };
-    match 干(&mut c) {
+    match work(&mut c) {
         Ok(v) => {
-            连.清错();
-            出串(v.to_string())
+            conn.clear_error();
+            out_str(v.to_string())
         }
         Err(e) => {
-            连.记错(e.to_string());
-            出串("[]".to_string())
+            conn.set_error(e.to_string());
+            out_str("[]".to_string())
         }
     }
 }
@@ -348,23 +346,26 @@ where
 
 /// SET。成功 1，失败 -1。
 #[no_mangle]
-pub extern "C" fn qi_redis_set(句柄: i64, 键: *const c_char, 值: *const c_char) -> i64 {
-    let (k, v) = (读C串(键), 读C串(值));
-    做整数(句柄, |c| c.set::<_, _, ()>(&k, &v).map(|_| 1))
+pub extern "C" fn qi_redis_set(id: i64, key: *const c_char, value: *const c_char) -> i64 {
+    let (k, v) = (read_cstr(key), read_cstr(value));
+    do_int(id, |c| c.set::<_, _, ()>(&k, &v).map(|_| 1))
 }
 
 /// SET + 过期秒数（SETEX）。会话、验证码这类东西该用这个，
 /// 而不是 设() 完再 设过期() —— 那中间断一下就留下一个永不过期的键。
 #[no_mangle]
 pub extern "C" fn qi_redis_set_ex(
-    句柄: i64, 键: *const c_char, 值: *const c_char, 秒: i64
+    id: i64,
+    key: *const c_char,
+    value: *const c_char,
+    secs: i64,
 ) -> i64 {
-    let (k, v) = (读C串(键), 读C串(值));
-    if 秒 <= 0 {
+    let (k, v) = (read_cstr(key), read_cstr(value));
+    if secs <= 0 {
         return -1;
     }
-    做整数(句柄, move |c| {
-        c.set_ex::<_, _, ()>(&k, &v, 秒 as u64).map(|_| 1)
+    do_int(id, move |c| {
+        c.set_ex::<_, _, ()>(&k, &v, secs as u64).map(|_| 1)
     })
 }
 
@@ -372,159 +373,164 @@ pub extern "C" fn qi_redis_set_ex(
 /// 这是分布式锁 / 「同一本书只让一个进程做」那类事情的基本件。
 #[no_mangle]
 pub extern "C" fn qi_redis_set_nx(
-    句柄: i64, 键: *const c_char, 值: *const c_char, 秒: i64
+    id: i64,
+    key: *const c_char,
+    value: *const c_char,
+    secs: i64,
 ) -> i64 {
-    let (k, v) = (读C串(键), 读C串(值));
-    做整数(句柄, move |c| {
-        let mut 命令 = redis::cmd("SET");
-        命令.arg(&k).arg(&v).arg("NX");
-        if 秒 > 0 {
-            命令.arg("EX").arg(秒);
+    let (k, v) = (read_cstr(key), read_cstr(value));
+    do_int(id, move |c| {
+        let mut cmd = redis::cmd("SET");
+        cmd.arg(&k).arg(&v).arg("NX");
+        if secs > 0 {
+            cmd.arg("EX").arg(secs);
         }
         // 没抢到时 Redis 回 nil，收成 Option
-        命令
-            .query::<Option<String>>(c)
-            .map(|回| if 回.is_some() { 1 } else { 0 })
+        cmd.query::<Option<String>>(c)
+            .map(|resp| if resp.is_some() { 1 } else { 0 })
     })
 }
 
 /// GET。键不存在返回空串 —— 要区分「不存在」和「存的就是空串」用 存在()。
 #[no_mangle]
-pub extern "C" fn qi_redis_get(句柄: i64, 键: *const c_char) -> *mut c_char {
-    let k = 读C串(键);
-    做可选串(句柄, |c| c.get::<_, Option<Vec<u8>>>(&k))
+pub extern "C" fn qi_redis_get(id: i64, key: *const c_char) -> *mut c_char {
+    let k = read_cstr(key);
+    do_opt_str(id, |c| c.get::<_, Option<Vec<u8>>>(&k))
 }
 
 /// DEL，返回真删掉几个。
 #[no_mangle]
-pub extern "C" fn qi_redis_del(句柄: i64, 键: *const c_char) -> i64 {
-    let k = 读C串(键);
-    做整数(句柄, |c| c.del::<_, i64>(&k))
+pub extern "C" fn qi_redis_del(id: i64, key: *const c_char) -> i64 {
+    let k = read_cstr(key);
+    do_int(id, |c| c.del::<_, i64>(&k))
 }
 
 /// EXISTS，1/0。
 #[no_mangle]
-pub extern "C" fn qi_redis_exists(句柄: i64, 键: *const c_char) -> i64 {
-    let k = 读C串(键);
-    做整数(句柄, |c| {
-        c.exists::<_, bool>(&k).map(|有| if 有 { 1 } else { 0 })
+pub extern "C" fn qi_redis_exists(id: i64, key: *const c_char) -> i64 {
+    let k = read_cstr(key);
+    do_int(id, |c| {
+        c.exists::<_, bool>(&k)
+            .map(|exists| if exists { 1 } else { 0 })
     })
 }
 
 /// INCR，返回自增后的新值。**新值本身可能是负数**，所以别拿 -1 当失败判据，
 /// 拿不准查 最后错误()。
 #[no_mangle]
-pub extern "C" fn qi_redis_incr(句柄: i64, 键: *const c_char) -> i64 {
-    let k = 读C串(键);
-    做整数(句柄, |c| c.incr::<_, i64, i64>(&k, 1))
+pub extern "C" fn qi_redis_incr(id: i64, key: *const c_char) -> i64 {
+    let k = read_cstr(key);
+    do_int(id, |c| c.incr::<_, i64, i64>(&k, 1))
 }
 
 /// INCRBY（增量可负，就是 DECRBY）。
 #[no_mangle]
-pub extern "C" fn qi_redis_incr_by(句柄: i64, 键: *const c_char, 增量: i64) -> i64 {
-    let k = 读C串(键);
-    做整数(句柄, move |c| c.incr::<_, i64, i64>(&k, 增量))
+pub extern "C" fn qi_redis_incr_by(id: i64, key: *const c_char, delta: i64) -> i64 {
+    let k = read_cstr(key);
+    do_int(id, move |c| c.incr::<_, i64, i64>(&k, delta))
 }
 
 /// EXPIRE。设上了返回 1，键不存在返回 0。
 #[no_mangle]
-pub extern "C" fn qi_redis_expire(句柄: i64, 键: *const c_char, 秒: i64) -> i64 {
-    let k = 读C串(键);
-    做整数(句柄, move |c| {
-        c.expire::<_, bool>(&k, 秒).map(|成| if 成 { 1 } else { 0 })
+pub extern "C" fn qi_redis_expire(id: i64, key: *const c_char, secs: i64) -> i64 {
+    let k = read_cstr(key);
+    do_int(id, move |c| {
+        c.expire::<_, bool>(&k, secs)
+            .map(|ok| if ok { 1 } else { 0 })
     })
 }
 
 /// TTL：剩余秒数；-1 没设过期；-2 键不存在。
 #[no_mangle]
-pub extern "C" fn qi_redis_ttl(句柄: i64, 键: *const c_char) -> i64 {
-    let k = 读C串(键);
-    做整数(句柄, |c| c.ttl::<_, i64>(&k))
+pub extern "C" fn qi_redis_ttl(id: i64, key: *const c_char) -> i64 {
+    let k = read_cstr(key);
+    do_int(id, |c| c.ttl::<_, i64>(&k))
 }
 
 // ── 哈希 ────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn qi_redis_hset(
-    句柄: i64,
-    键: *const c_char,
-    字段: *const c_char,
-    值: *const c_char,
+    id: i64,
+    key: *const c_char,
+    field: *const c_char,
+    value: *const c_char,
 ) -> i64 {
-    let (k, f, v) = (读C串(键), 读C串(字段), 读C串(值));
-    做整数(句柄, |c| c.hset::<_, _, _, ()>(&k, &f, &v).map(|_| 1))
+    let (k, f, v) = (read_cstr(key), read_cstr(field), read_cstr(value));
+    do_int(id, |c| c.hset::<_, _, _, ()>(&k, &f, &v).map(|_| 1))
 }
 
 #[no_mangle]
-pub extern "C" fn qi_redis_hget(
-    句柄: i64, 键: *const c_char, 字段: *const c_char
-) -> *mut c_char {
-    let (k, f) = (读C串(键), 读C串(字段));
-    做可选串(句柄, |c| c.hget::<_, _, Option<Vec<u8>>>(&k, &f))
+pub extern "C" fn qi_redis_hget(id: i64, key: *const c_char, field: *const c_char) -> *mut c_char {
+    let (k, f) = (read_cstr(key), read_cstr(field));
+    do_opt_str(id, |c| c.hget::<_, _, Option<Vec<u8>>>(&k, &f))
 }
 
 /// HGETALL → JSON 对象。字段/值非 UTF-8 的那几项会被跳过（不是整条失败）。
 #[no_mangle]
-pub extern "C" fn qi_redis_hgetall(句柄: i64, 键: *const c_char) -> *mut c_char {
-    let k = 读C串(键);
-    做JSON(句柄, |c| {
-        let 表: HashMap<String, String> = c.hgetall(&k)?;
-        let mut 出 = JsonMap::new();
-        for (字段, 值) in 表 {
-            出.insert(字段, JsonValue::String(值));
+pub extern "C" fn qi_redis_hgetall(id: i64, key: *const c_char) -> *mut c_char {
+    let k = read_cstr(key);
+    do_json(id, |c| {
+        let table: HashMap<String, String> = c.hgetall(&k)?;
+        let mut out = JsonMap::new();
+        for (field, value) in table {
+            out.insert(field, JsonValue::String(value));
         }
-        Ok(JsonValue::Object(出))
+        Ok(JsonValue::Object(out))
     })
 }
 
 #[no_mangle]
-pub extern "C" fn qi_redis_hdel(句柄: i64, 键: *const c_char, 字段: *const c_char) -> i64 {
-    let (k, f) = (读C串(键), 读C串(字段));
-    做整数(句柄, |c| c.hdel::<_, _, i64>(&k, &f))
+pub extern "C" fn qi_redis_hdel(id: i64, key: *const c_char, field: *const c_char) -> i64 {
+    let (k, f) = (read_cstr(key), read_cstr(field));
+    do_int(id, |c| c.hdel::<_, _, i64>(&k, &f))
 }
 
 // ── 列表 ────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn qi_redis_lpush(句柄: i64, 键: *const c_char, 值: *const c_char) -> i64 {
-    let (k, v) = (读C串(键), 读C串(值));
-    做整数(句柄, |c| c.lpush::<_, _, i64>(&k, &v))
+pub extern "C" fn qi_redis_lpush(id: i64, key: *const c_char, value: *const c_char) -> i64 {
+    let (k, v) = (read_cstr(key), read_cstr(value));
+    do_int(id, |c| c.lpush::<_, _, i64>(&k, &v))
 }
 
 #[no_mangle]
-pub extern "C" fn qi_redis_rpush(句柄: i64, 键: *const c_char, 值: *const c_char) -> i64 {
-    let (k, v) = (读C串(键), 读C串(值));
-    做整数(句柄, |c| c.rpush::<_, _, i64>(&k, &v))
+pub extern "C" fn qi_redis_rpush(id: i64, key: *const c_char, value: *const c_char) -> i64 {
+    let (k, v) = (read_cstr(key), read_cstr(value));
+    do_int(id, |c| c.rpush::<_, _, i64>(&k, &v))
 }
 
 #[no_mangle]
-pub extern "C" fn qi_redis_lpop(句柄: i64, 键: *const c_char) -> *mut c_char {
-    let k = 读C串(键);
-    做可选串(句柄, |c| c.lpop::<_, Option<Vec<u8>>>(&k, None))
+pub extern "C" fn qi_redis_lpop(id: i64, key: *const c_char) -> *mut c_char {
+    let k = read_cstr(key);
+    do_opt_str(id, |c| c.lpop::<_, Option<Vec<u8>>>(&k, None))
 }
 
 #[no_mangle]
-pub extern "C" fn qi_redis_rpop(句柄: i64, 键: *const c_char) -> *mut c_char {
-    let k = 读C串(键);
-    做可选串(句柄, |c| c.rpop::<_, Option<Vec<u8>>>(&k, None))
+pub extern "C" fn qi_redis_rpop(id: i64, key: *const c_char) -> *mut c_char {
+    let k = read_cstr(key);
+    do_opt_str(id, |c| c.rpop::<_, Option<Vec<u8>>>(&k, None))
 }
 
 #[no_mangle]
-pub extern "C" fn qi_redis_llen(句柄: i64, 键: *const c_char) -> i64 {
-    let k = 读C串(键);
-    做整数(句柄, |c| c.llen::<_, i64>(&k))
+pub extern "C" fn qi_redis_llen(id: i64, key: *const c_char) -> i64 {
+    let k = read_cstr(key);
+    do_int(id, |c| c.llen::<_, i64>(&k))
 }
 
 /// LRANGE → JSON 数组。止 = -1 表示到末尾。
 #[no_mangle]
 pub extern "C" fn qi_redis_lrange(
-    句柄: i64, 键: *const c_char, 起: i64, 止: i64
+    id: i64,
+    key: *const c_char,
+    start: i64,
+    stop: i64,
 ) -> *mut c_char {
-    let k = 读C串(键);
-    做JSON(句柄, move |c| {
-        let 项: Vec<String> = c.lrange(&k, 起 as isize, 止 as isize)?;
+    let k = read_cstr(key);
+    do_json(id, move |c| {
+        let items: Vec<String> = c.lrange(&k, start as isize, stop as isize)?;
         Ok(JsonValue::Array(
-            项.into_iter().map(JsonValue::String).collect(),
+            items.into_iter().map(JsonValue::String).collect(),
         ))
     })
 }
@@ -532,35 +538,33 @@ pub extern "C" fn qi_redis_lrange(
 // ── 集合 ────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn qi_redis_sadd(句柄: i64, 键: *const c_char, 成员: *const c_char) -> i64 {
-    let (k, m) = (读C串(键), 读C串(成员));
-    做整数(句柄, |c| c.sadd::<_, _, i64>(&k, &m))
+pub extern "C" fn qi_redis_sadd(id: i64, key: *const c_char, member: *const c_char) -> i64 {
+    let (k, m) = (read_cstr(key), read_cstr(member));
+    do_int(id, |c| c.sadd::<_, _, i64>(&k, &m))
 }
 
 #[no_mangle]
-pub extern "C" fn qi_redis_srem(句柄: i64, 键: *const c_char, 成员: *const c_char) -> i64 {
-    let (k, m) = (读C串(键), 读C串(成员));
-    做整数(句柄, |c| c.srem::<_, _, i64>(&k, &m))
+pub extern "C" fn qi_redis_srem(id: i64, key: *const c_char, member: *const c_char) -> i64 {
+    let (k, m) = (read_cstr(key), read_cstr(member));
+    do_int(id, |c| c.srem::<_, _, i64>(&k, &m))
 }
 
 #[no_mangle]
-pub extern "C" fn qi_redis_sismember(
-    句柄: i64, 键: *const c_char, 成员: *const c_char
-) -> i64 {
-    let (k, m) = (读C串(键), 读C串(成员));
-    做整数(句柄, |c| {
+pub extern "C" fn qi_redis_sismember(id: i64, key: *const c_char, member: *const c_char) -> i64 {
+    let (k, m) = (read_cstr(key), read_cstr(member));
+    do_int(id, |c| {
         c.sismember::<_, _, bool>(&k, &m)
-            .map(|有| if 有 { 1 } else { 0 })
+            .map(|exists| if exists { 1 } else { 0 })
     })
 }
 
 #[no_mangle]
-pub extern "C" fn qi_redis_smembers(句柄: i64, 键: *const c_char) -> *mut c_char {
-    let k = 读C串(键);
-    做JSON(句柄, |c| {
-        let 成员: Vec<String> = c.smembers(&k)?;
+pub extern "C" fn qi_redis_smembers(id: i64, key: *const c_char) -> *mut c_char {
+    let k = read_cstr(key);
+    do_json(id, |c| {
+        let member: Vec<String> = c.smembers(&k)?;
         Ok(JsonValue::Array(
-            成员.into_iter().map(JsonValue::String).collect(),
+            member.into_iter().map(JsonValue::String).collect(),
         ))
     })
 }
@@ -573,29 +577,29 @@ pub extern "C" fn qi_redis_smembers(句柄: i64, 键: *const c_char) -> *mut c_c
 /// 单线程的 Redis 会被它卡住整整几百毫秒，把整个应用一起拖下水。
 /// `上限` 是给自己的刹车，扫够了就停（<=0 时按 1000 算）。
 #[no_mangle]
-pub extern "C" fn qi_redis_scan(句柄: i64, 模式: *const c_char, 上限: i64) -> *mut c_char {
-    let p = 读C串(模式);
-    let 顶 = if 上限 <= 0 { 1000 } else { 上限 as usize };
-    做JSON(句柄, move |c| {
-        let mut 游标: u64 = 0;
-        let mut 出: Vec<JsonValue> = Vec::new();
+pub extern "C" fn qi_redis_scan(id: i64, pattern: *const c_char, limit: i64) -> *mut c_char {
+    let p = read_cstr(pattern);
+    let cap = if limit <= 0 { 1000 } else { limit as usize };
+    do_json(id, move |c| {
+        let mut cursor: u64 = 0;
+        let mut out: Vec<JsonValue> = Vec::new();
         loop {
-            let (下一个, 这批): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(游标)
+            let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
                 .arg("MATCH")
                 .arg(&p)
                 .arg("COUNT")
                 .arg(200)
                 .query(c)?;
-            for 键 in 这批 {
-                if 出.len() >= 顶 {
-                    return Ok(JsonValue::Array(出));
+            for key in batch {
+                if out.len() >= cap {
+                    return Ok(JsonValue::Array(out));
                 }
-                出.push(JsonValue::String(键));
+                out.push(JsonValue::String(key));
             }
-            游标 = 下一个;
-            if 游标 == 0 {
-                return Ok(JsonValue::Array(出));
+            cursor = next_cursor;
+            if cursor == 0 {
+                return Ok(JsonValue::Array(out));
             }
         }
     })
@@ -605,11 +609,9 @@ pub extern "C" fn qi_redis_scan(句柄: i64, 模式: *const c_char, 上限: i64)
 
 /// PUBLISH，返回收到的订阅者数（0 表示当下没人听着，不是错）。
 #[no_mangle]
-pub extern "C" fn qi_redis_publish(
-    句柄: i64, 频道: *const c_char, 消息: *const c_char
-) -> i64 {
-    let (ch, msg) = (读C串(频道), 读C串(消息));
-    做整数(句柄, |c| c.publish::<_, _, i64>(&ch, &msg))
+pub extern "C" fn qi_redis_publish(id: i64, channels: *const c_char, msg: *const c_char) -> i64 {
+    let (ch, msg) = (read_cstr(channels), read_cstr(msg));
+    do_int(id, |c| c.publish::<_, _, i64>(&ch, &msg))
 }
 
 /// 订阅一批频道，返回订阅句柄；失败 -1。
@@ -634,44 +636,44 @@ pub extern "C" fn qi_redis_publish(
 ///
 /// 频道用逗号分隔：`"房间:1,房间:2"`。
 #[no_mangle]
-pub extern "C" fn qi_redis_subscribe(url: *const c_char, 频道表: *const c_char) -> i64 {
-    let 原串 = 读C串(url);
-    let 频道串 = 读C串(频道表);
-    if 原串.is_empty() || 频道串.is_empty() {
+pub extern "C" fn qi_redis_subscribe(url: *const c_char, channel_list: *const c_char) -> i64 {
+    let raw = read_cstr(url);
+    let channels_text = read_cstr(channel_list);
+    if raw.is_empty() || channels_text.is_empty() {
         return -1;
     }
-    let (干净串, _) = 拆池参数(&原串);
-    let 频道: Vec<String> = 频道串
+    let (clean, _) = split_pool_params(&raw);
+    let channels: Vec<String> = channels_text
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if 频道.is_empty() {
+    if channels.is_empty() {
         return -1;
     }
 
-    let 状态 = Arc::new(订阅 {
-        队: Mutex::new(VecDeque::new()),
-        有货: Condvar::new(),
-        要停: AtomicBool::new(false),
-        活着: AtomicBool::new(false),
+    let state = Arc::new(Sub {
+        queue: Mutex::new(VecDeque::new()),
+        ready: Condvar::new(),
+        stopping: AtomicBool::new(false),
+        alive: AtomicBool::new(false),
     });
-    let 给线程 = 状态.clone();
+    let for_thread = state.clone();
     // 连不上要返回 -1，所以在这儿等线程把「订上了没有」回话
-    let (回信, 等回信) = std::sync::mpsc::channel::<bool>();
-    std::thread::spawn(move || 订阅线程(干净串, 频道, 给线程, 回信));
+    let (reply, wait_reply) = std::sync::mpsc::channel::<bool>();
+    std::thread::spawn(move || sub_thread(clean, channels, for_thread, reply));
 
-    match 等回信.recv_timeout(Duration::from_secs(10)) {
+    match wait_reply.recv_timeout(Duration::from_secs(10)) {
         Ok(true) => {}
         _ => return -1,
     }
 
-    let 句柄 = 订阅计数器.fetch_add(1, Ordering::SeqCst);
-    取订阅表()
+    let id = NEXT_SUB_ID.fetch_add(1, Ordering::SeqCst);
+    subs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(句柄, 状态);
-    句柄
+        .insert(id, state);
+    id
 }
 
 /// 读线程：攥着 PubSub 守卫读到死。
@@ -683,58 +685,58 @@ pub extern "C" fn qi_redis_subscribe(url: *const c_char, 频道表: *const c_cha
 /// 除超时以外的任何错误都当成这条连接废了：置 活着=false 退出，让 qi 侧
 /// 能靠 订阅活着() 发现并重订。**不在这儿自动重连** —— 重连要重放哪些
 /// 消息、算不算丢，是业务决定，运行时替它决定只会掩盖问题。
-fn 订阅线程(
-    连接串: String,
-    频道: Vec<String>,
-    状态: Arc<订阅>,
-    回信: std::sync::mpsc::Sender<bool>,
+fn sub_thread(
+    conn_str: String,
+    channels: Vec<String>,
+    state: Arc<Sub>,
+    reply: std::sync::mpsc::Sender<bool>,
 ) {
-    let 客户端 = match redis::Client::open(连接串.as_str()) {
+    let client = match redis::Client::open(conn_str.as_str()) {
         Ok(c) => c,
         Err(_) => {
-            let _ = 回信.send(false);
+            let _ = reply.send(false);
             return;
         }
     };
-    let mut 连 = match 客户端.get_connection() {
+    let mut conn = match client.get_connection() {
         Ok(c) => c,
         Err(_) => {
-            let _ = 回信.send(false);
+            let _ = reply.send(false);
             return;
         }
     };
 
-    let mut ps = 连.as_pubsub();
-    for 一个 in &频道 {
-        if ps.subscribe(一个).is_err() {
-            let _ = 回信.send(false);
+    let mut ps = conn.as_pubsub();
+    for one in &channels {
+        if ps.subscribe(one).is_err() {
+            let _ = reply.send(false);
             return;
         }
     }
     if ps.set_read_timeout(Some(Duration::from_secs(5))).is_err() {
-        let _ = 回信.send(false);
+        let _ = reply.send(false);
         return;
     }
-    状态.活着.store(true, Ordering::SeqCst);
-    let _ = 回信.send(true);
+    state.alive.store(true, Ordering::SeqCst);
+    let _ = reply.send(true);
 
     loop {
-        if 状态.要停.load(Ordering::SeqCst) {
+        if state.stopping.load(Ordering::SeqCst) {
             break;
         }
         match ps.get_message() {
-            Ok(消息) => {
-                let 频道名 = 消息.get_channel_name().to_string();
-                let 载荷: String = 消息.get_payload().unwrap_or_default();
-                let mut 队 = 状态.队.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(msg) => {
+                let channel_name = msg.get_channel_name().to_string();
+                let payload: String = msg.get_payload().unwrap_or_default();
+                let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
                 // 队满了丢**最旧**的：这条路上跑的是页面重渲染帧，
                 // 消费者卡住时最新那帧才是对的，留着一堆过期的没有意义。
-                if 队.len() >= 订阅队上限 {
-                    队.pop_front();
+                if queue.len() >= SUB_QUEUE_LIMIT {
+                    queue.pop_front();
                 }
-                队.push_back((频道名, 载荷));
-                drop(队);
-                状态.有货.notify_all();
+                queue.push_back((channel_name, payload));
+                drop(queue);
+                state.ready.notify_all();
             }
             Err(e) => {
                 // 超时是正常的（就是为了回来看 要停），其余都算连接废了
@@ -745,8 +747,8 @@ fn 订阅线程(
             }
         }
     }
-    状态.活着.store(false, Ordering::SeqCst);
-    状态.有货.notify_all();
+    state.alive.store(false, Ordering::SeqCst);
+    state.ready.notify_all();
 }
 
 /// 收一条消息，最多等 `超时毫秒`。
@@ -755,36 +757,36 @@ fn 订阅线程(
 /// 这个形状是照 WebSocket.接收文本超时 来的：有超时才能让一个循环在等消息的
 /// 间隙腾出手干别的（查邮箱、跑定时器），否则一订阅就把那条线程钉死了。
 #[no_mangle]
-pub extern "C" fn qi_redis_sub_recv(订阅句柄: i64, 超时毫秒: i64) -> *mut c_char {
-    let Some(状态) = 取订阅表()
+pub extern "C" fn qi_redis_sub_recv(sub_id: i64, timeout_ms: i64) -> *mut c_char {
+    let Some(state) = subs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&订阅句柄)
+        .get(&sub_id)
         .cloned()
     else {
-        return 空串();
+        return empty_str();
     };
 
-    let mut 队 = 状态.队.lock().unwrap_or_else(|e| e.into_inner());
-    if 队.is_empty() {
+    let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.is_empty() {
         // 虚假唤醒会让这里比要求的更早返回空串。无所谓 —— 调用方本来就把
         // 空串当「这次没有」，接着调就是了，不值得为它多套一层重算截止时间。
-        let (新队, _) = 状态
-            .有货
-            .wait_timeout(队, Duration::from_millis(超时毫秒.max(1) as u64))
+        let (new_queue, _) = state
+            .ready
+            .wait_timeout(queue, Duration::from_millis(timeout_ms.max(1) as u64))
             .unwrap_or_else(|e| e.into_inner());
-        队 = 新队;
+        queue = new_queue;
     }
 
-    match 队.pop_front() {
-        Some((频道名, 载荷)) => {
-            drop(队);
-            let mut 出 = JsonMap::new();
-            出.insert("频道".to_string(), JsonValue::String(频道名));
-            出.insert("消息".to_string(), JsonValue::String(载荷));
-            出串(JsonValue::Object(出).to_string())
+    match queue.pop_front() {
+        Some((channel_name, payload)) => {
+            drop(queue);
+            let mut out = JsonMap::new();
+            out.insert("频道".to_string(), JsonValue::String(channel_name));
+            out.insert("消息".to_string(), JsonValue::String(payload));
+            out_str(JsonValue::Object(out).to_string())
         }
-        None => 空串(),
+        None => empty_str(),
     }
 }
 
@@ -793,14 +795,14 @@ pub extern "C" fn qi_redis_sub_recv(订阅句柄: i64, 超时毫秒: i64) -> *mu
 /// 长跑的中继循环该定期看一眼：连接断了 订阅接收 只会一直返回空串，
 /// 跟「没人发消息」长得一模一样，不查这个就永远发现不了。
 #[no_mangle]
-pub extern "C" fn qi_redis_sub_alive(订阅句柄: i64) -> i64 {
-    match 取订阅表()
+pub extern "C" fn qi_redis_sub_alive(sub_id: i64) -> i64 {
+    match subs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&订阅句柄)
+        .get(&sub_id)
     {
-        Some(状态) => {
-            if 状态.活着.load(Ordering::SeqCst) {
+        Some(state) => {
+            if state.alive.load(Ordering::SeqCst) {
                 1
             } else {
                 0
@@ -812,14 +814,14 @@ pub extern "C" fn qi_redis_sub_alive(订阅句柄: i64) -> i64 {
 
 /// 退订并关掉那条连接。读线程最多再过一个读超时（5 秒）就退出。
 #[no_mangle]
-pub extern "C" fn qi_redis_unsubscribe(订阅句柄: i64) -> i64 {
-    match 取订阅表()
+pub extern "C" fn qi_redis_unsubscribe(sub_id: i64) -> i64 {
+    match subs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(&订阅句柄)
+        .remove(&sub_id)
     {
-        Some(状态) => {
-            状态.要停.store(true, Ordering::SeqCst);
+        Some(state) => {
+            state.stopping.store(true, Ordering::SeqCst);
             0
         }
         None => -1,
@@ -834,68 +836,68 @@ pub extern "C" fn qi_redis_unsubscribe(订阅句柄: i64) -> i64 {
 /// 不用等下一版运行时。返回值按 Redis 的回包类型转 JSON：
 /// 整数→数字，简单串/大块串→字符串，数组→数组，nil→null。
 #[no_mangle]
-pub extern "C" fn qi_redis_command(句柄: i64, 参数JSON: *const c_char) -> *mut c_char {
-    let 参数串 = 读C串(参数JSON);
-    做JSON(句柄, move |c| {
-        let 解析: JsonValue = serde_json::from_str(&参数串).unwrap_or(JsonValue::Null);
-        let JsonValue::Array(项) = 解析 else {
+pub extern "C" fn qi_redis_command(id: i64, args_json: *const c_char) -> *mut c_char {
+    let args_text = read_cstr(args_json);
+    do_json(id, move |c| {
+        let parsed: JsonValue = serde_json::from_str(&args_text).unwrap_or(JsonValue::Null);
+        let JsonValue::Array(items) = parsed else {
             return Err(redis::RedisError::from((
                 redis::ErrorKind::Client,
                 "参数要是 JSON 数组",
             )));
         };
-        let mut 词: Vec<String> = Vec::new();
-        for 一个 in 项 {
-            词.push(match 一个 {
+        let mut words: Vec<String> = Vec::new();
+        for one in items {
+            words.push(match one {
                 JsonValue::String(s) => s,
                 JsonValue::Number(n) => n.to_string(),
                 JsonValue::Bool(b) => b.to_string(),
-                其他 => 其他.to_string(),
+                other => other.to_string(),
             });
         }
-        if 词.is_empty() {
+        if words.is_empty() {
             return Err(redis::RedisError::from((
                 redis::ErrorKind::Client,
                 "命令是空的",
             )));
         }
-        let mut 命令 = redis::cmd(&词[0]);
-        for 一个 in &词[1..] {
-            命令.arg(一个);
+        let mut cmd = redis::cmd(&words[0]);
+        for one in &words[1..] {
+            cmd.arg(one);
         }
-        let 值 = 命令.query::<redis::Value>(c)?;
-        Ok(转JSON(&值))
+        let value = cmd.query::<redis::Value>(c)?;
+        Ok(value_to_json(&value))
     })
 }
 
 /// Redis 回包 → JSON。非 UTF-8 的大块串转成 null（而不是有损转换）。
-fn 转JSON(值: &redis::Value) -> JsonValue {
-    match 值 {
+fn value_to_json(value: &redis::Value) -> JsonValue {
+    match value {
         redis::Value::Nil => JsonValue::Null,
         redis::Value::Int(n) => JsonValue::Number((*n).into()),
-        redis::Value::BulkString(字节) => match std::str::from_utf8(字节) {
+        redis::Value::BulkString(raw_bytes) => match std::str::from_utf8(raw_bytes) {
             Ok(s) => JsonValue::String(s.to_string()),
             Err(_) => JsonValue::Null,
         },
-        redis::Value::Array(项) => JsonValue::Array(项.iter().map(转JSON).collect()),
+        redis::Value::Array(items) => JsonValue::Array(items.iter().map(value_to_json).collect()),
         redis::Value::SimpleString(s) => JsonValue::String(s.clone()),
         redis::Value::Okay => JsonValue::String("OK".to_string()),
-        redis::Value::Map(对) => {
-            let mut 出 = JsonMap::new();
-            for (k, v) in 对 {
-                let 键 = match 转JSON(k) {
+        redis::Value::Map(pairs) => {
+            let mut out = JsonMap::new();
+            for (k, v) in pairs {
+                let key = match value_to_json(k) {
                     JsonValue::String(s) => s,
-                    其他 => 其他.to_string(),
+                    other => other.to_string(),
                 };
-                出.insert(键, 转JSON(v));
+                out.insert(key, value_to_json(v));
             }
-            JsonValue::Object(出)
+            JsonValue::Object(out)
         }
-        redis::Value::Set(项) => JsonValue::Array(项.iter().map(转JSON).collect()),
+        redis::Value::Set(items) => JsonValue::Array(items.iter().map(value_to_json).collect()),
         redis::Value::Double(f) => serde_json::Number::from_f64(*f)
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
         redis::Value::Boolean(b) => JsonValue::Bool(*b),
-        其他 => JsonValue::String(format!("{:?}", 其他)),
+        other => JsonValue::String(format!("{:?}", other)),
     }
 }
