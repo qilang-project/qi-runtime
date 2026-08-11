@@ -31,7 +31,7 @@ redis = ["dep:redis", "dep:r2d2"]
 # 二进制），prost-reflect 提供 DynamicMessage 做 JSON ↔ protobuf 互转。
 # 选动态描述符而不是编译期代码生成：qi 没有 build.rs 那一环，而且这样
 # qi 侧继续只跟 JSON 打交道，跟数据库层「JSON 当细腰」是同一个选择。
-grpc = ["dep:protox", "dep:prost-reflect", "dep:prost", "dep:prost-types"]
+grpc = ["dep:protox", "dep:protox-parse", "dep:prost-reflect", "dep:prost", "dep:prost-types"]
 
 [build-dependencies]
 cc = "1.0"
@@ -108,6 +108,7 @@ protox = { version = "0.9.1", optional = true }
 prost-reflect = { version = "0.16.5", features = ["serde"], optional = true }
 prost = { version = "0.14.4", optional = true }
 prost-types = { version = "0.14.4", optional = true }
+protox-parse = { version = "0.9.0", optional = true }
 
 [dev-dependencies]
 # filesystem.rs 测试用（预先存在的缺口：tests 引用了 tempfile 但未声明）

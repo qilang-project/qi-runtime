@@ -55,6 +55,12 @@ fn lookup(id: i64) -> Option<Arc<ProtoPool>> {
         .cloned()
 }
 
+/// 给 gRPC 反射用：按句柄取描述符池的克隆（DescriptorPool 内部是 Arc，
+/// 克隆很便宜）。反射要把 .proto 的原始描述符发回给客户端。
+pub(crate) fn get_pool(id: i64) -> Option<DescriptorPool> {
+    lookup(id).map(|p| p.pool.clone())
+}
+
 fn read_cstr(p: *const c_char) -> String {
     if p.is_null() {
         return String::new();

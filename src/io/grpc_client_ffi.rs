@@ -23,6 +23,7 @@
 
 use bytes::Bytes;
 use http::{HeaderMap, Request};
+use rustls::{ClientConfig, RootCertStore};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -48,6 +49,9 @@ static CLIENT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 struct ClientConn {
     sender: h2::client::SendRequest<Bytes>,
     authority: String,
+    /// URL 的 scheme。TLS 连接要写 `https`，写错了有的服务端会拒 ——
+    /// :scheme 是 HTTP/2 的伪头，不是可有可无的装饰。
+    scheme: &'static str,
 }
 
 struct CallResult {
@@ -92,12 +96,37 @@ fn out_str(s: String) -> *mut c_char {
     rc_cstr_from_string(s)
 }
 
-fn frame_message(msg: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5 + msg.len());
-    out.push(0u8); // 不压缩
-    out.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-    out.extend_from_slice(msg);
-    out
+/// 小于这个字节数就不压 —— gzip 光头部 18 字节，压小消息是负收益。
+const GZIP_MIN_BYTES: usize = 512;
+
+fn frame_message(msg: &[u8], gzip: bool) -> (Vec<u8>, bool) {
+    let compressed_body = if gzip { gzip_encode(msg) } else { None };
+    let (body, flag): (&[u8], u8) = match compressed_body.as_deref() {
+        Some(z) => (z, 1),
+        None => (msg, 0),
+    };
+    let mut out = Vec::with_capacity(5 + body.len());
+    out.push(flag);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(body);
+    (out, flag == 1)
+}
+
+fn gzip_encode(raw: &[u8]) -> Option<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(raw).ok()?;
+    enc.finish().ok()
+}
+
+fn gzip_decode(raw: &[u8]) -> Option<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut out = Vec::new();
+    GzDecoder::new(raw).read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 fn take_one_message(buf: &[u8]) -> Option<(bool, Vec<u8>)> {
@@ -149,12 +178,59 @@ fn read_status(headers: &HeaderMap) -> Option<(i64, String)> {
 /// `target` 形如 `127.0.0.1:47813`。带 scheme 的写法（`http://…`）也认。
 #[no_mangle]
 pub extern "C" fn qi_grpc_dial(target: *const c_char) -> i64 {
-    let raw = read_cstr(target);
+    dial_inner(read_cstr(target), None)
+}
+
+/// 连一个 TLS 的 gRPC 后端。`ca_path` 给自签 CA 的 PEM 路径；留空走系统
+/// 内置根证书（webpki-roots）。
+///
+/// **不提供「跳过证书校验」的开关**：那种开关一旦存在，就一定会有人为了让
+/// 联调过去而打开它，然后一路带到线上。自签证书就把 CA 传进来。
+#[no_mangle]
+pub extern "C" fn qi_grpc_dial_tls(target: *const c_char, ca_path: *const c_char) -> i64 {
+    dial_inner(read_cstr(target), Some(read_cstr(ca_path)))
+}
+
+fn build_client_config(ca_path: &str) -> Result<ClientConfig, String> {
+    // 进程里只装一次默认加密后端；装两次会 panic
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+
+    let mut roots = RootCertStore::empty();
+    if ca_path.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    } else {
+        let file =
+            std::fs::File::open(ca_path).map_err(|e| format!("打开 CA {} 失败: {}", ca_path, e))?;
+        let mut reader = std::io::BufReader::new(file);
+        for cert in rustls_pemfile::certs(&mut reader) {
+            let cert = cert.map_err(|e| format!("解析 CA {} 失败: {}", ca_path, e))?;
+            roots
+                .add(cert)
+                .map_err(|e| format!("CA {} 不可用: {}", ca_path, e))?;
+        }
+    }
+
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // ALPN 只报 h2 —— gRPC 只跑 HTTP/2
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(config)
+}
+
+fn dial_inner(raw: String, tls_ca: Option<String>) -> i64 {
     if raw.is_empty() {
         return -1;
     }
+    let tls = tls_ca.is_some() || raw.starts_with("https://") || raw.starts_with("grpcs://");
     let authority = raw
+        .trim_start_matches("https://")
         .trim_start_matches("http://")
+        .trim_start_matches("grpcs://")
         .trim_start_matches("grpc://")
         .trim_end_matches('/')
         .to_string();
@@ -163,17 +239,44 @@ pub extern "C" fn qi_grpc_dial(target: *const c_char) -> i64 {
         return -1;
     };
 
+    let host_only = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| authority.clone());
+    let ca = tls_ca.unwrap_or_default();
+
     let result = rt.block_on(async {
         let tcp = tokio::net::TcpStream::connect(&authority).await?;
         // Nagle 会把小的 gRPC 帧攒起来等，一元调用的延迟直接翻倍
         let _ = tcp.set_nodelay(true);
-        let (sender, connection) = h2::client::handshake(tcp).await?;
+
         // 连接 future 必须一直有人 poll，否则这条连接上什么都动不了
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("[qi-grpc 客户端] 连接结束: {}", e);
-            }
-        });
+        let sender = if tls {
+            let config = build_client_config(&ca)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let name = rustls::pki_types::ServerName::try_from(host_only.clone()).map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("主机名 {} 不合法: {}", host_only, e).into()
+                },
+            )?;
+            let stream = connector.connect(name, tcp).await?;
+            let (sender, connection) = h2::client::handshake(stream).await?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("[qi-grpc 客户端] 连接结束: {}", e);
+                }
+            });
+            sender
+        } else {
+            let (sender, connection) = h2::client::handshake(tcp).await?;
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("[qi-grpc 客户端] 连接结束: {}", e);
+                }
+            });
+            sender
+        };
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(sender)
     });
 
@@ -186,10 +289,14 @@ pub extern "C" fn qi_grpc_dial(target: *const c_char) -> i64 {
     };
 
     let id = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
-    conns()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id, Arc::new(ClientConn { sender, authority }));
+    conns().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        id,
+        Arc::new(ClientConn {
+            sender,
+            authority,
+            scheme: if tls { "https" } else { "http" },
+        }),
+    );
     id
 }
 
@@ -233,6 +340,7 @@ pub extern "C" fn qi_grpc_call(
     let payload = clone_bytes(request_bytes).unwrap_or_default();
     let sender = conn.sender.clone();
     let authority = conn.authority.clone();
+    let scheme = conn.scheme;
     let wait = Duration::from_millis(if timeout_ms <= 0 {
         30_000
     } else {
@@ -240,7 +348,7 @@ pub extern "C" fn qi_grpc_call(
     });
 
     let outcome = rt.block_on(async move {
-        let fut = unary_call(sender, &authority, &method_name, payload);
+        let fut = unary_call(sender, scheme, &authority, &method_name, payload);
         match tokio::time::timeout(wait, fut).await {
             Ok(r) => r,
             Err(_) => (
@@ -271,19 +379,31 @@ pub extern "C" fn qi_grpc_call(
 
 async fn unary_call(
     sender: h2::client::SendRequest<Bytes>,
+    scheme: &str,
     authority: &str,
     method: &str,
     payload: Vec<u8>,
 ) -> (i64, String, Vec<u8>) {
-    let uri = format!("http://{}/{}", authority, method.trim_start_matches('/'));
-    let request = match Request::builder()
+    let uri = format!(
+        "{}://{}/{}",
+        scheme,
+        authority,
+        method.trim_start_matches('/')
+    );
+    // 大请求压着发；无论压不压，都声明我们**收**得下 gzip，
+    // 这样服务端可以压着回（两个头是不同方向的）。
+    let (framed, did_gzip) = frame_message(&payload, payload.len() >= GZIP_MIN_BYTES);
+    let mut builder = Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/grpc")
         .header("te", "trailers") // 规范要求，少了有的实现会拒
-        .header("user-agent", "qi-grpc")
-        .body(())
-    {
+        .header("grpc-accept-encoding", "identity,gzip")
+        .header("user-agent", "qi-grpc");
+    if did_gzip {
+        builder = builder.header("grpc-encoding", "gzip");
+    }
+    let request = match builder.body(()) {
         Ok(r) => r,
         Err(e) => return (STATUS_INTERNAL, format!("请求组不出来: {}", e), Vec::new()),
     };
@@ -297,7 +417,7 @@ async fn unary_call(
         Ok(p) => p,
         Err(e) => return (STATUS_UNAVAILABLE, format!("开流失败: {}", e), Vec::new()),
     };
-    if let Err(e) = send_stream.send_data(Bytes::from(frame_message(&payload)), true) {
+    if let Err(e) = send_stream.send_data(Bytes::from(framed), true) {
         return (STATUS_UNAVAILABLE, format!("发请求失败: {}", e), Vec::new());
     }
 
@@ -311,6 +431,12 @@ async fn unary_call(
 
     // trailers-only 响应：状态在初始头里（见文件顶部）
     let head_status = read_status(response.headers());
+    let response_gzip = response
+        .headers()
+        .get("grpc-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "gzip")
+        .unwrap_or(false);
     let mut body = response.into_body();
 
     let mut buf = Vec::new();
@@ -343,11 +469,20 @@ async fn unary_call(
         return (status, message, Vec::new());
     }
     match take_one_message(&buf) {
-        Some((true, _)) => (
-            STATUS_INTERNAL,
-            "对面回了压缩消息，本客户端还不支持".to_string(),
-            Vec::new(),
-        ),
+        Some((true, raw)) => {
+            if !response_gzip {
+                // 标志位说压了，头却没说用什么压的
+                return (
+                    STATUS_INTERNAL,
+                    "对面回了压缩消息但没说压缩方式".to_string(),
+                    Vec::new(),
+                );
+            }
+            match gzip_decode(&raw) {
+                Some(plain) => (STATUS_OK, String::new(), plain),
+                None => (STATUS_INTERNAL, "gzip 解不开".to_string(), Vec::new()),
+            }
+        }
         Some((false, msg)) => (STATUS_OK, String::new(), msg),
         None => {
             if buf.is_empty() {

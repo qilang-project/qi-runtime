@@ -40,6 +40,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
+use tokio_rustls::TlsAcceptor;
+
 use crate::stdlib::bytes_ffi::{clone_bytes, register_bytes};
 use crate::stdlib::qi_str::rc_cstr_from_string;
 
@@ -59,6 +63,8 @@ struct Server {
     queue: Mutex<VecDeque<i64>>,
     ready: Condvar,
     stopping: AtomicBool,
+    /// 开了反射才有：反射要把描述符原样发回给客户端。
+    reflection_pool: Mutex<Option<prost_reflect::DescriptorPool>>,
 }
 
 /// 一条已经排队、还没被回复的调用。回复时通过 oneshot 送回协议层。
@@ -106,11 +112,44 @@ fn take_one_message(buf: &[u8]) -> Option<(bool, Vec<u8>)> {
 }
 
 fn frame_message(msg: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5 + msg.len());
-    out.push(0u8); // 不压缩
-    out.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-    out.extend_from_slice(msg);
+    frame_message_maybe_gzip(msg, false)
+}
+
+/// 加分帧，可选 gzip。压缩标志位那一字节说的就是「这条消息压了没有」——
+/// 它是**逐条消息**的，不是整条流的属性。
+fn frame_message_maybe_gzip(msg: &[u8], gzip: bool) -> Vec<u8> {
+    let body: std::borrow::Cow<[u8]> = if gzip {
+        match gzip_encode(msg) {
+            Some(z) => std::borrow::Cow::Owned(z),
+            // 压不动就发原文。压缩失败不该让整个调用失败
+            None => std::borrow::Cow::Borrowed(msg),
+        }
+    } else {
+        std::borrow::Cow::Borrowed(msg)
+    };
+    let compressed = gzip && body.len() != msg.len();
+    let mut out = Vec::with_capacity(5 + body.len());
+    out.push(if compressed { 1u8 } else { 0u8 });
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
     out
+}
+
+fn gzip_encode(raw: &[u8]) -> Option<Vec<u8>> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(raw).ok()?;
+    enc.finish().ok()
+}
+
+fn gzip_decode(raw: &[u8]) -> Option<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut out = Vec::new();
+    GzDecoder::new(raw).read_to_end(&mut out).ok()?;
+    Some(out)
 }
 
 const STATUS_OK: i64 = 0;
@@ -118,12 +157,85 @@ const STATUS_UNIMPLEMENTED: i64 = 12;
 const STATUS_INTERNAL: i64 = 13;
 const STATUS_RESOURCE_EXHAUSTED: i64 = 8;
 
+/// 小于这个字节数就不压了 —— gzip 光头部就 18 字节，压小消息是负收益。
+const GZIP_MIN_BYTES: usize = 512;
+
 /// 起监听（明文 h2c），**立刻返回**服务器句柄；失败 -1。
 ///
 /// 端口占用这类错误在这一步就同步报出来 —— 后台线程里发现再打日志的话，
 /// qi 侧会以为起好了，然后卡在「接收调用」上等一个永远不来的请求。
 #[no_mangle]
 pub extern "C" fn qi_grpc_listen(host: *const c_char, port: i64) -> i64 {
+    listen_inner(host, port, None)
+}
+
+/// 起 TLS 监听（HTTP/2 over TLS，ALPN 只报 h2）。证书和私钥是 PEM 路径。
+///
+/// ALPN **只报 h2**、不给 http/1.1 兜底：gRPC 只跑在 HTTP/2 上，留个
+/// http/1.1 的口子只会让配错的客户端拿到一个更难懂的错误（协商成 1.1
+/// 之后所有 gRPC 帧都没人认），不如让它在 ALPN 阶段就失败。
+#[no_mangle]
+pub extern "C" fn qi_grpc_listen_tls(
+    host: *const c_char,
+    port: i64,
+    cert_path: *const c_char,
+    key_path: *const c_char,
+) -> i64 {
+    let cert = read_cstr(cert_path);
+    let key = read_cstr(key_path);
+    if cert.is_empty() || key.is_empty() {
+        eprintln!("[qi-grpc] TLS 监听要证书和私钥路径");
+        return -1;
+    }
+    let acceptor = match build_acceptor(&cert, &key) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[qi-grpc] TLS 配置: {}", e);
+            return -1;
+        }
+    };
+    listen_inner(host, port, Some(acceptor))
+}
+
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("打开证书 {} 失败: {}", path, e))?;
+    let mut reader = std::io::BufReader::new(file);
+    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
+    let certs = certs.map_err(|e| format!("解析证书 {} 失败: {}", path, e))?;
+    if certs.is_empty() {
+        return Err(format!("{} 不包含证书", path));
+    }
+    Ok(certs)
+}
+
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("打开私钥 {} 失败: {}", path, e))?;
+    let mut reader = std::io::BufReader::new(file);
+    let key = rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| format!("解析私钥 {} 失败: {}", path, e))?
+        .ok_or_else(|| format!("{} 不包含可用私钥", path))?;
+    Ok(key)
+}
+
+fn build_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, String> {
+    // 进程里只装一次默认加密后端；装两次会 panic
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("ServerConfig: {}", e))?;
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn listen_inner(host: *const c_char, port: i64, acceptor: Option<TlsAcceptor>) -> i64 {
     let host = read_cstr(host);
     let host = if host.is_empty() {
         "127.0.0.1".to_string()
@@ -135,6 +247,7 @@ pub extern "C" fn qi_grpc_listen(host: *const c_char, port: i64) -> i64 {
         queue: Mutex::new(VecDeque::new()),
         ready: Condvar::new(),
         stopping: AtomicBool::new(false),
+        reflection_pool: Mutex::new(None),
     });
 
     // 先同步绑定，绑上了才起线程
@@ -157,7 +270,7 @@ pub extern "C" fn qi_grpc_listen(host: *const c_char, port: i64) -> i64 {
 
     let for_thread = server.clone();
     std::thread::spawn(move || {
-        runtime.block_on(accept_loop(listener, for_thread));
+        runtime.block_on(accept_loop(listener, for_thread, acceptor));
     });
 
     let id = NEXT_SERVER_ID.fetch_add(1, Ordering::SeqCst);
@@ -168,7 +281,11 @@ pub extern "C" fn qi_grpc_listen(host: *const c_char, port: i64) -> i64 {
     id
 }
 
-async fn accept_loop(listener: tokio::net::TcpListener, server: Arc<Server>) {
+async fn accept_loop(
+    listener: tokio::net::TcpListener,
+    server: Arc<Server>,
+    acceptor: Option<TlsAcceptor>,
+) {
     loop {
         if server.stopping.load(Ordering::SeqCst) {
             return;
@@ -181,28 +298,42 @@ async fn accept_loop(listener: tokio::net::TcpListener, server: Arc<Server>) {
             }
         };
         let server = server.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            // 直接进 HTTP/2 —— h2c 的 prior-knowledge 模式。gRPC 客户端连
-            // 明文端口时就是这么干的，不走 HTTP/1.1 Upgrade。
-            let mut conn = match server::handshake(sock).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[qi-grpc] h2 握手: {}", e);
-                    return;
-                }
-            };
-            while let Some(result) = conn.accept().await {
-                match result {
-                    Ok((req, respond)) => {
-                        tokio::spawn(serve_stream(req, respond, server.clone()));
-                    }
-                    Err(e) => {
-                        eprintln!("[qi-grpc] 流: {}", e);
-                        break;
-                    }
-                }
+            match acceptor {
+                Some(a) => match a.accept(sock).await {
+                    Ok(tls) => serve_h2(tls, server).await,
+                    Err(e) => eprintln!("[qi-grpc] TLS 握手: {}", e),
+                },
+                // 明文：直接进 HTTP/2（h2c 的 prior-knowledge 模式）。
+                // gRPC 客户端连明文端口时就是这么干的，不走 HTTP/1.1 Upgrade。
+                None => serve_h2(sock, server).await,
             }
         });
+    }
+}
+
+async fn serve_h2<IO>(io: IO, server: Arc<Server>)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut conn = match server::handshake(io).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[qi-grpc] h2 握手: {}", e);
+            return;
+        }
+    };
+    while let Some(result) = conn.accept().await {
+        match result {
+            Ok((req, respond)) => {
+                tokio::spawn(serve_stream(req, respond, server.clone()));
+            }
+            Err(e) => {
+                eprintln!("[qi-grpc] 流: {}", e);
+                break;
+            }
+        }
     }
 }
 
@@ -214,6 +345,40 @@ async fn serve_stream(
     let (head, mut body) = req.into_parts();
     // 路径就是方法全名：/greet.Greeter/SayHello → greet.Greeter/SayHello
     let method = head.uri.path().trim_start_matches('/').to_string();
+
+    // 反射由运行时**就地答复**，不进 qi 的队列 —— 它要的东西全在描述符池里，
+    // 业务代码插不上手，交给 qi 只会逼着 qi 侧先有流式 API 才能开反射。
+    if crate::io::grpc_reflection::is_reflection_method(&method) {
+        let pool = server
+            .reflection_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match pool {
+            Some(p) => crate::io::grpc_reflection::serve(body, respond, p).await,
+            None => send_status_only(
+                &mut respond,
+                STATUS_UNIMPLEMENTED,
+                "本服务没开反射（调 开反射 之后再起）",
+            ),
+        }
+        return;
+    }
+
+    // 对面用什么压的（grpc-encoding），以及它能收什么（grpc-accept-encoding）。
+    // 两个头是**不同方向**的：前者说请求，后者说它希望响应怎么压。
+    let request_encoding = head
+        .headers
+        .get("grpc-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("identity")
+        .to_string();
+    let client_accepts_gzip = head
+        .headers
+        .get("grpc-accept-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|one| one.trim() == "gzip"))
+        .unwrap_or(false);
 
     // **凑齐一条完整消息就走，不等 END_STREAM。**
     //
@@ -230,14 +395,26 @@ async fn serve_stream(
                 let _ = body.flow_control().release_capacity(data.len());
                 buf.extend_from_slice(&data);
                 match take_one_message(&buf) {
-                    Some((true, _)) => {
-                        // 我们没宣告支持压缩，对面还是压了
-                        send_status_only(
-                            &mut respond,
-                            STATUS_UNIMPLEMENTED,
-                            "本服务不支持压缩的消息",
-                        );
-                        return;
+                    Some((true, raw)) => {
+                        if request_encoding != "gzip" {
+                            // 标志位说压了，头却没说用什么压的 —— 无从下手
+                            send_status_only(
+                                &mut respond,
+                                STATUS_UNIMPLEMENTED,
+                                &format!("不认识的压缩方式: {}", request_encoding),
+                            );
+                            return;
+                        }
+                        match gzip_decode(&raw) {
+                            Some(plain) => {
+                                message = Some(plain);
+                                break;
+                            }
+                            None => {
+                                send_status_only(&mut respond, STATUS_INTERNAL, "gzip 解不开");
+                                return;
+                            }
+                        }
                     }
                     Some((false, msg)) => {
                         message = Some(msg);
@@ -309,11 +486,20 @@ async fn serve_stream(
     };
 
     // **HTTP 状态永远 200**，成败看 trailer
-    let resp = match Response::builder()
+    // 小消息压了反而更大（gzip 头就 18 字节），所以设个门槛。
+    // 门槛之下发原文，压缩标志位照实写 0 —— 标志位是逐条消息的，
+    // 声明了 grpc-encoding 也**不代表每条都必须压**。
+    let use_gzip = client_accepts_gzip && response_bytes.len() >= GZIP_MIN_BYTES;
+
+    let mut builder = Response::builder()
         .status(200)
         .header("content-type", "application/grpc")
-        .body(())
-    {
+        // 告诉对面我们收得下 gzip（它下次可以压着发）
+        .header("grpc-accept-encoding", "identity,gzip");
+    if use_gzip {
+        builder = builder.header("grpc-encoding", "gzip");
+    }
+    let resp = match builder.body(()) {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -322,7 +508,8 @@ async fn serve_stream(
         Err(_) => return,
     };
     if status == STATUS_OK {
-        if let Err(e) = stream.send_data(Bytes::from(frame_message(&response_bytes)), false) {
+        let framed = frame_message_maybe_gzip(&response_bytes, use_gzip);
+        if let Err(e) = stream.send_data(Bytes::from(framed), false) {
             eprintln!("[qi-grpc] 发响应体: {}", e);
             return;
         }
@@ -457,6 +644,30 @@ pub extern "C" fn qi_grpc_respond(
         Err(_) => -1,
         Ok(()) => 0,
     }
+}
+
+/// 开服务端反射：把一个描述符句柄挂到服务器上。
+///
+/// 开了之后 grpcurl 不用带 `-proto` 就能 list/describe/调用，grpcui、
+/// Postman 这类工具也才认得出服务长什么样。
+#[no_mangle]
+pub extern "C" fn qi_grpc_enable_reflection(server_id: i64, pool_id: i64) -> i64 {
+    let Some(server) = servers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&server_id)
+        .cloned()
+    else {
+        return -1;
+    };
+    let Some(pool) = crate::stdlib::protobuf_ffi::get_pool(pool_id) else {
+        return -1;
+    };
+    *server
+        .reflection_pool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(pool);
+    0
 }
 
 /// 停服务：唤醒等在「接收调用」上的循环，并让 accept 循环退出。
