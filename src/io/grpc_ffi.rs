@@ -67,11 +67,33 @@ struct Server {
     reflection_pool: Mutex<Option<prost_reflect::DescriptorPool>>,
 }
 
-/// 一条已经排队、还没被回复的调用。回复时通过 oneshot 送回协议层。
+/// 一条已经排队、还没收尾的调用。
+///
+/// 一元和流式共用这一套：一元不过是「收一条、发一条、收尾」的特例。
+/// 分成两套 API 会让 qi 侧多一个「这个方法是不是流式」的分叉，
+/// 而那个分叉的答案已经在 .proto 里了。
 struct PendingCall {
-    reply: tokio::sync::oneshot::Sender<(i64, String, Vec<u8>)>,
     method: String,
-    request_handle: i64,
+    /// 客户端发过来的消息队列（协议层往里塞，qi 侧取）
+    inbound: Arc<Inbound>,
+    /// 往客户端发的口子。发消息和收尾都走它，保证顺序。
+    outbound: tokio::sync::mpsc::UnboundedSender<Outbound>,
+    /// 一元路径缓存的第一条消息 —— 请求字节 可以被调多次，
+    /// 每次都从队列里弹一条的话第二次就空了。
+    first_message: Mutex<Option<i64>>,
+}
+
+struct Inbound {
+    queue: Mutex<VecDeque<Vec<u8>>>,
+    ready: Condvar,
+    /// 客户端半关了流（不会再有消息）。跟「这一轮没消息」是两回事：
+    /// 前者要让 收一条 返回 -1 让循环退出，后者返回 0 让它接着等。
+    ended: AtomicBool,
+}
+
+enum Outbound {
+    Data(Vec<u8>),
+    Finish(i64, String),
 }
 
 fn servers() -> &'static Mutex<HashMap<i64, Arc<Server>>> {
@@ -342,7 +364,7 @@ async fn serve_stream(
     mut respond: server::SendResponse<Bytes>,
     server: Arc<Server>,
 ) {
-    let (head, mut body) = req.into_parts();
+    let (head, body) = req.into_parts();
     // 路径就是方法全名：/greet.Greeter/SayHello → greet.Greeter/SayHello
     let method = head.uri.path().trim_start_matches('/').to_string();
 
@@ -380,73 +402,19 @@ async fn serve_stream(
         .map(|v| v.split(',').any(|one| one.trim() == "gzip"))
         .unwrap_or(false);
 
-    // **凑齐一条完整消息就走，不等 END_STREAM。**
+    let inbound = Arc::new(Inbound {
+        queue: Mutex::new(VecDeque::new()),
+        ready: Condvar::new(),
+        ended: AtomicBool::new(false),
+    });
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
+
+    // **收头就派发**，不等第一条消息。
     //
-    // 一元调用里客户端发完就半关流，两种写法等价；但客户端流/双向流的客户端
-    // （Go 的 stream.Send()）发完**不关流**，等 END_STREAM 就是永远等下去 ——
-    // 于是对面拿到的不是「本服务没实现流式」而是一个挂死，直到它自己超时。
-    // 实测：grpcurl 调双向流能立刻拿到 UNIMPLEMENTED（它发完就半关），
-    // Go 客户端却挂满 10 秒 —— 同一个 bug 两种表现，光用 grpcurl 测发现不了。
-    let mut buf = Vec::new();
-    let mut message: Option<Vec<u8>> = None;
-    while let Some(chunk) = body.data().await {
-        match chunk {
-            Ok(data) => {
-                let _ = body.flow_control().release_capacity(data.len());
-                buf.extend_from_slice(&data);
-                match take_one_message(&buf) {
-                    Some((true, raw)) => {
-                        if request_encoding != "gzip" {
-                            // 标志位说压了，头却没说用什么压的 —— 无从下手
-                            send_status_only(
-                                &mut respond,
-                                STATUS_UNIMPLEMENTED,
-                                &format!("不认识的压缩方式: {}", request_encoding),
-                            );
-                            return;
-                        }
-                        match gzip_decode(&raw) {
-                            Some(plain) => {
-                                message = Some(plain);
-                                break;
-                            }
-                            None => {
-                                send_status_only(&mut respond, STATUS_INTERNAL, "gzip 解不开");
-                                return;
-                            }
-                        }
-                    }
-                    Some((false, msg)) => {
-                        message = Some(msg);
-                        break;
-                    }
-                    None => continue,
-                }
-            }
-            Err(e) => {
-                eprintln!("[qi-grpc] 读请求体: {}", e);
-                send_status_only(&mut respond, STATUS_INTERNAL, "读请求体失败");
-                return;
-            }
-        }
-    }
-
-    let request_msg = match message {
-        Some(m) => m,
-        None => {
-            if buf.is_empty() {
-                Vec::new() // 空消息是合法的（所有字段都是默认值）
-            } else {
-                send_status_only(&mut respond, STATUS_INTERNAL, "请求分帧不完整");
-                return;
-            }
-        }
-    };
-
-    // 排进队列，等 qi 侧回复
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    // 等第一条消息才派发的话，「服务端先说话」的双向流会直接卡住：
+    // 客户端在等服务端，服务端在等客户端的第一条消息。一元调用不受影响 ——
+    // 它那条路上 请求字节 会阻塞着等第一条，跟以前一样。
     let call_id = NEXT_CALL_ID.fetch_add(1, Ordering::SeqCst);
-    let request_handle = register_bytes(request_msg);
     {
         let mut queue = server.queue.lock().unwrap_or_else(|e| e.into_inner());
         if queue.len() >= QUEUE_LIMIT {
@@ -464,59 +432,122 @@ async fn serve_stream(
             .insert(
                 call_id,
                 PendingCall {
-                    reply: tx,
                     method,
-                    request_handle,
+                    inbound: inbound.clone(),
+                    outbound: out_tx,
+                    first_message: Mutex::new(None),
                 },
             );
-        // 队列里只放句柄 —— 方法名和请求字节挂在 PendingCall 那一份上，
-        // 存两份迟早对不上
+        // 队列里只放句柄 —— 别的都挂在 PendingCall 那一份上，存两份迟早对不上
         queue.push_back(call_id);
     }
     server.ready.notify_one();
 
-    let (status, message_text, response_bytes) = match rx.await {
-        Ok(triple) => triple,
-        // qi 侧把这条调用丢了（进程要退出、或者 handler 没回复）
-        Err(_) => (
-            STATUS_INTERNAL,
-            "服务端没有回复这次调用".to_string(),
-            Vec::new(),
-        ),
-    };
+    // 读腿：把客户端发来的消息拆帧塞进队列
+    let reader_inbound = inbound.clone();
+    tokio::spawn(async move {
+        let mut body = body;
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let Ok(data) = chunk else { break };
+            let _ = body.flow_control().release_capacity(data.len());
+            buf.extend_from_slice(&data);
+            loop {
+                match take_one_message(&buf) {
+                    Some((compressed, raw)) => {
+                        let used = 5 + raw_len_after_frame(&buf);
+                        buf.drain(..used);
+                        let plain = if compressed {
+                            if request_encoding != "gzip" {
+                                break;
+                            }
+                            match gzip_decode(&raw) {
+                                Some(p) => p,
+                                None => break,
+                            }
+                        } else {
+                            raw
+                        };
+                        let mut q = reader_inbound
+                            .queue
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        q.push_back(plain);
+                        drop(q);
+                        reader_inbound.ready.notify_all();
+                    }
+                    None => break,
+                }
+            }
+        }
+        reader_inbound.ended.store(true, Ordering::SeqCst);
+        reader_inbound.ready.notify_all();
+    });
 
+    // 写腿：qi 侧发什么就写什么。头**懒发** —— 收尾时还没发过数据且状态非 0，
+    // 就走 trailers-only 响应（gRPC 允许，且是错误路径的常规形状）。
+    let mut stream: Option<h2::SendStream<Bytes>> = None;
+    while let Some(item) = out_rx.recv().await {
+        match item {
+            Outbound::Data(payload) => {
+                if stream.is_none() {
+                    match open_response(&mut respond, client_accepts_gzip) {
+                        Some(s) => stream = Some(s),
+                        None => return,
+                    }
+                }
+                let use_gzip = client_accepts_gzip && payload.len() >= GZIP_MIN_BYTES;
+                let framed = frame_message_maybe_gzip(&payload, use_gzip);
+                if let Some(s) = stream.as_mut() {
+                    if s.send_data(Bytes::from(framed), false).is_err() {
+                        return;
+                    }
+                }
+            }
+            Outbound::Finish(status, message) => {
+                match stream.as_mut() {
+                    Some(s) => {
+                        let _ = s.send_trailers(build_trailers(status, &message));
+                    }
+                    None => send_status_only(&mut respond, status, &message),
+                }
+                return;
+            }
+        }
+    }
+
+    // 通道关了却没收到 Finish —— qi 侧把这条调用丢了
+    match stream.as_mut() {
+        Some(s) => {
+            let _ = s.send_trailers(build_trailers(STATUS_INTERNAL, "服务端没有回复这次调用"));
+        }
+        None => send_status_only(&mut respond, STATUS_INTERNAL, "服务端没有回复这次调用"),
+    }
+}
+
+/// take_one_message 只给出消息体，这里补一个「这一帧占了多少字节」。
+fn raw_len_after_frame(buf: &[u8]) -> usize {
+    if buf.len() < 5 {
+        return 0;
+    }
+    u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize
+}
+
+fn open_response(
+    respond: &mut server::SendResponse<Bytes>,
+    accepts_gzip: bool,
+) -> Option<h2::SendStream<Bytes>> {
     // **HTTP 状态永远 200**，成败看 trailer
-    // 小消息压了反而更大（gzip 头就 18 字节），所以设个门槛。
-    // 门槛之下发原文，压缩标志位照实写 0 —— 标志位是逐条消息的，
-    // 声明了 grpc-encoding 也**不代表每条都必须压**。
-    let use_gzip = client_accepts_gzip && response_bytes.len() >= GZIP_MIN_BYTES;
-
     let mut builder = Response::builder()
         .status(200)
         .header("content-type", "application/grpc")
         // 告诉对面我们收得下 gzip（它下次可以压着发）
         .header("grpc-accept-encoding", "identity,gzip");
-    if use_gzip {
+    if accepts_gzip {
         builder = builder.header("grpc-encoding", "gzip");
     }
-    let resp = match builder.body(()) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    let mut stream = match respond.send_response(resp, false) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if status == STATUS_OK {
-        let framed = frame_message_maybe_gzip(&response_bytes, use_gzip);
-        if let Err(e) = stream.send_data(Bytes::from(framed), false) {
-            eprintln!("[qi-grpc] 发响应体: {}", e);
-            return;
-        }
-    }
-    if let Err(e) = stream.send_trailers(build_trailers(status, &message_text)) {
-        eprintln!("[qi-grpc] 发 trailers: {}", e);
-    }
+    let resp = builder.body(()).ok()?;
+    respond.send_response(resp, false).ok()
 }
 
 fn build_trailers(status: i64, message: &str) -> HeaderMap {
@@ -607,30 +638,95 @@ pub extern "C" fn qi_grpc_method(call_id: i64) -> *mut c_char {
     }
 }
 
-/// 请求消息的字节切片句柄（5 字节分帧头已经脱掉）。
-#[no_mangle]
-pub extern "C" fn qi_grpc_request(call_id: i64) -> i64 {
-    match pending_calls()
+fn find_call_inbound(call_id: i64) -> Option<Arc<Inbound>> {
+    pending_calls()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&call_id)
-    {
-        Some(call) => call.request_handle,
-        None => 0,
+        .map(|c| c.inbound.clone())
+}
+
+/// 收一条客户端消息，最多等 `timeout_ms`。
+///
+/// 返回字节切片句柄；**0 = 这一轮没收到（超时）**，**-1 = 客户端半关了，
+/// 不会再有消息**。这两个必须分开：前者该接着等，后者该退出循环。
+/// 混成一个值的话，客户端流的处理循环要么提前收摊要么永远转下去。
+#[no_mangle]
+pub extern "C" fn qi_grpc_recv(call_id: i64, timeout_ms: i64) -> i64 {
+    let Some(inbound) = find_call_inbound(call_id) else {
+        return -1;
+    };
+    let mut queue = inbound.queue.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.is_empty() && !inbound.ended.load(Ordering::SeqCst) {
+        let (q, _) = inbound
+            .ready
+            .wait_timeout(queue, Duration::from_millis(timeout_ms.max(1) as u64))
+            .unwrap_or_else(|e| e.into_inner());
+        queue = q;
+    }
+    match queue.pop_front() {
+        Some(msg) => register_bytes(msg),
+        None => {
+            if inbound.ended.load(Ordering::SeqCst) {
+                -1
+            } else {
+                0
+            }
+        }
     }
 }
 
-/// 回复这条调用。状态码 0 = 成功（这时才发响应体），非 0 只发状态。
+/// 一元调用的便利入口：拿第一条请求消息（最多等 30 秒）。
 ///
-/// 回复之后调用句柄立即失效 —— 重复回复返回 -1，不会把第二次的内容
-/// 发到别人的流上。
+/// 会**缓存**，调多次拿到的是同一个句柄 —— 直接每次弹队列的话第二次就空了。
+/// 流式的方法别用这个，用 收一条。
 #[no_mangle]
-pub extern "C" fn qi_grpc_respond(
-    call_id: i64,
-    status: i64,
-    message: *const c_char,
-    response_bytes: i64,
-) -> i64 {
+pub extern "C" fn qi_grpc_request(call_id: i64) -> i64 {
+    {
+        let calls = pending_calls().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(call) = calls.get(&call_id) {
+            if let Some(cached) = *call.first_message.lock().unwrap_or_else(|e| e.into_inner()) {
+                return cached;
+            }
+        } else {
+            return 0;
+        }
+    }
+    let handle = qi_grpc_recv(call_id, 30_000);
+    // 没有消息（空请求 / 客户端直接关了）当空消息处理：proto3 里
+    // 「所有字段都是默认值」的编码就是零字节
+    let handle = if handle <= 0 {
+        register_bytes(Vec::new())
+    } else {
+        handle
+    };
+    let calls = pending_calls().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(call) = calls.get(&call_id) {
+        *call.first_message.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+    handle
+}
+
+/// 发一条响应消息（服务端流用）。不收尾 —— 收尾要显式调 收尾。
+#[no_mangle]
+pub extern "C" fn qi_grpc_send(call_id: i64, bytes_handle: i64) -> i64 {
+    let calls = pending_calls().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(call) = calls.get(&call_id) else {
+        return -1;
+    };
+    let payload = clone_bytes(bytes_handle).unwrap_or_default();
+    match call.outbound.send(Outbound::Data(payload)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// 收尾：发 trailers 并结束这条流。调用句柄随即失效。
+///
+/// **每条调用都必须收尾**（哪怕是错）。不收尾的话客户端一直等到自己超时，
+/// 而服务端这边一点痕迹都没有 —— 这是 gRPC 最难查的一类症状。
+#[no_mangle]
+pub extern "C" fn qi_grpc_finish(call_id: i64, status: i64, message: *const c_char) -> i64 {
     let Some(call) = pending_calls()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -638,12 +734,28 @@ pub extern "C" fn qi_grpc_respond(
     else {
         return -1;
     };
-    let payload = clone_bytes(response_bytes).unwrap_or_default();
-    match call.reply.send((status, read_cstr(message), payload)) {
+    match call
+        .outbound
+        .send(Outbound::Finish(status, read_cstr(message)))
+    {
+        Ok(()) => 0,
         // 协议层已经走了 —— 客户端多半断了，不算错误
         Err(_) => -1,
-        Ok(()) => 0,
     }
+}
+
+/// 一元回复 = 发一条 + 收尾。状态码非 0 时不发响应体。
+#[no_mangle]
+pub extern "C" fn qi_grpc_respond(
+    call_id: i64,
+    status: i64,
+    message: *const c_char,
+    response_bytes: i64,
+) -> i64 {
+    if status == STATUS_OK && qi_grpc_send(call_id, response_bytes) < 0 {
+        return -1;
+    }
+    qi_grpc_finish(call_id, status, message)
 }
 
 /// 开服务端反射：把一个描述符句柄挂到服务器上。
