@@ -40,6 +40,8 @@ pub mod qi_str;
 pub mod qi_str_ffi;
 pub mod random_ffi;
 pub mod rc_obj;
+#[cfg(feature = "redis")]
+pub mod redis_ffi;
 pub mod reflect_ffi;
 pub mod regex_ffi;
 pub mod signal_ffi;

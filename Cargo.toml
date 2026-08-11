@@ -14,7 +14,7 @@ name = "qi_runtime"
 crate-type = ["staticlib", "rlib"]
 
 [features]
-default = ["runtime-rc-string", "db-postgres", "db-mysql"]
+default = ["runtime-rc-string", "db-postgres", "db-mysql", "redis"]
 runtime-rc-string = []
 # 桌面 GUI：把 qi-gui（tao/egui/winit/softbuffer 等）编进 libqi_runtime.a，
 # 并置 has_gui。默认关闭 —— 保持运行时轻量、可 zig 交叉编译（GUI 非交叉目标）。
@@ -24,6 +24,9 @@ gui = ["dep:qi-gui"]
 # 少编两棵网络驱动树、二进制也小一圈（见 qi-web/docs/多数据库设计.md 风险表）。
 db-postgres = ["dep:postgres", "dep:postgres-types", "dep:r2d2"]
 db-mysql = ["dep:mysql", "dep:r2d2"]
+# Redis：默认开。跟 SQL 后端共用 r2d2 池。关掉它 标准库.Redis 的调用会
+# 在链接期报 undefined symbol —— 是刻意的，比运行时才发现「连不上」好。
+redis = ["dep:redis", "dep:r2d2"]
 
 [build-dependencies]
 cc = "1.0"
@@ -95,6 +98,7 @@ mysql = { version = "28", default-features = false, features = ["default-rust"],
 # r2d2_mysql —— 我们池化的是统一后的 `后端` 枚举，用官方适配器反而要按后端
 # 切成两个类型不同的池。纯 Rust，不妨碍 zig 交叉编译。
 r2d2 = { version = "0.8", optional = true }
+redis = { version = "1.5.0", features = ["r2d2", "tls-rustls", "tls-rustls-webpki-roots"], optional = true }
 
 [dev-dependencies]
 # filesystem.rs 测试用（预先存在的缺口：tests 引用了 tempfile 但未声明）
