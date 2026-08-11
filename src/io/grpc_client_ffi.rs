@@ -46,12 +46,26 @@ static RESULTS: OnceLock<Mutex<HashMap<i64, CallResult>>> = OnceLock::new();
 /// 几十套线程池 —— 而这些线程绝大部分时间在睡觉。
 static CLIENT_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+/// 一个客户端句柄背后可以挂多个后端。
+///
+/// **这不是完整的负载均衡**：没有服务发现、没有健康检查、没有 EDS 那一套。
+/// 有的是最常用的那一小块 —— 一组固定地址、轮询挑一个、连坏了重连、
+/// 明确「没打出去」的失败按退避重试。这块能覆盖「后端有几个副本、
+/// 滚动重启时别掉请求」这个最常见的诉求。
 struct ClientConn {
-    sender: h2::client::SendRequest<Bytes>,
-    authority: String,
-    /// URL 的 scheme。TLS 连接要写 `https`，写错了有的服务端会拒 ——
-    /// :scheme 是 HTTP/2 的伪头，不是可有可无的装饰。
+    subs: Vec<Mutex<SubChannel>>,
+    /// 轮询游标
+    next: AtomicI64,
     scheme: &'static str,
+    tls_ca: Option<String>,
+    /// UNAVAILABLE 时最多再试几次（0 = 不重试）
+    retries: i64,
+}
+
+struct SubChannel {
+    authority: String,
+    /// None = 这条子连接现在是坏的，下次用之前要重连
+    sender: Option<h2::client::SendRequest<Bytes>>,
 }
 
 struct CallResult {
@@ -227,25 +241,76 @@ fn dial_inner(raw: String, tls_ca: Option<String>) -> i64 {
         return -1;
     }
     let tls = tls_ca.is_some() || raw.starts_with("https://") || raw.starts_with("grpcs://");
-    let authority = raw
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("grpcs://")
-        .trim_start_matches("grpc://")
-        .trim_end_matches('/')
-        .to_string();
+    // 逗号分隔多个后端：`a:1,b:2,c:3`
+    let addrs: Vec<String> = raw
+        .split(',')
+        .map(|one| {
+            one.trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_start_matches("grpcs://")
+                .trim_start_matches("grpc://")
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    if addrs.is_empty() {
+        return -1;
+    }
 
     let Some(rt) = client_runtime() else {
         return -1;
     };
+    let ca = tls_ca.clone().unwrap_or_default();
 
+    // 至少要连上一个才算成功；连不上的先记成坏的，用的时候再重连 ——
+    // 滚动重启时有一个副本没起来不该让整个客户端建不起来。
+    let mut subs = Vec::new();
+    let mut any_ok = false;
+    for authority in &addrs {
+        let sender = rt.block_on(connect_one(authority, tls, &ca));
+        if sender.is_some() {
+            any_ok = true;
+        }
+        subs.push(Mutex::new(SubChannel {
+            authority: authority.clone(),
+            sender,
+        }));
+    }
+    if !any_ok {
+        eprintln!("[qi-grpc 客户端] {} 一个都连不上", addrs.join(","));
+        return -1;
+    }
+
+    let id = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
+    conns().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        id,
+        Arc::new(ClientConn {
+            subs,
+            next: AtomicI64::new(0),
+            scheme: if tls { "https" } else { "http" },
+            tls_ca: if tls { Some(ca) } else { None },
+            retries: 2,
+        }),
+    );
+    id
+}
+
+/// 连一个后端。连不上返回 None（调用方决定要不要当成致命）。
+async fn connect_one(
+    authority: &str,
+    tls: bool,
+    ca: &str,
+) -> Option<h2::client::SendRequest<Bytes>> {
     let host_only = authority
         .rsplit_once(':')
         .map(|(h, _)| h.to_string())
-        .unwrap_or_else(|| authority.clone());
-    let ca = tls_ca.unwrap_or_default();
+        .unwrap_or_else(|| authority.to_string());
+    let authority = authority.to_string();
+    let ca = ca.to_string();
 
-    let result = rt.block_on(async {
+    let result: Result<_, Box<dyn std::error::Error + Send + Sync>> = async {
         let tcp = tokio::net::TcpStream::connect(&authority).await?;
         // Nagle 会把小的 gRPC 帧攒起来等，一元调用的延迟直接翻倍
         let _ = tcp.set_nodelay(true);
@@ -277,27 +342,55 @@ fn dial_inner(raw: String, tls_ca: Option<String>) -> i64 {
             });
             sender
         };
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(sender)
-    });
+        Ok(sender)
+    }
+    .await;
 
-    let sender = match result {
-        Ok(s) => s,
+    match result {
+        Ok(s) => Some(s),
         Err(e) => {
             eprintln!("[qi-grpc 客户端] 连 {} 失败: {}", authority, e);
-            return -1;
+            None
         }
-    };
+    }
+}
 
-    let id = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
-    conns().lock().unwrap_or_else(|e| e.into_inner()).insert(
-        id,
-        Arc::new(ClientConn {
-            sender,
-            authority,
-            scheme: if tls { "https" } else { "http" },
-        }),
-    );
-    id
+/// 轮询挑一条可用的子连接。坏的就地重连；一圈都不行返回 None。
+fn pick_sender(conn: &ClientConn) -> Option<(h2::client::SendRequest<Bytes>, String)> {
+    let n = conn.subs.len();
+    let start = conn
+        .next
+        .fetch_add(1, Ordering::SeqCst)
+        .rem_euclid(n as i64) as usize;
+    let rt = client_runtime()?;
+    for step in 0..n {
+        let idx = (start + step) % n;
+        let mut sub = conn.subs[idx].lock().unwrap_or_else(|e| e.into_inner());
+        // 已有的连接可能已经断了（对面重启）—— poll_ready 会告诉我们
+        if let Some(sender) = sub.sender.clone() {
+            return Some((sender, sub.authority.clone()));
+        }
+        // 坏的：重连一次。失败就换下一个，别在这儿死磕
+        let tls = conn.tls_ca.is_some() || conn.scheme == "https";
+        let ca = conn.tls_ca.clone().unwrap_or_default();
+        let fresh = rt.block_on(connect_one(&sub.authority, tls, &ca));
+        if let Some(sender) = fresh {
+            sub.sender = Some(sender.clone());
+            return Some((sender, sub.authority.clone()));
+        }
+    }
+    None
+}
+
+/// 把某条子连接标成坏的，下次用之前会重连。
+fn mark_dead(conn: &ClientConn, authority: &str) {
+    for sub in &conn.subs {
+        let mut sub = sub.lock().unwrap_or_else(|e| e.into_inner());
+        if sub.authority == authority {
+            sub.sender = None;
+            return;
+        }
+    }
 }
 
 /// 关连接。在途的调用会被断掉。
@@ -338,8 +431,6 @@ pub extern "C" fn qi_grpc_call(
 
     let method_name = read_cstr(method);
     let payload = clone_bytes(request_bytes).unwrap_or_default();
-    let sender = conn.sender.clone();
-    let authority = conn.authority.clone();
     let scheme = conn.scheme;
     let wait = Duration::from_millis(if timeout_ms <= 0 {
         30_000
@@ -347,19 +438,48 @@ pub extern "C" fn qi_grpc_call(
         timeout_ms as u64
     });
 
-    let outcome = rt.block_on(async move {
-        let fut = unary_call(sender, scheme, &authority, &method_name, payload);
-        match tokio::time::timeout(wait, fut).await {
-            Ok(r) => r,
-            Err(_) => (
-                STATUS_DEADLINE_EXCEEDED,
-                format!("等 {} 毫秒还没回来", wait.as_millis()),
+    // **只重试 UNAVAILABLE**：那意味着请求根本没被对面处理（连不上、连接断了、
+    // 正在滚动重启）。别的错都可能是「已经执行了一半」—— 重试就是重复扣款
+    // 那类事故。gRPC 官方的重试策略同理，默认也只对这一类开。
+    let mut attempt = 0;
+    let (status, message, body) = loop {
+        let Some((sender, authority)) = pick_sender(&conn) else {
+            break (
+                STATUS_UNAVAILABLE,
+                "所有后端都连不上".to_string(),
                 Vec::new(),
-            ),
+            );
+        };
+        let payload_try = payload.clone();
+        let method_try = method_name.clone();
+        let authority_try = authority.clone();
+        let outcome = rt.block_on(async move {
+            let fut = unary_call(
+                sender,
+                scheme,
+                &authority_try,
+                &method_try,
+                payload_try,
+                wait.as_millis() as u64,
+            );
+            match tokio::time::timeout(wait, fut).await {
+                Ok(r) => r,
+                Err(_) => (
+                    STATUS_DEADLINE_EXCEEDED,
+                    format!("等 {} 毫秒还没回来", wait.as_millis()),
+                    Vec::new(),
+                ),
+            }
+        });
+        if outcome.0 != STATUS_UNAVAILABLE || attempt >= conn.retries {
+            break outcome;
         }
-    });
+        // 这条子连接不行了：标坏（下次用之前会重连）、退避、换一条再试
+        mark_dead(&conn, &authority);
+        attempt += 1;
+        std::thread::sleep(Duration::from_millis(50u64 << attempt));
+    };
 
-    let (status, message, body) = outcome;
     let bytes_handle = if body.is_empty() {
         0
     } else {
@@ -383,6 +503,7 @@ async fn unary_call(
     authority: &str,
     method: &str,
     payload: Vec<u8>,
+    deadline_ms: u64,
 ) -> (i64, String, Vec<u8>) {
     let uri = format!(
         "{}://{}/{}",
@@ -399,6 +520,10 @@ async fn unary_call(
         .header("content-type", "application/grpc")
         .header("te", "trailers") // 规范要求，少了有的实现会拒
         .header("grpc-accept-encoding", "identity,gzip")
+        // deadline 往下游传：对面据此掐自己的活儿，而不是傻算到底再发现
+        // 没人要了。单位后缀 m = 毫秒（规范里 H/M/S/m/u/n 各有其义，
+        // 别跟 M=分钟 搞混）。
+        .header("grpc-timeout", format!("{}m", deadline_ms.max(1)))
         .header("user-agent", "qi-grpc");
     if did_gzip {
         builder = builder.header("grpc-encoding", "gzip");
@@ -548,6 +673,325 @@ pub extern "C" fn qi_grpc_result_free(result_id: i64) -> i64 {
             if r.bytes_handle != 0 {
                 crate::stdlib::bytes_ffi::free_bytes(r.bytes_handle);
             }
+            0
+        }
+        None => -1,
+    }
+}
+
+// ── 客户端流式 ──────────────────────────────────────────────────
+//
+// 一元调用是「发一条、收一条、完事」，运行时可以整个包起来阻塞返回。
+// 流式不行：qi 侧要自己决定什么时候发、什么时候收、什么时候半关，
+// 所以这里跟服务端那侧一样，把 h2 的收发交给一个后台任务，
+// qi 侧通过队列和通道跟它打交道。
+
+static NEXT_STREAM_ID: AtomicI64 = AtomicI64::new(7_000_000);
+static STREAMS: OnceLock<Mutex<HashMap<i64, Arc<ClientStream>>>> = OnceLock::new();
+
+struct ClientStream {
+    /// 收到的响应消息
+    inbox: Mutex<std::collections::VecDeque<Vec<u8>>>,
+    ready: std::sync::Condvar,
+    /// 服务端把流收尾了（不会再有消息）
+    done: std::sync::atomic::AtomicBool,
+    /// 收尾状态。没收尾之前是 None。
+    status: Mutex<Option<(i64, String)>>,
+    /// 往服务端发的口子
+    outbox: tokio::sync::mpsc::UnboundedSender<StreamOut>,
+}
+
+enum StreamOut {
+    Data(Vec<u8>),
+    CloseSend,
+}
+
+fn streams() -> &'static Mutex<HashMap<i64, Arc<ClientStream>>> {
+    STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn find_stream(id: i64) -> Option<Arc<ClientStream>> {
+    streams()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .cloned()
+}
+
+/// 开一条流。返回流句柄；失败 -1。
+///
+/// 三种流（服务端流/客户端流/双向）在这一层是同一件事 —— 发几条、收几条
+/// 由调用方决定。`.proto` 里的 stream 标记只影响对面怎么用。
+#[no_mangle]
+pub extern "C" fn qi_grpc_open_stream(conn_id: i64, method: *const c_char, timeout_ms: i64) -> i64 {
+    let Some(conn) = conns()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&conn_id)
+        .cloned()
+    else {
+        return -1;
+    };
+    let Some(rt) = client_runtime() else {
+        return -1;
+    };
+
+    let method_name = read_cstr(method);
+    let deadline_ms = if timeout_ms <= 0 {
+        300_000
+    } else {
+        timeout_ms as u64
+    };
+    let Some((sender_picked, authority)) = pick_sender(&conn) else {
+        return -1;
+    };
+    let uri = format!(
+        "{}://{}/{}",
+        conn.scheme,
+        authority,
+        method_name.trim_start_matches('/')
+    );
+
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<StreamOut>();
+    let state = Arc::new(ClientStream {
+        inbox: Mutex::new(std::collections::VecDeque::new()),
+        ready: std::sync::Condvar::new(),
+        done: std::sync::atomic::AtomicBool::new(false),
+        status: Mutex::new(None),
+        outbox: out_tx,
+    });
+
+    let mut sender = sender_picked;
+    let for_task = state.clone();
+    // 开流本身要同步知道成没成，所以在这儿等握手那一步
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<bool>();
+    rt.spawn(async move {
+        let request = match Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("grpc-accept-encoding", "identity,gzip")
+            .header("grpc-timeout", format!("{}m", deadline_ms))
+            .header("user-agent", "qi-grpc")
+            .body(())
+        {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = started_tx.send(false);
+                return;
+            }
+        };
+        let ready = match sender.ready().await {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = started_tx.send(false);
+                return;
+            }
+        };
+        let mut ready = ready;
+        // end_of_stream = false：后面还要接着发（客户端流的前提）
+        let (response, mut send_stream) = match ready.send_request(request, false) {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = started_tx.send(false);
+                return;
+            }
+        };
+        let _ = started_tx.send(true);
+
+        // 写腿：qi 侧要发什么就发什么
+        let writer = async move {
+            while let Some(item) = out_rx.recv().await {
+                match item {
+                    StreamOut::Data(payload) => {
+                        let gzip = payload.len() >= GZIP_MIN_BYTES;
+                        let (framed, _) = frame_message(&payload, gzip);
+                        if send_stream.send_data(Bytes::from(framed), false).is_err() {
+                            return;
+                        }
+                    }
+                    StreamOut::CloseSend => {
+                        // 半关：告诉对面「我不再发了」，但还在收。
+                        // 客户端流的服务端就等这个信号才开始算总账。
+                        let _ = send_stream.send_data(Bytes::new(), true);
+                        return;
+                    }
+                }
+            }
+        };
+
+        // 读腿：把服务端的消息塞进 inbox
+        let reader = async move {
+            let response = match response.await {
+                Ok(r) => r,
+                Err(e) => {
+                    finish_stream(&for_task, STATUS_UNAVAILABLE, format!("没等到响应: {}", e));
+                    return;
+                }
+            };
+            let head_status = read_status(response.headers());
+            let gzip = response
+                .headers()
+                .get("grpc-encoding")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim() == "gzip")
+                .unwrap_or(false);
+            let mut body = response.into_body();
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let Ok(data) = chunk else { break };
+                let _ = body.flow_control().release_capacity(data.len());
+                buf.extend_from_slice(&data);
+                loop {
+                    let Some((compressed, raw)) = take_one_message(&buf) else {
+                        break;
+                    };
+                    let used = 5 + raw.len().max(frame_len(&buf));
+                    buf.drain(..used.min(buf.len()));
+                    let plain = if compressed {
+                        if !gzip {
+                            break;
+                        }
+                        match gzip_decode(&raw) {
+                            Some(p) => p,
+                            None => break,
+                        }
+                    } else {
+                        raw
+                    };
+                    let mut inbox = for_task.inbox.lock().unwrap_or_else(|e| e.into_inner());
+                    inbox.push_back(plain);
+                    drop(inbox);
+                    for_task.ready.notify_all();
+                }
+            }
+            let trailer_status = match body.trailers().await {
+                Ok(Some(t)) => read_status(&t),
+                _ => None,
+            };
+            let (code, msg) = trailer_status
+                .or(head_status)
+                .unwrap_or((STATUS_UNKNOWN, "对面没给 grpc-status".to_string()));
+            finish_stream(&for_task, code, msg);
+        };
+
+        tokio::join!(writer, reader);
+    });
+
+    match started_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(true) => {}
+        _ => return -1,
+    }
+
+    let id = NEXT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
+    streams()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, state);
+    id
+}
+
+fn frame_len(buf: &[u8]) -> usize {
+    if buf.len() < 5 {
+        return 0;
+    }
+    u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize
+}
+
+fn finish_stream(state: &Arc<ClientStream>, code: i64, message: String) {
+    *state.status.lock().unwrap_or_else(|e| e.into_inner()) = Some((code, message));
+    state.done.store(true, std::sync::atomic::Ordering::SeqCst);
+    state.ready.notify_all();
+}
+
+/// 往流上发一条消息。
+#[no_mangle]
+pub extern "C" fn qi_grpc_stream_send(stream_id: i64, bytes_handle: i64) -> i64 {
+    let Some(state) = find_stream(stream_id) else {
+        return -1;
+    };
+    let payload = clone_bytes(bytes_handle).unwrap_or_default();
+    match state.outbox.send(StreamOut::Data(payload)) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// 半关：不再发了，但还收。**客户端流必须调这个**，
+/// 否则服务端一直在等下一条，两边干瞪眼。
+#[no_mangle]
+pub extern "C" fn qi_grpc_stream_close_send(stream_id: i64) -> i64 {
+    let Some(state) = find_stream(stream_id) else {
+        return -1;
+    };
+    match state.outbox.send(StreamOut::CloseSend) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// 收一条。返回字节切片句柄；**0 = 这轮没有（超时）**，
+/// **-1 = 服务端已收尾**（去查 流状态）。
+#[no_mangle]
+pub extern "C" fn qi_grpc_stream_recv(stream_id: i64, timeout_ms: i64) -> i64 {
+    let Some(state) = find_stream(stream_id) else {
+        return -1;
+    };
+    let mut inbox = state.inbox.lock().unwrap_or_else(|e| e.into_inner());
+    if inbox.is_empty() && !state.done.load(std::sync::atomic::Ordering::SeqCst) {
+        let (q, _) = state
+            .ready
+            .wait_timeout(inbox, Duration::from_millis(timeout_ms.max(1) as u64))
+            .unwrap_or_else(|e| e.into_inner());
+        inbox = q;
+    }
+    match inbox.pop_front() {
+        Some(msg) => register_bytes(msg),
+        None => {
+            if state.done.load(std::sync::atomic::Ordering::SeqCst) {
+                -1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// 流的收尾状态码。还没收尾返回 -1。
+#[no_mangle]
+pub extern "C" fn qi_grpc_stream_status(stream_id: i64) -> i64 {
+    match find_stream(stream_id) {
+        Some(state) => match &*state.status.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((code, _)) => *code,
+            None => -1,
+        },
+        None => -1,
+    }
+}
+
+/// 流的收尾说明。
+#[no_mangle]
+pub extern "C" fn qi_grpc_stream_message(stream_id: i64) -> *mut c_char {
+    match find_stream(stream_id) {
+        Some(state) => match &*state.status.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((_, msg)) => out_str(msg.clone()),
+            None => out_str(String::new()),
+        },
+        None => out_str("流句柄无效".to_string()),
+    }
+}
+
+/// 关掉流句柄。没半关过的话顺手半关，免得对面一直等。
+#[no_mangle]
+pub extern "C" fn qi_grpc_stream_free(stream_id: i64) -> i64 {
+    match streams()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&stream_id)
+    {
+        Some(state) => {
+            let _ = state.outbox.send(StreamOut::CloseSend);
             0
         }
         None => -1,

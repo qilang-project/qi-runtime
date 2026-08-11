@@ -178,6 +178,45 @@ const STATUS_OK: i64 = 0;
 const STATUS_UNIMPLEMENTED: i64 = 12;
 const STATUS_INTERNAL: i64 = 13;
 const STATUS_RESOURCE_EXHAUSTED: i64 = 8;
+const STATUS_DEADLINE_EXCEEDED: i64 = 4;
+
+static DEADLINES: OnceLock<Mutex<HashMap<i64, std::time::Instant>>> = OnceLock::new();
+
+fn deadlines() -> &'static Mutex<HashMap<i64, std::time::Instant>> {
+    DEADLINES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_deadline(call_id: i64, at: std::time::Instant) {
+    deadlines()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(call_id, at);
+}
+
+fn clear_deadline(call_id: i64) {
+    deadlines()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&call_id);
+}
+
+/// `grpc-timeout` 的值：一串数字 + 一个单位字母。
+/// H 小时 / M 分钟 / S 秒 / m 毫秒 / u 微秒 / n 纳秒。
+/// **M 是分钟、m 是毫秒**，大小写弄反就是六万倍的误差。
+fn parse_grpc_timeout(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    let (digits, unit) = raw.split_at(raw.len().checked_sub(1)?);
+    let n: u64 = digits.parse().ok()?;
+    Some(match unit {
+        "H" => Duration::from_secs(n.saturating_mul(3600)),
+        "M" => Duration::from_secs(n.saturating_mul(60)),
+        "S" => Duration::from_secs(n),
+        "m" => Duration::from_millis(n),
+        "u" => Duration::from_micros(n),
+        "n" => Duration::from_nanos(n),
+        _ => return None,
+    })
+}
 
 /// 小于这个字节数就不压了 —— gzip 光头部就 18 字节，压小消息是负收益。
 const GZIP_MIN_BYTES: usize = 512;
@@ -395,6 +434,15 @@ async fn serve_stream(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("identity")
         .to_string();
+    // 上游给的 deadline。它是**整条调用**的预算，超了就算业务还在算也没意义 ——
+    // 对面早就不等了。没给就按 5 分钟兜底，免得跑飞的 handler 把流挂到天荒地老。
+    let deadline = head
+        .headers
+        .get("grpc-timeout")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_grpc_timeout)
+        .unwrap_or_else(|| Duration::from_secs(300));
+
     let client_accepts_gzip = head
         .headers
         .get("grpc-accept-encoding")
@@ -484,37 +532,63 @@ async fn serve_stream(
         reader_inbound.ready.notify_all();
     });
 
+    // 记下截止时间，qi 侧可以查还剩多少预算
+    set_deadline(call_id, std::time::Instant::now() + deadline);
+
     // 写腿：qi 侧发什么就写什么。头**懒发** —— 收尾时还没发过数据且状态非 0，
     // 就走 trailers-only 响应（gRPC 允许，且是错误路径的常规形状）。
     let mut stream: Option<h2::SendStream<Bytes>> = None;
-    while let Some(item) = out_rx.recv().await {
-        match item {
-            Outbound::Data(payload) => {
-                if stream.is_none() {
-                    match open_response(&mut respond, client_accepts_gzip) {
-                        Some(s) => stream = Some(s),
-                        None => return,
-                    }
-                }
-                let use_gzip = client_accepts_gzip && payload.len() >= GZIP_MIN_BYTES;
-                let framed = frame_message_maybe_gzip(&payload, use_gzip);
-                if let Some(s) = stream.as_mut() {
-                    if s.send_data(Bytes::from(framed), false).is_err() {
-                        return;
-                    }
-                }
-            }
-            Outbound::Finish(status, message) => {
+    let sleep = tokio::time::sleep(deadline);
+    tokio::pin!(sleep);
+    loop {
+        let item = tokio::select! {
+            // 到点了：**运行时自己把话说清楚**。不主动收尾的话，客户端只能
+            // 等自己那侧超时，服务端日志上什么都看不到。
+            _ = &mut sleep => {
+                clear_deadline(call_id);
+                pending_calls().lock().unwrap_or_else(|e| e.into_inner()).remove(&call_id);
                 match stream.as_mut() {
-                    Some(s) => {
-                        let _ = s.send_trailers(build_trailers(status, &message));
-                    }
-                    None => send_status_only(&mut respond, status, &message),
+                    Some(s) => { let _ = s.send_trailers(build_trailers(STATUS_DEADLINE_EXCEEDED, "超过调用方给的期限")); }
+                    None => send_status_only(&mut respond, STATUS_DEADLINE_EXCEEDED, "超过调用方给的期限"),
                 }
                 return;
             }
+            got = out_rx.recv() => match got {
+                Some(v) => v,
+                None => break,
+            },
+        };
+        {
+            match item {
+                Outbound::Data(payload) => {
+                    if stream.is_none() {
+                        match open_response(&mut respond, client_accepts_gzip) {
+                            Some(s) => stream = Some(s),
+                            None => return,
+                        }
+                    }
+                    let use_gzip = client_accepts_gzip && payload.len() >= GZIP_MIN_BYTES;
+                    let framed = frame_message_maybe_gzip(&payload, use_gzip);
+                    if let Some(s) = stream.as_mut() {
+                        if s.send_data(Bytes::from(framed), false).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Outbound::Finish(status, message) => {
+                    clear_deadline(call_id);
+                    match stream.as_mut() {
+                        Some(s) => {
+                            let _ = s.send_trailers(build_trailers(status, &message));
+                        }
+                        None => send_status_only(&mut respond, status, &message),
+                    }
+                    return;
+                }
+            }
         }
     }
+    clear_deadline(call_id);
 
     // 通道关了却没收到 Finish —— qi 侧把这条调用丢了
     match stream.as_mut() {
@@ -756,6 +830,24 @@ pub extern "C" fn qi_grpc_respond(
         return -1;
     }
     qi_grpc_finish(call_id, status, message)
+}
+
+/// 这条调用还剩多少毫秒预算。没有 deadline 信息时返回 -1。
+///
+/// 长活儿（查库、调 LLM）动手前问一句：只剩两百毫秒就别开工了，
+/// 直接回 DEADLINE_EXCEEDED —— 干完也没人要。
+#[no_mangle]
+pub extern "C" fn qi_grpc_deadline_left(call_id: i64) -> i64 {
+    match deadlines()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&call_id)
+    {
+        Some(at) => at
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis() as i64,
+        None => -1,
+    }
 }
 
 /// 开服务端反射：把一个描述符句柄挂到服务器上。
