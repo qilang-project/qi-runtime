@@ -60,6 +60,9 @@ struct ClientConn {
     tls_ca: Option<String>,
     /// UNAVAILABLE 时最多再试几次（0 = 不重试）
     retries: i64,
+    /// 连接级默认元数据。auth token 这类每次都要带的东西放这儿，
+    /// 免得每个调用点都记得传一遍 —— 漏一个就是一次 401。
+    default_metadata: Vec<(String, String)>,
 }
 
 struct SubChannel {
@@ -79,6 +82,7 @@ const STATUS_UNKNOWN: i64 = 2;
 const STATUS_DEADLINE_EXCEEDED: i64 = 4;
 const STATUS_UNAVAILABLE: i64 = 14;
 const STATUS_INTERNAL: i64 = 13;
+const STATUS_RESOURCE_EXHAUSTED: i64 = 8;
 
 fn client_runtime() -> Option<&'static tokio::runtime::Runtime> {
     if let Some(rt) = CLIENT_RUNTIME.get() {
@@ -113,6 +117,23 @@ fn out_str(s: String) -> *mut c_char {
 /// 小于这个字节数就不压 —— gzip 光头部 18 字节，压小消息是负收益。
 const GZIP_MIN_BYTES: usize = 512;
 
+/// 单条消息上限，默认 4MB（跟 gRPC 各家实现一致）。**客户端一样要设** ——
+/// 一个坏掉（或恶意）的服务端可以用一条声称 2GB 的响应把客户端撑死。
+/// 用 QI_GRPC_MAX_MESSAGE 调（字节）。
+fn max_message_bytes() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("QI_GRPC_MAX_MESSAGE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(4 * 1024 * 1024)
+    })
+}
+
+/// 出站队列深度（有界 = 背压）
+const OUTBOUND_DEPTH: usize = 64;
+
 fn frame_message(msg: &[u8], gzip: bool) -> (Vec<u8>, bool) {
     let compressed_body = if gzip { gzip_encode(msg) } else { None };
     let (body, flag): (&[u8], u8) = match compressed_body.as_deref() {
@@ -143,16 +164,20 @@ fn gzip_decode(raw: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn take_one_message(buf: &[u8]) -> Option<(bool, Vec<u8>)> {
+/// 拆一条消息。`Err(声称的长度)` = 超了上限。
+fn take_one_message(buf: &[u8]) -> Result<Option<(bool, Vec<u8>)>, usize> {
     if buf.len() < 5 {
-        return None;
+        return Ok(None);
     }
     let compressed = buf[0] != 0;
     let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-    if buf.len() < 5 + len {
-        return None;
+    if len > max_message_bytes() {
+        return Err(len);
     }
-    Some((compressed, buf[5..5 + len].to_vec()))
+    if buf.len() < 5 + len {
+        return Ok(None);
+    }
+    Ok(Some((compressed, buf[5..5 + len].to_vec())))
 }
 
 /// grpc-message 的反转义（服务端按 percent-encoding 编过）。
@@ -292,6 +317,7 @@ fn dial_inner(raw: String, tls_ca: Option<String>) -> i64 {
             scheme: if tls { "https" } else { "http" },
             tls_ca: if tls { Some(ca) } else { None },
             retries: 2,
+            default_metadata: Vec::new(),
         }),
     );
     id
@@ -393,6 +419,105 @@ fn mark_dead(conn: &ClientConn, authority: &str) {
     }
 }
 
+/// 给连接设一组默认元数据（JSON 对象），每次调用都会带上。
+///
+/// auth token 这类东西放这儿，免得每个调用点都得记得传 —— 漏一个就是一次 401。
+/// 每次调用还可以再补，同名的以**调用级**为准。
+#[no_mangle]
+pub extern "C" fn qi_grpc_set_metadata(conn_id: i64, json: *const c_char) -> i64 {
+    let text = read_cstr(json);
+    let parsed: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
+    let serde_json::Value::Object(map) = parsed else {
+        return -1;
+    };
+    let mut list = Vec::new();
+    for (k, v) in map {
+        if let Some(text) = json_meta_value(&v) {
+            list.push((k.to_ascii_lowercase(), text));
+        }
+    }
+
+    let mut conns = conns().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(conn) = conns.get(&conn_id) else {
+        return -1;
+    };
+    // ClientConn 在 Arc 里且没有内部可变性，直接换一个新的
+    let replaced = Arc::new(ClientConn {
+        subs: conn
+            .subs
+            .iter()
+            .map(|s| {
+                let s = s.lock().unwrap_or_else(|e| e.into_inner());
+                Mutex::new(SubChannel {
+                    authority: s.authority.clone(),
+                    sender: s.sender.clone(),
+                })
+            })
+            .collect(),
+        next: AtomicI64::new(conn.next.load(Ordering::SeqCst)),
+        scheme: conn.scheme,
+        tls_ca: conn.tls_ca.clone(),
+        retries: conn.retries,
+        default_metadata: list,
+    });
+    conns.insert(conn_id, replaced);
+    0
+}
+
+fn json_meta_value(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// 元数据往请求头上贴。**保留头不给覆盖** —— content-type、te、grpc-timeout
+/// 这些是协议自己的地盘，让业务改只会把调用弄坏，而且坏得莫名其妙。
+fn apply_metadata(
+    mut builder: http::request::Builder,
+    metadata: &[(String, String)],
+) -> http::request::Builder {
+    for (k, v) in metadata {
+        let key = k.to_ascii_lowercase();
+        if key.starts_with(':')
+            || key == "content-type"
+            || key == "te"
+            || key == "user-agent"
+            || key.starts_with("grpc-")
+        {
+            continue;
+        }
+        builder = builder.header(key, v.clone());
+    }
+    builder
+}
+
+/// 把调用级元数据 JSON 并到连接级默认之上（同名以调用级为准）。
+fn merge_metadata(base: &[(String, String)], call_json: &str) -> Vec<(String, String)> {
+    let mut out = base.to_vec();
+    if call_json.trim().is_empty() {
+        return out;
+    }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(call_json)
+    else {
+        return out;
+    };
+    for (k, v) in map {
+        let Some(text) = json_meta_value(&v) else {
+            continue;
+        };
+        let key = k.to_ascii_lowercase();
+        out.retain(|(existing, _)| existing != &key);
+        out.push((key, text));
+    }
+    out
+}
+
 /// 关连接。在途的调用会被断掉。
 #[no_mangle]
 pub extern "C" fn qi_grpc_close_conn(conn_id: i64) -> i64 {
@@ -417,6 +542,18 @@ pub extern "C" fn qi_grpc_call(
     request_bytes: i64,
     timeout_ms: i64,
 ) -> i64 {
+    qi_grpc_call_meta(conn_id, method, request_bytes, timeout_ms, std::ptr::null())
+}
+
+/// 带调用级元数据的一元调用。元数据是 JSON 对象；同名的盖掉连接级默认。
+#[no_mangle]
+pub extern "C" fn qi_grpc_call_meta(
+    conn_id: i64,
+    method: *const c_char,
+    request_bytes: i64,
+    timeout_ms: i64,
+    metadata_json: *const c_char,
+) -> i64 {
     let Some(conn) = conns()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -431,6 +568,7 @@ pub extern "C" fn qi_grpc_call(
 
     let method_name = read_cstr(method);
     let payload = clone_bytes(request_bytes).unwrap_or_default();
+    let metadata = merge_metadata(&conn.default_metadata, &read_cstr(metadata_json));
     let scheme = conn.scheme;
     let wait = Duration::from_millis(if timeout_ms <= 0 {
         30_000
@@ -453,6 +591,7 @@ pub extern "C" fn qi_grpc_call(
         let payload_try = payload.clone();
         let method_try = method_name.clone();
         let authority_try = authority.clone();
+        let meta_try = metadata.clone();
         let outcome = rt.block_on(async move {
             let fut = unary_call(
                 sender,
@@ -461,6 +600,7 @@ pub extern "C" fn qi_grpc_call(
                 &method_try,
                 payload_try,
                 wait.as_millis() as u64,
+                meta_try,
             );
             match tokio::time::timeout(wait, fut).await {
                 Ok(r) => r,
@@ -504,6 +644,7 @@ async fn unary_call(
     method: &str,
     payload: Vec<u8>,
     deadline_ms: u64,
+    metadata: Vec<(String, String)>,
 ) -> (i64, String, Vec<u8>) {
     let uri = format!(
         "{}://{}/{}",
@@ -511,6 +652,17 @@ async fn unary_call(
         authority,
         method.trim_start_matches('/')
     );
+    if payload.len() > max_message_bytes() {
+        return (
+            STATUS_RESOURCE_EXHAUSTED,
+            format!(
+                "请求 {} 字节超过上限 {}",
+                payload.len(),
+                max_message_bytes()
+            ),
+            Vec::new(),
+        );
+    }
     // 大请求压着发；无论压不压，都声明我们**收**得下 gzip，
     // 这样服务端可以压着回（两个头是不同方向的）。
     let (framed, did_gzip) = frame_message(&payload, payload.len() >= GZIP_MIN_BYTES);
@@ -528,6 +680,7 @@ async fn unary_call(
     if did_gzip {
         builder = builder.header("grpc-encoding", "gzip");
     }
+    builder = apply_metadata(builder, &metadata);
     let request = match builder.body(()) {
         Ok(r) => r,
         Err(e) => return (STATUS_INTERNAL, format!("请求组不出来: {}", e), Vec::new()),
@@ -593,7 +746,21 @@ async fn unary_call(
     if status != STATUS_OK {
         return (status, message, Vec::new());
     }
-    match take_one_message(&buf) {
+    let parsed = match take_one_message(&buf) {
+        Ok(v) => v,
+        Err(claimed) => {
+            return (
+                STATUS_RESOURCE_EXHAUSTED,
+                format!(
+                    "响应声称 {} 字节，超过上限 {}",
+                    claimed,
+                    max_message_bytes()
+                ),
+                Vec::new(),
+            );
+        }
+    };
+    match parsed {
         Some((true, raw)) => {
             if !response_gzip {
                 // 标志位说压了，头却没说用什么压的
@@ -698,7 +865,7 @@ struct ClientStream {
     /// 收尾状态。没收尾之前是 None。
     status: Mutex<Option<(i64, String)>>,
     /// 往服务端发的口子
-    outbox: tokio::sync::mpsc::UnboundedSender<StreamOut>,
+    outbox: tokio::sync::mpsc::Sender<StreamOut>,
 }
 
 enum StreamOut {
@@ -745,6 +912,7 @@ pub extern "C" fn qi_grpc_open_stream(conn_id: i64, method: *const c_char, timeo
     let Some((sender_picked, authority)) = pick_sender(&conn) else {
         return -1;
     };
+    let stream_metadata = conn.default_metadata.clone();
     let uri = format!(
         "{}://{}/{}",
         conn.scheme,
@@ -752,7 +920,7 @@ pub extern "C" fn qi_grpc_open_stream(conn_id: i64, method: *const c_char, timeo
         method_name.trim_start_matches('/')
     );
 
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<StreamOut>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<StreamOut>(OUTBOUND_DEPTH);
     let state = Arc::new(ClientStream {
         inbox: Mutex::new(std::collections::VecDeque::new()),
         ready: std::sync::Condvar::new(),
@@ -766,16 +934,15 @@ pub extern "C" fn qi_grpc_open_stream(conn_id: i64, method: *const c_char, timeo
     // 开流本身要同步知道成没成，所以在这儿等握手那一步
     let (started_tx, started_rx) = std::sync::mpsc::channel::<bool>();
     rt.spawn(async move {
-        let request = match Request::builder()
+        let request = Request::builder()
             .method("POST")
             .uri(uri)
             .header("content-type", "application/grpc")
             .header("te", "trailers")
             .header("grpc-accept-encoding", "identity,gzip")
             .header("grpc-timeout", format!("{}m", deadline_ms))
-            .header("user-agent", "qi-grpc")
-            .body(())
-        {
+            .header("user-agent", "qi-grpc");
+        let request = match apply_metadata(request, &stream_metadata).body(()) {
             Ok(r) => r,
             Err(_) => {
                 let _ = started_tx.send(false);
@@ -844,7 +1011,18 @@ pub extern "C" fn qi_grpc_open_stream(conn_id: i64, method: *const c_char, timeo
                 let _ = body.flow_control().release_capacity(data.len());
                 buf.extend_from_slice(&data);
                 loop {
-                    let Some((compressed, raw)) = take_one_message(&buf) else {
+                    let parsed = match take_one_message(&buf) {
+                        Ok(v) => v,
+                        Err(claimed) => {
+                            finish_stream(
+                                &for_task,
+                                STATUS_RESOURCE_EXHAUSTED,
+                                format!("响应声称 {} 字节，超过上限", claimed),
+                            );
+                            return;
+                        }
+                    };
+                    let Some((compressed, raw)) = parsed else {
                         break;
                     };
                     let used = 5 + raw.len().max(frame_len(&buf));
@@ -912,7 +1090,10 @@ pub extern "C" fn qi_grpc_stream_send(stream_id: i64, bytes_handle: i64) -> i64 
         return -1;
     };
     let payload = clone_bytes(bytes_handle).unwrap_or_default();
-    match state.outbox.send(StreamOut::Data(payload)) {
+    if payload.len() > max_message_bytes() {
+        return -1;
+    }
+    match state.outbox.blocking_send(StreamOut::Data(payload)) {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -925,7 +1106,7 @@ pub extern "C" fn qi_grpc_stream_close_send(stream_id: i64) -> i64 {
     let Some(state) = find_stream(stream_id) else {
         return -1;
     };
-    match state.outbox.send(StreamOut::CloseSend) {
+    match state.outbox.blocking_send(StreamOut::CloseSend) {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -991,7 +1172,7 @@ pub extern "C" fn qi_grpc_stream_free(stream_id: i64) -> i64 {
         .remove(&stream_id)
     {
         Some(state) => {
-            let _ = state.outbox.send(StreamOut::CloseSend);
+            let _ = state.outbox.try_send(StreamOut::CloseSend);
             0
         }
         None => -1,

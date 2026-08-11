@@ -74,10 +74,15 @@ struct Server {
 /// 而那个分叉的答案已经在 .proto 里了。
 struct PendingCall {
     method: String,
+    /// 请求头（元数据）。gRPC 的鉴权、链路追踪、租户标识全靠它，
+    /// 不暴露给业务侧的话拦截器就只能做日志，做不了鉴权。
+    metadata: Vec<(String, String)>,
+    /// 业务侧要塞进 trailers 的自定义元数据
+    out_trailers: Mutex<Vec<(String, String)>>,
     /// 客户端发过来的消息队列（协议层往里塞，qi 侧取）
     inbound: Arc<Inbound>,
     /// 往客户端发的口子。发消息和收尾都走它，保证顺序。
-    outbound: tokio::sync::mpsc::UnboundedSender<Outbound>,
+    outbound: tokio::sync::mpsc::Sender<Outbound>,
     /// 一元路径缓存的第一条消息 —— 请求字节 可以被调多次，
     /// 每次都从队列里弹一条的话第二次就空了。
     first_message: Mutex<Option<i64>>,
@@ -86,6 +91,8 @@ struct PendingCall {
 struct Inbound {
     queue: Mutex<VecDeque<Vec<u8>>>,
     ready: Condvar,
+    /// 对面发了超限的消息，这条流已经废了
+    oversized: AtomicBool,
     /// 客户端半关了流（不会再有消息）。跟「这一轮没消息」是两回事：
     /// 前者要让 收一条 返回 -1 让循环退出，后者返回 0 让它接着等。
     ended: AtomicBool,
@@ -93,7 +100,8 @@ struct Inbound {
 
 enum Outbound {
     Data(Vec<u8>),
-    Finish(i64, String),
+    /// 状态码、说明、业务自己塞的 trailer 元数据
+    Finish(i64, String, Vec<(String, String)>),
 }
 
 fn servers() -> &'static Mutex<HashMap<i64, Arc<Server>>> {
@@ -121,16 +129,20 @@ fn out_str(s: String) -> *mut c_char {
 // 一个 DATA 帧里可以有多条消息，一条消息也能跨多个 DATA 帧 ——
 // 所以不能假设「一帧一消息」，得边收边试着拆。
 
-fn take_one_message(buf: &[u8]) -> Option<(bool, Vec<u8>)> {
+/// 拆一条消息。`Err(声称的长度)` = 超了上限，调用方该回 RESOURCE_EXHAUSTED。
+fn take_one_message(buf: &[u8]) -> Result<Option<(bool, Vec<u8>)>, usize> {
     if buf.len() < 5 {
-        return None;
+        return Ok(None);
     }
     let compressed = buf[0] != 0;
     let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-    if buf.len() < 5 + len {
-        return None;
+    if len > max_message_bytes() {
+        return Err(len);
     }
-    Some((compressed, buf[5..5 + len].to_vec()))
+    if buf.len() < 5 + len {
+        return Ok(None);
+    }
+    Ok(Some((compressed, buf[5..5 + len].to_vec())))
 }
 
 fn frame_message(msg: &[u8]) -> Vec<u8> {
@@ -220,6 +232,28 @@ fn parse_grpc_timeout(raw: &str) -> Option<Duration> {
 
 /// 小于这个字节数就不压了 —— gzip 光头部就 18 字节，压小消息是负收益。
 const GZIP_MIN_BYTES: usize = 512;
+
+/// 单条消息的大小上限，默认 4MB（跟 gRPC 各家实现的默认值一致）。
+///
+/// **没有上限就是一个 OOM 漏洞**：分帧头里那 4 个字节是对面说的长度，
+/// 照着它一路 extend 下去，一条声称 2GB 的消息就能把进程撑死 ——
+/// 而且不需要真发 2GB，光是让我们按那个数扩容就够了。
+/// 用 QI_GRPC_MAX_MESSAGE 调（字节）。
+fn max_message_bytes() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("QI_GRPC_MAX_MESSAGE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(4 * 1024 * 1024)
+    })
+}
+
+/// 出站队列的深度。**不能无界**：qi 侧循环里疯狂 发一条 而对面读得慢时，
+/// 无界队列会一路吃内存直到进程死掉 —— HTTP/2 有流控，但那是在 socket 那一层，
+/// 拦不住我们自己在内存里堆。满了就阻塞发送方，这才是背压。
+const OUTBOUND_DEPTH: usize = 64;
 
 /// 起监听（明文 h2c），**立刻返回**服务器句柄；失败 -1。
 ///
@@ -453,9 +487,10 @@ async fn serve_stream(
     let inbound = Arc::new(Inbound {
         queue: Mutex::new(VecDeque::new()),
         ready: Condvar::new(),
+        oversized: AtomicBool::new(false),
         ended: AtomicBool::new(false),
     });
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Outbound>(OUTBOUND_DEPTH);
 
     // **收头就派发**，不等第一条消息。
     //
@@ -481,6 +516,8 @@ async fn serve_stream(
                 call_id,
                 PendingCall {
                     method,
+                    metadata: collect_metadata(&head.headers),
+                    out_trailers: Mutex::new(Vec::new()),
                     inbound: inbound.clone(),
                     outbound: out_tx,
                     first_message: Mutex::new(None),
@@ -501,7 +538,22 @@ async fn serve_stream(
             let _ = body.flow_control().release_capacity(data.len());
             buf.extend_from_slice(&data);
             loop {
-                match take_one_message(&buf) {
+                let parsed = match take_one_message(&buf) {
+                    Ok(v) => v,
+                    Err(claimed) => {
+                        // 对面声称的长度超过上限：**不要照着它扩容**
+                        eprintln!(
+                            "[qi-grpc] 请求消息声称 {} 字节，超过上限 {}",
+                            claimed,
+                            max_message_bytes()
+                        );
+                        reader_inbound.oversized.store(true, Ordering::SeqCst);
+                        reader_inbound.ended.store(true, Ordering::SeqCst);
+                        reader_inbound.ready.notify_all();
+                        return;
+                    }
+                };
+                match parsed {
                     Some((compressed, raw)) => {
                         let used = 5 + raw_len_after_frame(&buf);
                         buf.drain(..used);
@@ -561,6 +613,32 @@ async fn serve_stream(
         {
             match item {
                 Outbound::Data(payload) => {
+                    if payload.len() > max_message_bytes() {
+                        eprintln!(
+                            "[qi-grpc] 响应 {} 字节超过上限 {}，掐掉",
+                            payload.len(),
+                            max_message_bytes()
+                        );
+                        clear_deadline(call_id);
+                        pending_calls()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&call_id);
+                        match stream.as_mut() {
+                            Some(s) => {
+                                let _ = s.send_trailers(build_trailers(
+                                    STATUS_RESOURCE_EXHAUSTED,
+                                    "响应消息超过大小上限",
+                                ));
+                            }
+                            None => send_status_only(
+                                &mut respond,
+                                STATUS_RESOURCE_EXHAUSTED,
+                                "响应消息超过大小上限",
+                            ),
+                        }
+                        return;
+                    }
                     if stream.is_none() {
                         match open_response(&mut respond, client_accepts_gzip) {
                             Some(s) => stream = Some(s),
@@ -575,13 +653,44 @@ async fn serve_stream(
                         }
                     }
                 }
-                Outbound::Finish(status, message) => {
+                Outbound::Finish(status, message, extra) => {
                     clear_deadline(call_id);
+                    // 对面发过超限消息的话，不管 qi 侧说什么都是 RESOURCE_EXHAUSTED ——
+                    // handler 只看到「流提前结束」，会当成正常收尾报 OK，
+                    // 那样调用方永远不知道自己的请求是被我们掐掉的
+                    let (status, message) = if inbound.oversized.load(Ordering::SeqCst) {
+                        (
+                            STATUS_RESOURCE_EXHAUSTED,
+                            "请求消息超过大小上限".to_string(),
+                        )
+                    } else {
+                        (status, message)
+                    };
+                    let mut trailers = build_trailers(status, &message);
+                    for (k, v) in &extra {
+                        if let (Ok(name), Ok(value)) = (
+                            http::header::HeaderName::from_bytes(k.as_bytes()),
+                            v.parse::<http::header::HeaderValue>(),
+                        ) {
+                            trailers.insert(name, value);
+                        }
+                    }
                     match stream.as_mut() {
                         Some(s) => {
-                            let _ = s.send_trailers(build_trailers(status, &message));
+                            let _ = s.send_trailers(trailers);
                         }
-                        None => send_status_only(&mut respond, status, &message),
+                        None => {
+                            // trailers-only：状态和自定义元数据一起在初始头里
+                            if let Ok(resp) = Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .body(())
+                            {
+                                if let Ok(mut st) = respond.send_response(resp, false) {
+                                    let _ = st.send_trailers(trailers);
+                                }
+                            }
+                        }
                     }
                     return;
                 }
@@ -622,6 +731,26 @@ fn open_response(
     }
     let resp = builder.body(()).ok()?;
     respond.send_response(resp, false).ok()
+}
+
+/// 把请求头收成 (键, 值) 列表。
+///
+/// **HTTP/2 的头名一律小写**，所以查的时候也得按小写查 —— 对面写
+/// `Authorization` 到了这儿就是 `authorization`。
+/// `-bin` 结尾的是二进制元数据，线上就是 base64，原样带给业务侧。
+/// 冒号开头的伪头（:method/:path…）不算元数据，滤掉。
+fn collect_metadata(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, value) in headers.iter() {
+        let key = name.as_str();
+        if key.starts_with(':') {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            out.push((key.to_string(), v.to_string()));
+        }
+    }
+    out
 }
 
 fn build_trailers(status: i64, message: &str) -> HeaderMap {
@@ -789,7 +918,8 @@ pub extern "C" fn qi_grpc_send(call_id: i64, bytes_handle: i64) -> i64 {
         return -1;
     };
     let payload = clone_bytes(bytes_handle).unwrap_or_default();
-    match call.outbound.send(Outbound::Data(payload)) {
+    // 队列满了就在这儿等 —— 这就是背压，让 qi 侧那个循环自己慢下来
+    match call.outbound.blocking_send(Outbound::Data(payload)) {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -808,9 +938,14 @@ pub extern "C" fn qi_grpc_finish(call_id: i64, status: i64, message: *const c_ch
     else {
         return -1;
     };
+    let extra = call
+        .out_trailers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     match call
         .outbound
-        .send(Outbound::Finish(status, read_cstr(message)))
+        .blocking_send(Outbound::Finish(status, read_cstr(message), extra))
     {
         Ok(()) => 0,
         // 协议层已经走了 —— 客户端多半断了，不算错误
@@ -830,6 +965,80 @@ pub extern "C" fn qi_grpc_respond(
         return -1;
     }
     qi_grpc_finish(call_id, status, message)
+}
+
+/// 取一条请求元数据。没有这个键返回空串。
+///
+/// **键按小写查**：HTTP/2 的头名一律小写，对面写 `Authorization`
+/// 到这儿就是 `authorization`。这里会自动把键转小写，免得踩这个坑。
+#[no_mangle]
+pub extern "C" fn qi_grpc_metadata(call_id: i64, key: *const c_char) -> *mut c_char {
+    let key = read_cstr(key).to_ascii_lowercase();
+    match pending_calls()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&call_id)
+    {
+        Some(call) => {
+            for (k, v) in &call.metadata {
+                if k == &key {
+                    return out_str(v.clone());
+                }
+            }
+            out_str(String::new())
+        }
+        None => out_str(String::new()),
+    }
+}
+
+/// 全部请求元数据，JSON 对象。同名多值的只保留第一个 ——
+/// 要精确处理重复键的场景（比如多个 cookie）请自己用 元数据() 逐个取。
+#[no_mangle]
+pub extern "C" fn qi_grpc_metadata_all(call_id: i64) -> *mut c_char {
+    match pending_calls()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&call_id)
+    {
+        Some(call) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in &call.metadata {
+                map.entry(k.clone())
+                    .or_insert_with(|| serde_json::Value::String(v.clone()));
+            }
+            out_str(serde_json::Value::Object(map).to_string())
+        }
+        None => out_str("{}".to_string()),
+    }
+}
+
+/// 往响应的 trailers 里塞一条自定义元数据。收尾时一起发。
+#[no_mangle]
+pub extern "C" fn qi_grpc_set_trailer(
+    call_id: i64,
+    key: *const c_char,
+    value: *const c_char,
+) -> i64 {
+    let key = read_cstr(key).to_ascii_lowercase();
+    let value = read_cstr(value);
+    // grpc- 前缀和伪头是协议自己的地盘，业务塞进去会把状态搞乱
+    if key.starts_with("grpc-") || key.starts_with(':') || key.is_empty() {
+        return -1;
+    }
+    match pending_calls()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&call_id)
+    {
+        Some(call) => {
+            call.out_trailers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((key, value));
+            0
+        }
+        None => -1,
+    }
 }
 
 /// 这条调用还剩多少毫秒预算。没有 deadline 信息时返回 -1。
