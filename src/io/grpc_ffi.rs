@@ -93,6 +93,10 @@ struct Inbound {
     ready: Condvar,
     /// 对面发了超限的消息，这条流已经废了
     oversized: AtomicBool,
+    /// 连接断了（客户端跑了 / 网络没了），跟「正常发完半关」是两回事：
+    /// 半关之后还该回一个响应，断了则连回都没人收 —— handler 分不清的话，
+    /// 掉线的调用会白白算完一整轮再往一个死掉的流上写。
+    aborted: AtomicBool,
     /// 客户端半关了流（不会再有消息）。跟「这一轮没消息」是两回事：
     /// 前者要让 收一条 返回 -1 让循环退出，后者返回 0 让它接着等。
     ended: AtomicBool,
@@ -488,6 +492,7 @@ async fn serve_stream(
         queue: Mutex::new(VecDeque::new()),
         ready: Condvar::new(),
         oversized: AtomicBool::new(false),
+        aborted: AtomicBool::new(false),
         ended: AtomicBool::new(false),
     });
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Outbound>(OUTBOUND_DEPTH);
@@ -534,7 +539,14 @@ async fn serve_stream(
         let mut body = body;
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = body.data().await {
-            let Ok(data) = chunk else { break };
+            let data = match chunk {
+                Ok(d) => d,
+                Err(_) => {
+                    // 读出错 = 连接断了，不是正常的半关
+                    reader_inbound.aborted.store(true, Ordering::SeqCst);
+                    break;
+                }
+            };
             let _ = body.flow_control().release_capacity(data.len());
             buf.extend_from_slice(&data);
             loop {
@@ -609,6 +621,16 @@ async fn serve_stream(
                 Some(v) => v,
                 None => break,
             },
+            // 对面撤了：标记一下就收摊，没必要再往一条死流上写
+            _ = wait_reset(&mut respond, &mut stream) => {
+                inbound.aborted.store(true, Ordering::SeqCst);
+                clear_deadline(call_id);
+                pending_calls()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&call_id);
+                return;
+            }
         };
         {
             match item {
@@ -753,6 +775,22 @@ fn collect_metadata(headers: &HeaderMap) -> Vec<(String, String)> {
     out
 }
 
+/// 等对面把这条流重置（RST_STREAM）—— 也就是客户端撤了。
+///
+/// **不能靠读腿发现取消**：一元调用的客户端发完请求就半关，读腿在那一刻就
+/// 正常结束了，后来的 RST_STREAM 根本没人在看。要盯的是发送侧的 poll_reset。
+/// 这也是「客户端发完了」和「客户端跑了」必须分成两件事的原因。
+async fn wait_reset(
+    respond: &mut server::SendResponse<Bytes>,
+    stream: &mut Option<h2::SendStream<Bytes>>,
+) {
+    let _ = std::future::poll_fn(|cx| match stream.as_mut() {
+        Some(s) => s.poll_reset(cx),
+        None => respond.poll_reset(cx),
+    })
+    .await;
+}
+
 fn build_trailers(status: i64, message: &str) -> HeaderMap {
     let mut trailers = HeaderMap::new();
     trailers.insert(
@@ -876,6 +914,26 @@ pub extern "C" fn qi_grpc_recv(call_id: i64, timeout_ms: i64) -> i64 {
                 0
             }
         }
+    }
+}
+
+/// 对面还在吗。1 = 还连着，0 = 已经断了。
+///
+/// 长活儿（查库、调 LLM、跑循环）中途问一句：人都走了就别算了。
+/// **这跟「收一条返回 -1」不是一回事** —— 那个的含义是「客户端发完了」，
+/// 一元和客户端流的正常路径每次都会走到那里。
+#[no_mangle]
+pub extern "C" fn qi_grpc_alive(call_id: i64) -> i64 {
+    match find_call_inbound(call_id) {
+        Some(inbound) => {
+            if inbound.aborted.load(Ordering::SeqCst) {
+                0
+            } else {
+                1
+            }
+        }
+        // 已经收尾/不存在的调用当成断了
+        None => 0,
     }
 }
 
@@ -1083,19 +1141,37 @@ pub extern "C" fn qi_grpc_enable_reflection(server_id: i64, pool_id: i64) -> i64
     0
 }
 
-/// 停服务：唤醒等在「接收调用」上的循环，并让 accept 循环退出。
+/// 停服务：不再收新连接，**等在途调用做完**（最多等 `wait_ms`），再返回。
+///
+/// 直接把监听一关就退出的话，正在处理的请求会被拦腰截断 —— 客户端看到的是
+/// 连接重置，而不是一个体面的状态码。滚动发布时这种截断会集中出现，
+/// 表现为「每次发版都有一小撮 5xx」，查起来极其烦人。
+///
+/// 返回还没做完的调用数（0 = 全清干净了）。
 #[no_mangle]
-pub extern "C" fn qi_grpc_stop(server_id: i64) -> i64 {
-    match servers()
+pub extern "C" fn qi_grpc_stop(server_id: i64, wait_ms: i64) -> i64 {
+    let Some(server) = servers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&server_id)
-    {
-        Some(server) => {
-            server.stopping.store(true, Ordering::SeqCst);
-            server.ready.notify_all();
-            0
+    else {
+        return -1;
+    };
+    server.stopping.store(true, Ordering::SeqCst);
+    server.ready.notify_all();
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms.max(0) as u64);
+    loop {
+        let left = pending_calls()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        if left == 0 {
+            return 0;
         }
-        None => -1,
+        if std::time::Instant::now() >= deadline {
+            return left as i64;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

@@ -392,9 +392,23 @@ fn pick_sender(conn: &ClientConn) -> Option<(h2::client::SendRequest<Bytes>, Str
     for step in 0..n {
         let idx = (start + step) % n;
         let mut sub = conn.subs[idx].lock().unwrap_or_else(|e| e.into_inner());
-        // 已有的连接可能已经断了（对面重启）—— poll_ready 会告诉我们
+        // **挑之前先探一下活**。h2 的 SendRequest 在连接断了之后 poll_ready
+        // 会立刻报错，比「发出去等失败再重试」少一整个往返。对端静默消失时
+        // 尤其重要（进程被 kill -9、中间的 NAT 悄悄把连接丢了）—— 那种情况
+        // socket 上不会有 FIN，不主动探就只能等下一次调用超时才发现。
         if let Some(sender) = sub.sender.clone() {
-            return Some((sender, sub.authority.clone()));
+            let alive = rt.block_on(async {
+                let probe = sender.clone();
+                probe.ready().await
+            });
+            match alive {
+                Ok(ready) => {
+                    // ready() 把 sender 吃掉又还回来，用还回来的那个
+                    sub.sender = Some(ready.clone());
+                    return Some((ready, sub.authority.clone()));
+                }
+                Err(_) => sub.sender = None,
+            }
         }
         // 坏的：重连一次。失败就换下一个，别在这儿死磕
         let tls = conn.tls_ca.is_some() || conn.scheme == "https";
