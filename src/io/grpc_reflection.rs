@@ -285,6 +285,17 @@ fn answer_one(
                     .map(|m| m.parent_file().name().to_string())
             })
             .or_else(|| {
+                pool.get_enum_by_name(&symbol)
+                    .map(|e| e.parent_file().name().to_string())
+            })
+            .or_else(|| {
+                // 扩展也是符号 —— 漏了它，`describe 包.扩展名` 会报
+                // 「Symbol not found」，而那个扩展明明就在描述符里
+                pool.all_extensions()
+                    .find(|e| e.full_name() == symbol)
+                    .map(|e| e.parent_file().name().to_string())
+            })
+            .or_else(|| {
                 // 是方法全名的话，砍掉最后一段再试服务
                 symbol.rsplit_once('.').and_then(|(head, _)| {
                     pool.get_service_by_name(head)
@@ -329,12 +340,90 @@ fn answer_one(
         return Some(response.encode_to_vec());
     }
 
-    // 扩展相关的两种请求我们不支持（proto3 里基本用不上）
+    // all_extension_numbers_of_type：某个消息上注册了哪些扩展号
+    if let Some(type_name) = get_str("all_extension_numbers_of_type") {
+        let pool_ref = reflection_pool()?;
+        let ext_desc =
+            pool_ref.get_message_by_name("grpc.reflection.v1.ExtensionNumberResponse")?;
+        let Some(msg) = pool.get_message_by_name(&type_name) else {
+            return Some(error_response(
+                &mut response,
+                resp_desc,
+                5,
+                &format!("找不到类型 {}", type_name),
+            ));
+        };
+        let mut numbers: Vec<Value> = Vec::new();
+        for ext in pool.all_extensions() {
+            if ext.containing_message().full_name() == msg.full_name() {
+                numbers.push(Value::I32(ext.number() as i32));
+            }
+        }
+        let mut ext_resp = DynamicMessage::new(ext_desc.clone());
+        if let Some(f) = ext_desc.get_field_by_name("base_type_name") {
+            ext_resp.set_field(&f, Value::String(msg.full_name().to_string()));
+        }
+        if let Some(f) = ext_desc.get_field_by_name("extension_number") {
+            ext_resp.set_field(&f, Value::List(numbers));
+        }
+        let f = resp_desc.get_field_by_name("all_extension_numbers_response")?;
+        response.set_field(&f, Value::Message(ext_resp));
+        return Some(response.encode_to_vec());
+    }
+
+    // file_containing_extension：某个扩展号定义在哪个文件里
+    if let Some(field) = req_desc.get_field_by_name("file_containing_extension") {
+        if request.has_field(&field) {
+            let value = request.get_field(&field);
+            if let Some(ext_req) = value.as_message() {
+                let containing = ext_req
+                    .get_field_by_name("containing_type")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                let number = ext_req
+                    .get_field_by_name("extension_number")
+                    .and_then(|v| v.as_i32())
+                    .unwrap_or(0);
+                for ext in pool.all_extensions() {
+                    if ext.containing_message().full_name() == containing
+                        && ext.number() as i32 == number
+                    {
+                        let file_name = ext.parent_file().name().to_string();
+                        let fd_desc = reflection_pool()?
+                            .get_message_by_name("grpc.reflection.v1.FileDescriptorResponse")?;
+                        let mut fd_resp = DynamicMessage::new(fd_desc.clone());
+                        let mut seen = Vec::new();
+                        let mut files = Vec::new();
+                        collect_with_deps(pool, &file_name, &mut seen, &mut files);
+                        if let Some(f) = fd_desc.get_field_by_name("file_descriptor_proto") {
+                            fd_resp.set_field(
+                                &f,
+                                Value::List(
+                                    files.into_iter().map(|b| Value::Bytes(b.into())).collect(),
+                                ),
+                            );
+                        }
+                        let f = resp_desc.get_field_by_name("file_descriptor_response")?;
+                        response.set_field(&f, Value::Message(fd_resp));
+                        return Some(response.encode_to_vec());
+                    }
+                }
+                return Some(error_response(
+                    &mut response,
+                    resp_desc,
+                    5,
+                    &format!("{} 上没有扩展号 {}", containing, number),
+                ));
+            }
+        }
+    }
+
+    // 到这儿说明 oneof 一个都没设 —— 空请求
     Some(error_response(
         &mut response,
         resp_desc,
-        12,
-        "本服务只支持 list_services / file_by_filename / file_containing_symbol",
+        3,
+        "请求里没有指明要问什么",
     ))
 }
 

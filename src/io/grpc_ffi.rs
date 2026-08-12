@@ -93,6 +93,8 @@ struct Inbound {
     ready: Condvar,
     /// 对面发了超限的消息，这条流已经废了
     oversized: AtomicBool,
+    /// 对面用了我们不认识的压缩算法
+    bad_encoding: AtomicBool,
     /// 连接断了（客户端跑了 / 网络没了），跟「正常发完半关」是两回事：
     /// 半关之后还该回一个响应，断了则连回都没人收 —— handler 分不清的话，
     /// 掉线的调用会白白算完一整轮再往一个死掉的流上写。
@@ -188,6 +190,26 @@ fn gzip_decode(raw: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     GzDecoder::new(raw).read_to_end(&mut out).ok()?;
     Some(out)
+}
+
+/// deflate 也认。规范里 `deflate` 指的是 **zlib 包装**的 deflate
+/// （RFC 1950），不是裸 deflate（RFC 1951）—— 用错一个，解出来就是一堆
+/// 「invalid header」而两边都觉得自己没错。
+fn deflate_decode(raw: &[u8]) -> Option<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+    let mut out = Vec::new();
+    ZlibDecoder::new(raw).read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// 按对面声明的算法解压。不认识的算法返回 None，调用方回 UNIMPLEMENTED。
+fn decode_by(encoding: &str, raw: &[u8]) -> Option<Vec<u8>> {
+    match encoding {
+        "gzip" => gzip_decode(raw),
+        "deflate" => deflate_decode(raw),
+        _ => None,
+    }
 }
 
 const STATUS_OK: i64 = 0;
@@ -492,6 +514,7 @@ async fn serve_stream(
         queue: Mutex::new(VecDeque::new()),
         ready: Condvar::new(),
         oversized: AtomicBool::new(false),
+        bad_encoding: AtomicBool::new(false),
         aborted: AtomicBool::new(false),
         ended: AtomicBool::new(false),
     });
@@ -570,12 +593,22 @@ async fn serve_stream(
                         let used = 5 + raw_len_after_frame(&buf);
                         buf.drain(..used);
                         let plain = if compressed {
-                            if request_encoding != "gzip" {
-                                break;
-                            }
-                            match gzip_decode(&raw) {
+                            // 解不开就把这条流废掉并说清楚 —— 原来这里是
+                            // `break`，消息被**静默丢掉**，handler 只看到一个
+                            // 空请求，报出来的错跟真实原因八竿子打不着
+                            match decode_by(&request_encoding, &raw) {
                                 Some(p) => p,
-                                None => break,
+                                None => {
+                                    eprintln!(
+                                        "[qi-grpc] 解不开 grpc-encoding: {}",
+                                        request_encoding
+                                    );
+                                    reader_inbound.oversized.store(false, Ordering::SeqCst);
+                                    reader_inbound.bad_encoding.store(true, Ordering::SeqCst);
+                                    reader_inbound.ended.store(true, Ordering::SeqCst);
+                                    reader_inbound.ready.notify_all();
+                                    return;
+                                }
                             }
                         } else {
                             raw
@@ -685,6 +718,11 @@ async fn serve_stream(
                             STATUS_RESOURCE_EXHAUSTED,
                             "请求消息超过大小上限".to_string(),
                         )
+                    } else if inbound.bad_encoding.load(Ordering::SeqCst) {
+                        (
+                            STATUS_UNIMPLEMENTED,
+                            "不支持这种压缩方式（本服务收 identity/gzip/deflate）".to_string(),
+                        )
                     } else {
                         (status, message)
                     };
@@ -747,7 +785,7 @@ fn open_response(
         .status(200)
         .header("content-type", "application/grpc")
         // 告诉对面我们收得下 gzip（它下次可以压着发）
-        .header("grpc-accept-encoding", "identity,gzip");
+        .header("grpc-accept-encoding", "identity,gzip,deflate");
     if accepts_gzip {
         builder = builder.header("grpc-encoding", "gzip");
     }

@@ -69,6 +69,12 @@ struct SubChannel {
     authority: String,
     /// None = 这条子连接现在是坏的，下次用之前要重连
     sender: Option<h2::client::SendRequest<Bytes>>,
+    /// 连续失败次数。**死板轮询的问题**：一个后端挂了，每 N 次请求还是有
+    /// 一次要先撞上去、失败、再重试 —— 尾延迟被这一下拉得很难看。
+    /// 记着谁最近不行，挑的时候先跳过它，过一会儿再放它回来试。
+    fails: u32,
+    /// 在这个时刻之前不要再挑它（退避中）
+    skip_until: Option<std::time::Instant>,
 }
 
 struct CallResult {
@@ -301,6 +307,8 @@ fn dial_inner(raw: String, tls_ca: Option<String>) -> i64 {
         subs.push(Mutex::new(SubChannel {
             authority: authority.clone(),
             sender,
+            fails: 0,
+            skip_until: None,
         }));
     }
     if !any_ok {
@@ -389,34 +397,59 @@ fn pick_sender(conn: &ClientConn) -> Option<(h2::client::SendRequest<Bytes>, Str
         .fetch_add(1, Ordering::SeqCst)
         .rem_euclid(n as i64) as usize;
     let rt = client_runtime()?;
-    for step in 0..n {
-        let idx = (start + step) % n;
-        let mut sub = conn.subs[idx].lock().unwrap_or_else(|e| e.into_inner());
-        // **挑之前先探一下活**。h2 的 SendRequest 在连接断了之后 poll_ready
-        // 会立刻报错，比「发出去等失败再重试」少一整个往返。对端静默消失时
-        // 尤其重要（进程被 kill -9、中间的 NAT 悄悄把连接丢了）—— 那种情况
-        // socket 上不会有 FIN，不主动探就只能等下一次调用超时才发现。
-        if let Some(sender) = sub.sender.clone() {
-            let alive = rt.block_on(async {
-                let probe = sender.clone();
-                probe.ready().await
-            });
-            match alive {
-                Ok(ready) => {
-                    // ready() 把 sender 吃掉又还回来，用还回来的那个
-                    sub.sender = Some(ready.clone());
-                    return Some((ready, sub.authority.clone()));
+    let now = std::time::Instant::now();
+    // 两轮：第一轮只挑「没在退避里」的健康子连接；一个都没有再放宽，
+    // 让退避中的也上（总比直接报「全都连不上」强）
+    for relaxed in [false, true] {
+        for step in 0..n {
+            let idx = (start + step) % n;
+            let mut sub = conn.subs[idx].lock().unwrap_or_else(|e| e.into_inner());
+            if !relaxed {
+                if let Some(until) = sub.skip_until {
+                    if now < until {
+                        continue;
+                    }
                 }
-                Err(_) => sub.sender = None,
             }
-        }
-        // 坏的：重连一次。失败就换下一个，别在这儿死磕
-        let tls = conn.tls_ca.is_some() || conn.scheme == "https";
-        let ca = conn.tls_ca.clone().unwrap_or_default();
-        let fresh = rt.block_on(connect_one(&sub.authority, tls, &ca));
-        if let Some(sender) = fresh {
-            sub.sender = Some(sender.clone());
-            return Some((sender, sub.authority.clone()));
+            // **挑之前先探一下活**。h2 的 SendRequest 在连接断了之后 poll_ready
+            // 会立刻报错，比「发出去等失败再重试」少一整个往返。对端静默消失时
+            // 尤其重要（进程被 kill -9、中间的 NAT 悄悄把连接丢了）—— 那种情况
+            // socket 上不会有 FIN，不主动探就只能等下一次调用超时才发现。
+            if let Some(sender) = sub.sender.clone() {
+                let alive = rt.block_on(async {
+                    let probe = sender.clone();
+                    probe.ready().await
+                });
+                match alive {
+                    Ok(ready) => {
+                        // ready() 把 sender 吃掉又还回来，用还回来的那个
+                        sub.sender = Some(ready.clone());
+                        sub.fails = 0;
+                        sub.skip_until = None;
+                        return Some((ready, sub.authority.clone()));
+                    }
+                    Err(_) => sub.sender = None,
+                }
+            }
+            // 坏的：重连一次。失败就记一笔退避，换下一个，别在这儿死磕
+            let tls = conn.tls_ca.is_some() || conn.scheme == "https";
+            let ca = conn.tls_ca.clone().unwrap_or_default();
+            let fresh = rt.block_on(connect_one(&sub.authority, tls, &ca));
+            match fresh {
+                Some(sender) => {
+                    sub.sender = Some(sender.clone());
+                    sub.fails = 0;
+                    sub.skip_until = None;
+                    return Some((sender, sub.authority.clone()));
+                }
+                None => {
+                    sub.fails = sub.fails.saturating_add(1);
+                    // 退避上限 30 秒：挂久了的后端不该每次请求都去敲一遍门，
+                    // 但也不能永远不敲 —— 它总会回来
+                    let backoff = (200u64 << sub.fails.min(7)).min(30_000);
+                    sub.skip_until = Some(now + Duration::from_millis(backoff));
+                }
+            }
         }
     }
     None
@@ -428,9 +461,38 @@ fn mark_dead(conn: &ClientConn, authority: &str) {
         let mut sub = sub.lock().unwrap_or_else(|e| e.into_inner());
         if sub.authority == authority {
             sub.sender = None;
+            sub.fails = sub.fails.saturating_add(1);
+            let backoff = (200u64 << sub.fails.min(7)).min(30_000);
+            sub.skip_until = Some(std::time::Instant::now() + Duration::from_millis(backoff));
             return;
         }
     }
+}
+
+/// 各后端的健康状况，JSON 数组 —— 排查「为什么请求都跑到一台上去了」时要用。
+#[no_mangle]
+pub extern "C" fn qi_grpc_backends(conn_id: i64) -> *mut c_char {
+    let Some(conn) = conns()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&conn_id)
+        .cloned()
+    else {
+        return out_str("[]".to_string());
+    };
+    let now = std::time::Instant::now();
+    let mut out = Vec::new();
+    for sub in &conn.subs {
+        let sub = sub.lock().unwrap_or_else(|e| e.into_inner());
+        let skipping = sub.skip_until.map(|u| now < u).unwrap_or(false);
+        out.push(serde_json::json!({
+            "地址": sub.authority,
+            "连着": sub.sender.is_some(),
+            "连续失败": sub.fails,
+            "退避中": skipping,
+        }));
+    }
+    out_str(serde_json::Value::Array(out).to_string())
 }
 
 /// 给连接设一组默认元数据（JSON 对象），每次调用都会带上。
@@ -468,6 +530,8 @@ pub extern "C" fn qi_grpc_set_metadata(conn_id: i64, json: *const c_char) -> i64
                 Mutex::new(SubChannel {
                     authority: s.authority.clone(),
                     sender: s.sender.clone(),
+                    fails: s.fails,
+                    skip_until: s.skip_until,
                 })
             })
             .collect(),
@@ -923,7 +987,27 @@ pub extern "C" fn qi_grpc_open_stream(conn_id: i64, method: *const c_char, timeo
     } else {
         timeout_ms as u64
     };
-    let Some((sender_picked, authority)) = pick_sender(&conn) else {
+    // 开流也要重试：挑到一条正好在重启的后端就直接失败，对上层是「偶发开流失败」，
+    // 而这类失败恰恰是最该被自动抹平的（请求根本没发出去）。
+    // 一元那边同理，只是那边还能重试整个调用；流开起来之后就不能重开了
+    // （消息可能已经发出去一半），所以只在**开的这一刻**重试。
+    let mut sender_picked = None;
+    let mut authority = String::new();
+    let mut tries = 0;
+    while tries <= conn.retries {
+        match pick_sender(&conn) {
+            Some((s, a)) => {
+                sender_picked = Some(s);
+                authority = a;
+                break;
+            }
+            None => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(50u64 << tries));
+            }
+        }
+    }
+    let Some(sender_picked) = sender_picked else {
         return -1;
     };
     let stream_metadata = conn.default_metadata.clone();
