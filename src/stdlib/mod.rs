@@ -30,6 +30,7 @@ pub mod math_ffi;
 pub mod mcp;
 pub mod mcp_client_ffi;
 pub mod mcp_ffi;
+pub mod mem_ffi;
 pub mod multipart_ffi;
 pub mod os_ffi;
 pub mod path_ffi;
