@@ -103,6 +103,11 @@ extern "C" {
     fn qi_gui_egui_canvas_clicked_impl() -> i64;
     fn qi_gui_egui_canvas_mouse_x_impl() -> i64;
     fn qi_gui_egui_canvas_mouse_y_impl() -> i64;
+
+    // ── 键盘层（2026-08）──
+    fn qi_gui_egui_key_down_impl(name: *const c_char) -> i64;
+    fn qi_gui_egui_key_pressed_impl(name: *const c_char) -> i64;
+    fn qi_gui_egui_any_key_pressed_impl() -> i64;
 }
 
 // ============================================================================
@@ -934,6 +939,51 @@ pub extern "C" fn qi_gui_egui_canvas_mouse_y() -> i64 {
     #[cfg(not(has_gui))]
     {
         -1
+    }
+}
+
+// ============================================================================
+// 键盘层（2026-08）—— 帧内查询本帧按键快照，做小游戏用
+// ============================================================================
+
+/// 按键按住(键名) → 1/0：本帧该键处于按下状态（持续，适合移动）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_key_down(name: *const c_char) -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_key_down_impl(name) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = name;
+        0
+    }
+}
+
+/// 按键刚按(键名) → 1/0：本帧刚按下的边沿（适合跳跃 / 开火）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_key_pressed(name: *const c_char) -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_key_pressed_impl(name) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = name;
+        0
+    }
+}
+
+/// 任意键刚按() → 1/0：本帧有任何键刚按下（"按任意键开始"）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_any_key_pressed() -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_any_key_pressed_impl() }
+    }
+    #[cfg(not(has_gui))]
+    {
+        0
     }
 }
 
