@@ -1,0 +1,22 @@
+# 独立 workspace —— 不并入 qi-runtime，避免把 rusqlite/reqwest 那棵依赖树拖进来
+[workspace]
+
+[package]
+name = "qi-runtime-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Qi 语言 WASM 最小运行时 —— 只含纯计算 FFI（RC 字符串 / 打印 / 数值转换），供 wasm32-wasip1 链接"
+
+[lib]
+name = "qi_runtime_wasm"
+crate-type = ["staticlib"]
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+codegen-units = 1
+strip = true

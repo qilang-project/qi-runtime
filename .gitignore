@@ -1,3 +1,7 @@
 target/
 Cargo.lock
 .DS_Store
+
+# wasm spike：worktree 里的独立构建目录
+target-wt/
+wasm最小/target/
