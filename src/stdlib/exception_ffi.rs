@@ -185,10 +185,15 @@ pub extern "C" fn qi_exc_pop() {
     }
 }
 
-/// 抛出异常：保存错误消息并 longjmp 到栈顶 frame。
-/// 没有 frame 时打印消息并 abort。
+/// 只**登记**错误消息，不转移控制权（配合 [`qi_exc_throw_staged`] 用）。
+///
+/// 为什么要把抛出拆成两步：QI_ARC 下 `抛出` 之前得先释放本帧的 RC 局部 ——
+/// longjmp 整帧跳过，函数出口那段统一释放永远不执行，每抛一次就漏一帧对象。
+/// 可消息本身就可能是一个 RC 局部（`抛出 错误信息;`），先释放再把指针交出去
+/// 就是读已释放内存。于是顺序改成：stage（把消息**拷进** LAST_ERROR，此后
+/// 那个指针的死活与异常机制无关）→ 释放本帧局部 → throw_staged 转移控制权。
 #[no_mangle]
-pub extern "C-unwind" fn qi_exc_throw(msg: *const c_char) -> ! {
+pub extern "C" fn qi_exc_stage(msg: *const c_char) {
     let msg_str = if msg.is_null() {
         String::new()
     } else {
@@ -196,11 +201,39 @@ pub extern "C-unwind" fn qi_exc_throw(msg: *const c_char) -> ! {
             .to_string_lossy()
             .into_owned()
     };
-    LAST_ERROR.with(|e| *e.borrow_mut() = msg_str.clone());
+    LAST_ERROR.with(|e| *e.borrow_mut() = msg_str);
+}
 
+/// 用 [`qi_exc_stage`] 已登记的消息转移控制权（longjmp / panic / abort）。
+/// 未先 stage 就调用等价于抛一条空消息 —— 不会读到野指针。
+#[no_mangle]
+pub extern "C-unwind" fn qi_exc_throw_staged() -> ! {
+    throw_with()
+}
+
+/// 抛出异常：保存错误消息并 longjmp 到栈顶 frame。
+/// 没有 frame 时打印消息并 abort。
+#[no_mangle]
+pub extern "C-unwind" fn qi_exc_throw(msg: *const c_char) -> ! {
+    qi_exc_stage(msg);
+    qi_exc_throw_staged()
+}
+
+/// 控制转移本体（消息已在 LAST_ERROR 里）。
+///
+/// **longjmp 那条路径上一个拥有堆内存的局部都不许有。** longjmp 永不返回，
+/// 本函数的栈帧被整个丢掉，Rust 的 Drop 一个都不会跑 —— 以前这里先
+/// `LAST_ERROR.clone()` 出一个 String 再 longjmp，那份 String 的堆缓冲每抛一次
+/// 漏一份（短消息落在 16 字节的 malloc 桶里，400 万次抛出 ≈ 32MB，RSS 斜率
+/// 约 16MB/s）。它不是 RC 分配，`QI_RC_REPORT` 看不见 —— 只有 RSS 采样能发现。
+/// 所以：先判分支，只在**会正常返回或走 unwind** 的分支里才去取消息。
+fn throw_with() -> ! {
     if let Some(ptr) = top_frame() {
         unsafe { longjmp(ptr, 1) }
-    } else if in_goroutine() {
+    }
+    // 以下两条都不经 longjmp：panic 走正常 unwind（Drop 会跑），abort 前进程即死。
+    let msg_str = LAST_ERROR.with(|e| e.borrow().clone());
+    if in_goroutine() {
         // goroutine 内未捕获的 `抛出`：不能 abort 整个进程。转成 panic
         // （qi_exc_throw 是 C-unwind ABI，可跨 FFI 边界 unwind），由 spawn
         // 点的 catch_unwind 接住并记入协程异常队列 / 句柄状态。
