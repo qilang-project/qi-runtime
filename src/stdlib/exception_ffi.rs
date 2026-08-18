@@ -22,9 +22,42 @@ use std::sync::{Mutex, OnceLock};
 // jmp_buf 在 macOS arm64 上是 192 字节；预留 256 给所有平台对齐
 pub const JMP_BUF_SIZE: usize = 256;
 
+// Windows x64 上 setjmp **不是函数，是宏** —— 它展开成
+//     _setjmp(env, _AddressOfReturnAddress())
+// 两个参数。按 Unix 那样声明成单参数去链 `setjmp`，第二个参数就是寄存器里
+// 的垃圾；而 Windows 的 longjmp 会拿这个"帧指针"去做 SEH unwind（RtlUnwindEx），
+// 拿垃圾去 unwind 的结果是进程当场死于 STATUS_INVALID_HANDLE (0xC0000008)。
+//
+// 表现：`抛出` 那一刻进程消失，捕获块根本没跑，退出码 -1073741784。
+// Windows 上任何用 尝试/捕获 的 qi 程序都是这样，而 mac/Linux 一切正常。
+//
+// **帧指针传 NULL**：这是 MSVC 有意支持的一条路 —— longjmp 看到 Frame 为 0
+// 就完全跳过 unwind，只做寄存器恢复。那正是这里要的语义：qi 的 抛出 是裸跳转，
+// 本来就没有 SEH 帧要展开（见下面 qi_exc_throw_staged 的注释：longjmp 那条
+// 路径上一个拥有堆内存的局部都不许有）。
+#[cfg(all(windows, target_arch = "x86_64"))]
+extern "C" {
+    fn _setjmp(buf: *mut u8, frame: *mut u8) -> i32;
+    fn longjmp(buf: *mut u8, val: i32) -> !;
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 extern "C" {
     fn setjmp(buf: *mut u8) -> i32;
     fn longjmp(buf: *mut u8, val: i32) -> !;
+}
+
+/// 平台差异只收在这一处，上面 qi_exc_setjmp 保持一个签名。
+#[inline(always)]
+unsafe fn 平台setjmp(buf: *mut u8) -> i32 {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        _setjmp(buf, std::ptr::null_mut())
+    }
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        setjmp(buf)
+    }
 }
 
 thread_local! {
@@ -161,27 +194,34 @@ fn top_frame() -> Option<*mut u8> {
 #[no_mangle]
 #[inline(never)]
 pub unsafe extern "C" fn qi_exc_setjmp(buf: *mut u8) -> i32 {
-    setjmp(buf)
+    平台setjmp(buf)
 }
 
 /// 分配一个 jmp_buf 大小的缓冲，push 到 thread-local 栈，返回缓冲指针。
 /// 调用方紧接着应该 `call i32 @qi_exc_setjmp(ptr %buf)`。
 #[no_mangle]
 pub extern "C" fn qi_exc_alloc_frame() -> *mut u8 {
-    let buf = vec![0u8; JMP_BUF_SIZE].into_boxed_slice();
-    let ptr = Box::into_raw(buf) as *mut u8;
+    // **必须 16 字节对齐**：Windows x64 的 jmp_buf 里要存 xmm6-xmm15，
+    // setjmp 用 movaps 写，地址没对齐直接 #GP。Vec<u8> 只保证 1 字节对齐，
+    // 实践中大块分配通常够，但"通常"在这儿不算数。
+    let ptr = unsafe { std::alloc::alloc_zeroed(帧布局()) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(帧布局());
+    }
     push_frame(ptr);
     ptr
+}
+
+#[inline]
+fn 帧布局() -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(JMP_BUF_SIZE, 16).expect("jmp_buf layout")
 }
 
 /// 弹出 thread-local 栈顶 frame 并释放
 #[no_mangle]
 pub extern "C" fn qi_exc_pop() {
     if let Some(ptr) = pop_frame_ptr() {
-        unsafe {
-            let slice = std::slice::from_raw_parts_mut(ptr, JMP_BUF_SIZE);
-            let _ = Box::from_raw(slice as *mut [u8]);
-        }
+        unsafe { std::alloc::dealloc(ptr, 帧布局()) }
     }
 }
 
