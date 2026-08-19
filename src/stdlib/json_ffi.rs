@@ -1020,6 +1020,48 @@ fn 新建qi数组(槽: &[i64]) -> *mut std::os::raw::c_void {
     p as *mut std::os::raw::c_void
 }
 
+/// 取字段并**按显示形态**转成字符串：字符串原样、数字/布尔转字面量、
+/// null 和缺字段都给空串、对象/数组给紧凑 JSON。
+///
+/// 为什么必须有：`获取字符串` 只认 Value::String，字段是数字时返回**空串**。
+/// 于是「把一批行渲染成表格」这件事在通用代码里做不了 —— 你不知道每列是什么
+/// 类型，也就不知道该调 获取字符串 还是 获取整数 还是 获取浮点数，
+/// 猜错就是一列空白。而一列空白看起来像「数据本来就没有」，不像 bug。
+///
+/// 数字不做任何格式化（不加千分位、不截精度）—— 这是**取值**，
+/// 展示层要千分位是展示层的事，在这儿加了就没法关掉了。
+/// 浮点整值打成 "3" 而不是 "3.0"：serde_json 的 f64 显示行为，
+/// 表格里 "3" 比 "3.0" 常见得多。
+#[no_mangle]
+pub extern "C" fn qi_json_get_display(obj_id: i64, key: *const c_char) -> *mut c_char {
+    // 跟 获取字符串 同一个哨兵：字符串在 Qi 里永不该为 null
+    let 空 = || crate::stdlib::qi_str::rc_cstr_from_str("");
+    if obj_id <= 0 || key.is_null() {
+        return 空();
+    }
+    let key_str = unsafe {
+        match CStr::from_ptr(key).to_str() {
+            Ok(s) => s,
+            Err(_) => return 空(),
+        }
+    };
+    let storage = JSON_VALUES.lock().unwrap();
+    if let Some(ref map) = *storage {
+        if let Some(Value::Object(ref obj)) = map.get(&(obj_id as u64)) {
+            if let Some(v) = obj.get(key_str) {
+                let s = match v {
+                    Value::Null => String::new(),
+                    Value::String(s) => s.clone(),
+                    Value::Bool(b) => (if *b { "真" } else { "假" }).to_string(),
+                    其它 => 其它.to_string(),
+                };
+                return crate::stdlib::qi_str::rc_cstr_from_str(&s);
+            }
+        }
+    }
+    空()
+}
+
 /// 对象的键列表 → Qi 字符串数组。
 ///
 /// 补的是一个基本缺口：JSON 模块能按名字取字段，却**没法把一个对象的键遍历一遍**。
