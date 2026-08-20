@@ -269,10 +269,39 @@ impl LLM会话 {
         使用工具: bool,
     ) -> Value {
         let 消息列表 = self.组装消息(用户内容);
-        match self.提供商.as_str() {
+        let mut 请求体 = match self.提供商.as_str() {
             "anthropic" => self.构建Anthropic请求体(消息列表, 流式, 使用工具),
             "gemini" => self.构建Gemini请求体(消息列表, 使用工具),
             _ => self.构建OpenAI请求体(消息列表, 流式, 使用工具),
+        };
+        self.注入额外参数(&mut 请求体);
+        请求体
+    }
+
+    /// 逃生口：把 配置["extra_body"]（一个 JSON 对象）合进请求体顶层。
+    ///
+    /// 存在的理由是**每家都有自己的非标字段**，而我们不可能为每一个都开一个
+    /// 配置项：Gemini 的内置搜索是 `tools:[{"google_search":{}}]`，百炼是
+    /// `enable_search:true`，有的家还要 `reasoning_effort`。与其追着加，不如
+    /// 给一个「你写什么就发什么」的口子。
+    ///
+    /// 合并规则里只有一条不显然：**两边都是数组时是追加，不是覆盖**。
+    /// 因为 `tools` 这个键会撞——agent 注册的函数工具已经在里面了，如果
+    /// extra_body 里的 google_search 直接盖掉，就是「开了联网搜索之后
+    /// 所有自定义工具静默消失」。这种 bug 不报错，只表现为 agent 忽然不调
+    /// 工具了，极难往这儿想。追加则两者共存，实测 Gemini 接受混合列表。
+    fn 注入额外参数(&self, 请求体: &mut Value) {
+        let Some(额外) = self.配置.get("extra_body") else { return };
+        let 额外 = 额外.trim();
+        if 额外.is_empty() {
+            return;
+        }
+        let Ok(Value::Object(附加)) = serde_json::from_str::<Value>(额外) else { return };
+        for (键, 值) in 附加 {
+            match (请求体.get_mut(&键), &值) {
+                (Some(Value::Array(原)), Value::Array(新)) => 原.extend(新.clone()),
+                _ => 请求体[键] = 值,
+            }
         }
     }
 
@@ -3561,6 +3590,49 @@ mod tests {
         // 用量照常记账（一次请求的 total）
         assert_eq!(qi_llm_budget_used(会话), 14);
         qi_llm_close_session(会话);
+    }
+
+    // ── extra_body 逃生口 ──
+
+    #[test]
+    fn 额外参数_新键直接并进请求体() {
+        let mut 会话 = 建会话("openai");
+        会话.配置.insert(
+            "extra_body".to_string(),
+            r#"{"enable_search": true, "reasoning_effort": "high"}"#.to_string(),
+        );
+        let 体 = 会话.构建请求体("金价多少", false, false);
+        assert_eq!(体["enable_search"], json!(true));
+        assert_eq!(体["reasoning_effort"], json!("high"));
+        // 不碰原有字段
+        assert_eq!(体["model"], json!("test-model"));
+    }
+
+    /// 这条是这个功能的全部要害：tools 键会撞。
+    /// 覆盖语义 = 开了联网搜索之后 agent 的函数工具静默消失，不报错。
+    #[test]
+    fn 额外参数_数组是追加而不是覆盖工具() {
+        let mut 会话 = 建会话("openai");
+        会话.工具列表 = vec![json!({"type": "function", "function": {"name": "查持仓"}})];
+        会话.配置.insert(
+            "extra_body".to_string(),
+            r#"{"tools": [{"google_search": {}}]}"#.to_string(),
+        );
+        let 体 = 会话.构建请求体("我该加仓吗", false, true);
+        let 工具 = 体["tools"].as_array().expect("tools 应当是数组");
+        assert_eq!(工具.len(), 2, "自定义工具和内置搜索必须共存: {体:?}");
+        assert_eq!(工具[0]["function"]["name"], json!("查持仓"));
+        assert!(工具[1].get("google_search").is_some());
+    }
+
+    #[test]
+    fn 额外参数_空值与坏JSON一律当没写() {
+        for 值 in ["", "   ", "不是JSON", "[1,2,3]", "\"字符串\""] {
+            let mut 会话 = 建会话("openai");
+            会话.配置.insert("extra_body".to_string(), 值.to_string());
+            let 体 = 会话.构建请求体("你好", false, false);
+            assert_eq!(体.as_object().unwrap().len(), 4, "值={值:?} 不该改变请求体形状");
+        }
     }
 
     // ── Anthropic Messages API ──
