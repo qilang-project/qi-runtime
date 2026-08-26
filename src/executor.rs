@@ -311,6 +311,56 @@ pub extern "C" fn qi_runtime_println(s: *const c_char) -> c_int {
     }
 }
 
+/// 往 stderr 写一行（UTF-8）。
+///
+/// stdout 那边走 行级打印段（带全缓冲与行锁），stderr 不进那条路：诊断信息的
+/// 价值就在于**立刻看得见**，跟着 stdout 的缓冲一起攒到进程退出才吐，等于没有。
+/// Rust 的 eprintln! 本来就是行缓冲/无缓冲的，直接用。
+///
+/// 加这个是因为标准库开始用 qi 写之后，qi 那边一个往 stderr 说话的口子都没有 ——
+/// 整张 724 条 FFI 表里没有任何 stderr 输出。而 Rust 版的标准库到处在用
+/// eprintln! 打防御警告（向量维度不匹配返回 0.0 这类「不报错但结果是假的」的
+/// 情况），照搬到 qi 就只能把警告丢掉，或者错发到 stdout 去污染程序输出。
+#[no_mangle]
+pub extern "C" fn qi_io_eprintln(s: *const c_char) -> c_int {
+    if s.is_null() {
+        return -1;
+    }
+    unsafe {
+        match CStr::from_ptr(s).to_str() {
+            Ok(rust_str) => {
+                eprintln!("{}", rust_str);
+                0
+            }
+            Err(_) => {
+                eprintln!("无效的 UTF-8 字符串");
+                -1
+            }
+        }
+    }
+}
+
+/// 同 qi_io_eprintln，不带换行。
+#[no_mangle]
+pub extern "C" fn qi_io_eprint(s: *const c_char) -> c_int {
+    if s.is_null() {
+        return -1;
+    }
+    unsafe {
+        match CStr::from_ptr(s).to_str() {
+            Ok(rust_str) => {
+                eprint!("{}", rust_str);
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                0
+            }
+            Err(_) => {
+                eprintln!("无效的 UTF-8 字符串");
+                -1
+            }
+        }
+    }
+}
+
 /// Print an integer
 #[no_mangle]
 pub extern "C" fn qi_runtime_print_int(value: i64) -> c_int {
