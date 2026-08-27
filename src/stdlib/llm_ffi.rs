@@ -3067,16 +3067,11 @@ pub extern "C" fn qi_llm_exchange(
         "embed" => 会话.嵌入请求响应(请求体),
         "chat" => match 会话.预算检查() {
             Err(e) => Err(e),
-            Ok(()) => {
-                // extra_body 的合并留在这边而不是交给 qi，有两个理由：
-                // ① 合并规则里「两边都是数组时追加而不是覆盖」需要按 JSON 值的
-                //    **类型**分派，而 qi 侧的 JSON 接口没有类型查询；
-                // ② 它必须发生在算磁带键**之前**、且是最后一步 —— 顺序错了键就变。
-                //    放在这儿正好接着 qi 交上来的请求体往下走，跟原路径逐字节同序。
-                let mut 请求体 = 请求体;
-                会话.注入额外参数(&mut 请求体);
-                会话.请求响应(请求体)
-            }
+            // extra_body 不在这里合 —— 合并**位置**会影响键序，而位置只有 qi
+            // 那边知道：单轮对话是「合完就发」，多候选却是「合完再加 n」。
+            // 在这儿统一合的话，多候选就变成「加 n 再合」，extra_body 带一个
+            // 新键时键序就跟原实现不同了。qi 侧调 合并额外参数 自己挑时机。
+            Ok(()) => 会话.请求响应(请求体),
         },
         其他 => Err(format!("未知用途「{}」（只认 chat / embed）", 其他)),
     };
@@ -3089,12 +3084,51 @@ pub extern "C" fn qi_llm_exchange(
     }
 }
 
+/// 把会话配置里的 extra_body 合进请求体，返回合并后的请求体 JSON。
+///
+/// 合并规则本身留在 Rust：里面有一条「两边都是数组时**追加**而不是覆盖」，
+/// 要按 JSON 值的类型分派，而 qi 侧的 JSON 接口没有类型查询。
+/// （这条规则不是洁癖：agent 注册的函数工具已经在 `tools` 里，extra_body 里
+/// 的 google_search 直接盖掉就是「开了联网搜索之后所有自定义工具静默消失」。）
+///
+/// 但**什么时候**合由 qi 决定 —— 合并位置决定键序，键序决定磁带键。
+/// 单轮对话是「合完就发」，多候选是「合完再加 n」，两者不能在同一处统一做。
+///
+/// 句柄无效或请求体不合法时原样返回输入，不制造第二种失败路径
+/// （真正的失败会在紧跟着的 交换 里报出来）。
+#[no_mangle]
+pub extern "C" fn qi_llm_merge_extra(
+    session_handle: i64,
+    request_json: *const c_char,
+) -> *mut c_char {
+    if request_json.is_null() {
+        return crate::stdlib::qi_str::rc_cstr_from_string(String::new());
+    }
+    let 原文 = unsafe { CStr::from_ptr(request_json) }
+        .to_string_lossy()
+        .to_string();
+    let Ok(mut 请求体) = serde_json::from_str::<Value>(&原文) else {
+        return crate::stdlib::qi_str::rc_cstr_from_string(原文);
+    };
+    let 会话池 = 获取会话池().lock().unwrap();
+    let Some(会话) = 会话池.get(&session_handle) else {
+        return crate::stdlib::qi_str::rc_cstr_from_string(原文);
+    };
+    会话.注入额外参数(&mut 请求体);
+    crate::stdlib::qi_str::rc_cstr_from_string(请求体.to_string())
+}
+
 /// 一次对话完成后落账：追加历史 + 记用量 + 预算累进。三件事必须在**同一把锁**
 /// 里做完 —— 分成三个 FFI 的话，两个 goroutine 并发对话就能交错出「历史里
 /// 有 user 没有对应 assistant」的状态，而历史版本号是流式提交做 CAS 的依据。
 ///
 /// `user_msg_json` / `assistant_msg_json` 传空串表示这一条不入历史
 /// （嵌入就不入）。用量三个数由 qi 从响应体里按 provider 提取后传进来。
+///
+/// `total_tokens` 传**负数**表示这次不动用量也不记账，只写历史。
+/// 多候选在 anthropic/gemini 上会退化成串行 n 次请求：每次各自记账（跟原实现
+/// 一样，计费确实是 n 次），但历史只在最后写一次、且只写第一个候选。
+/// 没有这个「只写历史」的档位，最后那次落账会把 最近用量 冲成 0。
 #[no_mangle]
 pub extern "C" fn qi_llm_commit(
     session_handle: i64,
@@ -3133,8 +3167,10 @@ pub extern "C" fn qi_llm_commit(
     if 动过历史 {
         会话.历史版本 += 1;
     }
-    会话.最近用量 = (prompt_tokens, completion_tokens, total_tokens);
-    会话.累计用量 += total_tokens;
+    if total_tokens >= 0 {
+        会话.最近用量 = (prompt_tokens, completion_tokens, total_tokens);
+        会话.累计用量 += total_tokens;
+    }
     1
 }
 
