@@ -2976,6 +2976,168 @@ pub extern "C" fn qi_llm_chat_async(session_handle: i64, prompt: *const c_char) 
     }
 }
 
+// ───────── 给 qi 侧实现用的三件套（会话视图 / 交换 / 落账） ─────────
+//
+// 标准库.大模型 的 对话 与 嵌入 已经改成 qi 写（qi/标准库/大模型.qi）。
+// 缝划在这里，理由是三条约束互相咬死：
+//
+// 1. **密钥不能进 qi**。所以 qi 拿不到能自己发请求的东西，HTTP 必须留在这边。
+// 2. **会话池只能有一个**。流式和工具调用还在 Rust，跟 对话 共用同一份历史；
+//    要是 qi 另起一套会话，用户 对话 完再 流式对话 就接不上上文了。
+// 3. **磁带键必须一模一样**。键是 DefaultHasher 打在 serde_json 序列化文本上
+//    （见 磁带::请求键），而 serde_json 开了 preserve_order —— 键序即插入序，
+//    换个顺序就是另一个键。AIOne 课程那批录制磁带全靠这个键命中，
+//    错一个字段顺序就是**静默全部回放未命中**。所以键只能在 Rust 这边算。
+//
+// 于是分工：qi 负责**请求成形 + 响应归一化**（各家 provider 的形状差异，
+// 也正是改得最勤的那部分），Rust 负责状态、密钥、HTTP、磁带、预算闸。
+//
+// qi 侧一次 对话 的时序：
+//   会话视图 → (qi 拼请求体) → 交换 → (qi 归一化取文本和用量) → 落账
+
+/// 会话的只读视图，JSON。**不含密钥** —— 密钥从不离开 Rust。
+///
+/// 句柄无效返回 `{}`（不是错误串：调用方本来就要 JSON 解析，
+/// 给个空对象让它按「字段都取不到」走，比多一条字符串分支干净）。
+#[no_mangle]
+pub extern "C" fn qi_llm_session_view(session_handle: i64) -> *mut c_char {
+    let 会话池 = 获取会话池().lock().unwrap();
+    let Some(会话) = 会话池.get(&session_handle) else {
+        return crate::stdlib::qi_str::rc_cstr_from_string("{}".to_string());
+    };
+    let 配置: serde_json::Map<String, Value> = 会话
+        .配置
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v)))
+        .collect();
+    let 视图 = json!({
+        "端点": 会话.端点,
+        "模型": 会话.模型,
+        "提供商": 会话.提供商,
+        "配置": Value::Object(配置),
+        "历史": 会话.历史,
+        "预算上限": 会话.预算上限,
+        "累计用量": 会话.累计用量,
+        "有密钥": 会话.密钥.is_some(),
+    });
+    crate::stdlib::qi_str::rc_cstr_from_string(视图.to_string())
+}
+
+/// 把 qi 拼好的请求体发出去，返回响应体。中间夹预算闸和磁带闸。
+///
+/// `用途`：
+/// - `"chat"`  → 走 请求端点()，**过预算闸**（超限直接拒，不打 API）
+/// - `"embed"` → 走 嵌入端点()，**不过预算闸也不记账**（跟原 嵌入 的语义一致：
+///               只读会话。改这条会让嵌入悄悄吃掉对话预算）
+///
+/// 返回 JSON：成功 `{"ok":true,"body":<响应体>}`，失败 `{"ok":false,"error":"..."}`。
+/// 不用「返回错误串」那种约定 —— 响应体本身就是 JSON，两者混在一个通道里
+/// 迟早会有个响应体恰好长得像错误串。
+#[no_mangle]
+pub extern "C" fn qi_llm_exchange(
+    session_handle: i64,
+    purpose: *const c_char,
+    request_json: *const c_char,
+) -> *mut c_char {
+    fn 失败(消息: String) -> *mut c_char {
+        crate::stdlib::qi_str::rc_cstr_from_string(json!({"ok": false, "error": 消息}).to_string())
+    }
+    if purpose.is_null() || request_json.is_null() {
+        return 失败("参数为空".to_string());
+    }
+    let 用途 = unsafe { CStr::from_ptr(purpose) }
+        .to_string_lossy()
+        .to_string();
+    let 请求文本 = unsafe { CStr::from_ptr(request_json) }
+        .to_string_lossy()
+        .to_string();
+    let 请求体: Value = match serde_json::from_str(&请求文本) {
+        Ok(v) => v,
+        Err(e) => return 失败(format!("请求体不是合法 JSON: {}", e)),
+    };
+
+    let 会话池 = 获取会话池().lock().unwrap();
+    let Some(会话) = 会话池.get(&session_handle) else {
+        return 失败("无效会话句柄".to_string());
+    };
+
+    let 结果 = match 用途.as_str() {
+        // 嵌入不过预算闸也不合 extra_body —— 跟原 嵌入 的语义逐条一致
+        // （请求体就是 {"model","input"}，只读会话）。
+        "embed" => 会话.嵌入请求响应(请求体),
+        "chat" => match 会话.预算检查() {
+            Err(e) => Err(e),
+            Ok(()) => {
+                // extra_body 的合并留在这边而不是交给 qi，有两个理由：
+                // ① 合并规则里「两边都是数组时追加而不是覆盖」需要按 JSON 值的
+                //    **类型**分派，而 qi 侧的 JSON 接口没有类型查询；
+                // ② 它必须发生在算磁带键**之前**、且是最后一步 —— 顺序错了键就变。
+                //    放在这儿正好接着 qi 交上来的请求体往下走，跟原路径逐字节同序。
+                let mut 请求体 = 请求体;
+                会话.注入额外参数(&mut 请求体);
+                会话.请求响应(请求体)
+            }
+        },
+        其他 => Err(format!("未知用途「{}」（只认 chat / embed）", 其他)),
+    };
+
+    match 结果 {
+        Ok(体) => {
+            crate::stdlib::qi_str::rc_cstr_from_string(json!({"ok": true, "body": 体}).to_string())
+        }
+        Err(e) => 失败(e),
+    }
+}
+
+/// 一次对话完成后落账：追加历史 + 记用量 + 预算累进。三件事必须在**同一把锁**
+/// 里做完 —— 分成三个 FFI 的话，两个 goroutine 并发对话就能交错出「历史里
+/// 有 user 没有对应 assistant」的状态，而历史版本号是流式提交做 CAS 的依据。
+///
+/// `user_msg_json` / `assistant_msg_json` 传空串表示这一条不入历史
+/// （嵌入就不入）。用量三个数由 qi 从响应体里按 provider 提取后传进来。
+#[no_mangle]
+pub extern "C" fn qi_llm_commit(
+    session_handle: i64,
+    user_msg_json: *const c_char,
+    assistant_msg_json: *const c_char,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+) -> i64 {
+    let 读 = |p: *const c_char| -> Option<Value> {
+        if p.is_null() {
+            return None;
+        }
+        let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().to_string();
+        if s.trim().is_empty() {
+            return None;
+        }
+        serde_json::from_str(&s).ok()
+    };
+    let 用户消息 = 读(user_msg_json);
+    let 助手消息 = 读(assistant_msg_json);
+
+    let mut 会话池 = 获取会话池().lock().unwrap();
+    let Some(会话) = 会话池.get_mut(&session_handle) else {
+        return 0;
+    };
+    let mut 动过历史 = false;
+    if let Some(m) = 用户消息 {
+        会话.历史.push(m);
+        动过历史 = true;
+    }
+    if let Some(m) = 助手消息 {
+        会话.历史.push(m);
+        动过历史 = true;
+    }
+    if 动过历史 {
+        会话.历史版本 += 1;
+    }
+    会话.最近用量 = (prompt_tokens, completion_tokens, total_tokens);
+    会话.累计用量 += total_tokens;
+    1
+}
+
 // ───────────────── LLM 磁带（录制 / 回放 / 缓存） ─────────────────
 //
 // 把 请求→响应 落到一个 JSON 文件，键 = 规范化请求体的哈希。核心价值：
