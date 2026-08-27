@@ -291,12 +291,16 @@ impl LLM会话 {
     /// 所有自定义工具静默消失」。这种 bug 不报错，只表现为 agent 忽然不调
     /// 工具了，极难往这儿想。追加则两者共存，实测 Gemini 接受混合列表。
     fn 注入额外参数(&self, 请求体: &mut Value) {
-        let Some(额外) = self.配置.get("extra_body") else { return };
+        let Some(额外) = self.配置.get("extra_body") else {
+            return;
+        };
         let 额外 = 额外.trim();
         if 额外.is_empty() {
             return;
         }
-        let Ok(Value::Object(附加)) = serde_json::from_str::<Value>(额外) else { return };
+        let Ok(Value::Object(附加)) = serde_json::from_str::<Value>(额外) else {
+            return;
+        };
         for (键, 值) in 附加 {
             match (请求体.get_mut(&键), &值) {
                 (Some(Value::Array(原)), Value::Array(新)) => 原.extend(新.clone()),
@@ -3631,7 +3635,11 @@ mod tests {
             let mut 会话 = 建会话("openai");
             会话.配置.insert("extra_body".to_string(), 值.to_string());
             let 体 = 会话.构建请求体("你好", false, false);
-            assert_eq!(体.as_object().unwrap().len(), 4, "值={值:?} 不该改变请求体形状");
+            assert_eq!(
+                体.as_object().unwrap().len(),
+                4,
+                "值={值:?} 不该改变请求体形状"
+            );
         }
     }
 

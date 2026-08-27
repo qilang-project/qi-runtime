@@ -11,6 +11,7 @@ pub mod grpc_reflection;
 pub mod h2_ffi;
 pub mod http;
 pub mod http_ffi;
+pub mod http_stream_ffi;
 pub mod interface;
 pub mod io_ffi;
 pub mod network_ffi;

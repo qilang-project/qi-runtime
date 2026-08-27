@@ -68,7 +68,7 @@ pub use debug::{DebugInfo, DebugModule};
 pub use llm::{大模型模块, 嵌入器, 提示模板, 知识库};
 pub use math::{MathModule, MathOperation};
 pub use mcp::{
-    MCP工具, MCP提示, MCP服务器, MCP服务器模块, MCP资源, 工具参数, 工具回调函数, 资源内容, 资源类型,
+    工具参数, 工具回调函数, 资源内容, 资源类型, MCP工具, MCP提示, MCP服务器, MCP服务器模块, MCP资源,
 };
 pub use string::{StringModule, StringOperation};
 pub use system::{SystemInfo, SystemModule};

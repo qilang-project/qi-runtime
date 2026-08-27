@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 
 use super::mcp::{
-    MCP工具, MCP提示, MCP服务器, MCP服务器模块, MCP服务器配置, MCP资源, 工具参数, 资源类型,
+    工具参数, 资源类型, MCP工具, MCP提示, MCP服务器, MCP服务器模块, MCP服务器配置, MCP资源,
 };
 
 // MCP 服务器池
