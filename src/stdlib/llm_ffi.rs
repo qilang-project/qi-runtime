@@ -3084,6 +3084,113 @@ pub extern "C" fn qi_llm_exchange(
     }
 }
 
+// ───────── 流式：给 qi 侧实现用 ─────────
+//
+// 简单流（流式对话 / 读取流 / 关闭流）已改成 qi 写。分工跟非流式一样：
+// Rust 负责带鉴权把请求发出去、以及流式磁带的存取；SSE 分帧、增量拼接、
+// 历史落账都在 qi（标准库.大模型 + 标准库.事件流）。
+//
+// 流式磁带存的不是原始响应，是**解析后的内容块列表** —— 所以录制方必须是
+// 产生块的那一侧，也就是 qi。这两个函数就是那道存取口。
+
+/// 带鉴权发出流式请求，把响应接进 HTTP 流池，返回**HTTP 流句柄**。
+///
+/// 鉴权与端点按 provider 走（跟非流式 发送请求体 同一套：anthropic 用
+/// x-api-key + anthropic-version，gemini 用 x-goog-api-key，其余 Bearer）。
+/// 密钥不出 Rust。
+///
+/// 返回正数句柄；-1 参数无效 / -2 无效会话 / -3 请求失败或非 2xx。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_open(session_handle: i64, request_json: *const c_char) -> i64 {
+    if request_json.is_null() {
+        return -1;
+    }
+    let 请求文本 = unsafe { CStr::from_ptr(request_json) }
+        .to_string_lossy()
+        .to_string();
+    let Ok(请求体) = serde_json::from_str::<Value>(&请求文本) else {
+        return -1;
+    };
+    let 会话 = {
+        let 会话池 = 获取会话池().lock().unwrap();
+        match 会话池.get(&session_handle) {
+            Some(s) => s.clone(),
+            None => return -2,
+        }
+    };
+    match 会话.发送请求体(请求体) {
+        Ok(响应) => crate::io::http_stream_ffi::注册响应(响应),
+        Err(e) => {
+            eprintln!("[qi-llm] 流式请求失败: {}", e);
+            -3
+        }
+    }
+}
+
+/// 查流式磁带。返回 JSON：命中 `{"命中":1,"块":["…"]}`，未命中 `{"命中":0}`。
+///
+/// 还回一个 `"回放":1/0` 告诉 qi 当前是不是 REPLAY 档 —— 未命中且在 REPLAY 档
+/// 下必须**报错而不是去联网**，否则「离线回放」这个承诺就破了（课堂上服务端
+/// 注入的是假 URL/KEY，真联网只会得到一个看不懂的网络错误）。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_tape_get(request_json: *const c_char) -> *mut c_char {
+    let 回放 = 环境开(&["QI_LLM_REPLAY"]);
+    let 缓存 = 环境开(&["QI_LLM_CACHE"]);
+    let 录制 = 环境开(&["QI_LLM_RECORD"]);
+    let mut 出 = json!({
+        "命中": 0,
+        "回放": if 回放 { 1 } else { 0 },
+        "要录": if 录制 || 缓存 { 1 } else { 0 },
+    });
+    if request_json.is_null() {
+        return crate::stdlib::qi_str::rc_cstr_from_string(出.to_string());
+    }
+    let 请求文本 = unsafe { CStr::from_ptr(request_json) }
+        .to_string_lossy()
+        .to_string();
+    let Ok(请求体) = serde_json::from_str::<Value>(&请求文本) else {
+        return crate::stdlib::qi_str::rc_cstr_from_string(出.to_string());
+    };
+    let 键 = 流式磁带键(&请求体);
+    出["键"] = json!(键);
+    if 回放 || 缓存 {
+        if let Some(值) = 磁带::取(&键) {
+            let (块列表, _工具) = 解析流式磁带值(&值);
+            出["命中"] = json!(1);
+            出["块"] = json!(块列表);
+        }
+    }
+    crate::stdlib::qi_str::rc_cstr_from_string(出.to_string())
+}
+
+/// 把一条读尽的纯文本流落盘。`chunks_json` 是内容块字符串数组。
+///
+/// **只在流读尽时调**（qi 侧判定）—— 半途关流不录，否则磁带里存下的是个
+/// 截断的回答，之后每次回放都拿到半句话，而且完全看不出来是磁带的问题。
+#[no_mangle]
+pub extern "C" fn qi_llm_stream_tape_put(
+    request_json: *const c_char,
+    chunks_json: *const c_char,
+) -> i64 {
+    if request_json.is_null() || chunks_json.is_null() {
+        return 0;
+    }
+    let 请求文本 = unsafe { CStr::from_ptr(request_json) }
+        .to_string_lossy()
+        .to_string();
+    let 块文本 = unsafe { CStr::from_ptr(chunks_json) }
+        .to_string_lossy()
+        .to_string();
+    let (Ok(请求体), Ok(块列表)) = (
+        serde_json::from_str::<Value>(&请求文本),
+        serde_json::from_str::<Value>(&块文本),
+    ) else {
+        return 0;
+    };
+    磁带::存(&流式磁带键(&请求体), &块列表);
+    1
+}
+
 /// 把会话配置里的 extra_body 合进请求体，返回合并后的请求体 JSON。
 ///
 /// 合并规则本身留在 Rust：里面有一条「两边都是数组时**追加**而不是覆盖」，

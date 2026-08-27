@@ -216,6 +216,15 @@ pub extern "C" fn qi_http_stream_open(
         Err(_) => return -3,
     };
 
+    注册响应(响应)
+}
+
+/// 把一个**已经拿到**的 blocking Response 接进流池，返回句柄。
+///
+/// 给需要自己发请求的调用方用（LLM 流式要按 provider 加鉴权头、走会话端点，
+/// 那套逻辑在 llm_ffi 里，不该在这儿重复一遍）。接进来之后读取/超时/关闭
+/// 全走同一套，UTF-8 边界处理也一样。
+pub(crate) fn 注册响应(响应: reqwest::blocking::Response) -> i64 {
     let 状态码 = 响应.status().as_u16() as i64;
     let 响应头 = {
         let mut 表 = serde_json::Map::new();
