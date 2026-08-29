@@ -28,7 +28,7 @@
 //!
 //! 网络分块跟字符边界毫无关系：一个汉字三字节，可能第一块结尾拿到两个、
 //! 第二块开头才是第三个。直接把块当字符串交给 qi 就是乱码（更糟的是
-//! from_utf8_lossy 会把半个字符替换成 U+FFFD，**数据就此损坏**，而且
+//! from_utf8_lossy 会把partial_char替换成 U+FFFD，**数据就此损坏**，而且
 //! 后半截字节也跟着废掉，错误还不可见）。
 //!
 //! 所以文本读取会把**结尾不完整的那几个字节留在缓冲里**，等下一块补齐再交出去。
@@ -53,59 +53,59 @@ use std::time::Duration;
 
 use crate::stdlib::qi_str::rc_cstr_from_string;
 
-/// 上一次读取的结果。qi 侧靠 流状态() 取，因为「读到空串」本身有歧义 ——
+/// 上一次读取的结果。qi 侧靠 流状态() 取，因为「读到empty_cstr」本身有歧义 ——
 /// 可能是超时、可能是流结束，也可能真的是个空块。
-pub const 状态_有数据: i64 = 0;
-pub const 状态_超时: i64 = 1;
-pub const 状态_结束: i64 = 2;
-pub const 状态_出错: i64 = 3;
+pub const STATE_DATA: i64 = 0;
+pub const STATE_TIMEOUT: i64 = 1;
+pub const STATE_EOF: i64 = 2;
+pub const STATE_ERROR: i64 = 3;
 /// 句柄根本不存在（已关闭 / 从来没有过）。跟「出错」分开：前者是调用方
 /// 拿着个废句柄，后者是流真的坏了，两种要查的地方不一样。
-pub const 状态_无此流: i64 = 4;
+pub const STATE_NO_STREAM: i64 = 4;
 
-/// 通道容量。按 8KB 一块算，满载约 512KB 在途。
-const 通道容量: usize = 64;
+/// CHANNEL_CAP。按 8KB 一块算，满载约 512KB 在途。
+const CHANNEL_CAP: usize = 64;
 /// 单次 read 的缓冲大小。
-const 读缓冲: usize = 8 * 1024;
+const READ_BUF: usize = 8 * 1024;
 
 /// 句柄从这里起，单调递增、**永不复用**。
 ///
 /// 不复用是有代价换来的教训（见 邮箱 那边同样的做法）：句柄一复用，
 /// 一个「关完了还留着旧句柄」的调用方就会静默读到**别人的流**，
 /// 而不是拿到「无此流」。那种 bug 查起来极贵。
-static 句柄计数器: AtomicI64 = AtomicI64::new(700_001);
+static NEXT_HANDLE: AtomicI64 = AtomicI64::new(700_001);
 
-enum 块 {
-    数据(Vec<u8>),
-    错误(String),
+enum Chunk {
+    Data(Vec<u8>),
+    Err_(String),
 }
 
-struct 流 {
-    状态码: i64,
-    响应头: String,
-    接收器: crossbeam::channel::Receiver<块>,
-    已取消: Arc<AtomicBool>,
+struct stream {
+    status: i64,
+    headers: String,
+    receiver: crossbeam::channel::Receiver<Chunk>,
+    cancelled: Arc<AtomicBool>,
     /// 上次读取的结果，供 流状态() 查。
-    上次状态: Mutex<i64>,
-    错误信息: Mutex<String>,
+    last_state: Mutex<i64>,
+    error_msg: Mutex<String>,
     /// 文本读取时结尾那几个凑不成完整字符的字节，留到下一块拼上。
-    半个字符: Mutex<Vec<u8>>,
+    partial_char: Mutex<Vec<u8>>,
     /// 通道读空且发送端已断 → 流真结束。单独记是因为 recv_timeout 的
     /// Disconnected 只能看到一次，之后再问还得答「结束」而不是「超时」。
-    已结束: Mutex<bool>,
+    finished: Mutex<bool>,
 }
 
-static 流池: OnceLock<Mutex<HashMap<i64, Arc<流>>>> = OnceLock::new();
+static STREAMS: OnceLock<Mutex<HashMap<i64, Arc<stream>>>> = OnceLock::new();
 
-fn 池() -> &'static Mutex<HashMap<i64, Arc<流>>> {
-    流池.get_or_init(|| Mutex::new(HashMap::new()))
+fn pool() -> &'static Mutex<HashMap<i64, Arc<stream>>> {
+    STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn 取流(句柄: i64) -> Option<Arc<流>> {
-    池().lock().ok()?.get(&句柄).cloned()
+fn get_stream(handle: i64) -> Option<Arc<stream>> {
+    pool().lock().ok()?.get(&handle).cloned()
 }
 
-fn 读C串(p: *const c_char) -> Option<String> {
+fn read_cstr(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
@@ -115,33 +115,33 @@ fn 读C串(p: *const c_char) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn 空串() -> *mut c_char {
+fn empty_cstr() -> *mut c_char {
     rc_cstr_from_string(String::new())
 }
 
-fn 记状态(流: &流, 状态: i64) {
-    if let Ok(mut s) = 流.上次状态.lock() {
+fn set_state(stream: &stream, 状态: i64) {
+    if let Ok(mut s) = stream.last_state.lock() {
         *s = 状态;
     }
 }
 
-fn 记错误(流: &流, 消息: String) {
-    if let Ok(mut e) = 流.错误信息.lock() {
+fn set_error(stream: &stream, 消息: String) {
+    if let Ok(mut e) = stream.error_msg.lock() {
         *e = 消息;
     }
-    记状态(流, 状态_出错);
+    set_state(stream, STATE_ERROR);
 }
 
 /// 打开一条流式 HTTP 请求。
 ///
-/// **阻塞到响应头到达**（reqwest 的 send() 本来就是这个语义），所以返回之后
-/// 状态码 / 响应头 立刻可读，响应体才由后台线程慢慢泵。这样 qi 侧能先看
-/// 状态码决定要不要继续读，而不是稀里糊涂开始读一个 500 的错误页。
+/// **阻塞到headers到达**（reqwest 的 send() 本来就是这个语义），所以返回之后
+/// status / headers 立刻可读，响应体才由后台线程慢慢泵。这样 qi 侧能先看
+/// status决定要不要继续读，而不是稀里糊涂开始读一个 500 的错误页。
 ///
 /// 参数：
 /// - `method` 大小写不敏感，认 GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS
-/// - `headers_json` JSON 对象 `{"名":"值"}`，可传空串
-/// - `body` 请求体，空串表示没有
+/// - `headers_json` JSON 对象 `{"名":"值"}`，可传empty_cstr
+/// - `body` 请求体，empty_cstr表示没有
 /// - `connect_timeout_ms` 连接超时；<=0 用默认 30 秒
 /// - `total_timeout_ms` 整条请求的总时限；**<=0 表示不限**（SSE 常态）
 ///
@@ -156,16 +156,16 @@ pub extern "C" fn qi_http_stream_open(
     connect_timeout_ms: i64,
     total_timeout_ms: i64,
 ) -> i64 {
-    let (Some(方法文本), Some(地址)) = (读C串(method), 读C串(url)) else {
+    let (Some(method_text), Some(url_text)) = (read_cstr(method), read_cstr(url)) else {
         return -1;
     };
-    if 地址.trim().is_empty() {
+    if url_text.trim().is_empty() {
         return -1;
     }
-    let 头文本 = 读C串(headers_json).unwrap_or_default();
-    let 体 = 读C串(body).unwrap_or_default();
+    let headers_text = read_cstr(headers_json).unwrap_or_default();
+    let body_text = read_cstr(body).unwrap_or_default();
 
-    let 方法 = match 方法文本.trim().to_ascii_uppercase().as_str() {
+    let method = match method_text.trim().to_ascii_uppercase().as_str() {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
         "PUT" => reqwest::Method::PUT,
@@ -176,7 +176,7 @@ pub extern "C" fn qi_http_stream_open(
         _ => return -1,
     };
 
-    let mut 构建 = reqwest::blocking::Client::builder().connect_timeout(Duration::from_millis(
+    let mut builder = reqwest::blocking::Client::builder().connect_timeout(Duration::from_millis(
         if connect_timeout_ms > 0 {
             connect_timeout_ms as u64
         } else {
@@ -186,126 +186,129 @@ pub extern "C" fn qi_http_stream_open(
     // 总时限只在显式要求时设。默认不设是**故意**的：`.timeout()` 管的是整条
     // 请求（含读体），给 SSE 设一个就等于给流规定了寿命，到点无差别掐断。
     if total_timeout_ms > 0 {
-        构建 = 构建.timeout(Duration::from_millis(total_timeout_ms as u64));
+        builder = builder.timeout(Duration::from_millis(total_timeout_ms as u64));
     }
-    let Ok(客户端) = 构建.build() else {
+    let Ok(client) = builder.build() else {
         return -2;
     };
 
-    let mut 请求 = 客户端.request(方法, &地址);
-    if !头文本.trim().is_empty() {
-        match serde_json::from_str::<serde_json::Value>(&头文本) {
-            Ok(serde_json::Value::Object(表)) => {
-                for (名, 值) in 表 {
-                    let 值文本 = match 值 {
+    let mut req = client.request(method, &url_text);
+    if !headers_text.trim().is_empty() {
+        match serde_json::from_str::<serde_json::Value>(&headers_text) {
+            Ok(serde_json::Value::Object(map)) => {
+                for (k, v) in map {
+                    let value_text = match v {
                         serde_json::Value::String(s) => s,
                         其他 => 其他.to_string(),
                     };
-                    请求 = 请求.header(名, 值文本);
+                    req = req.header(k, value_text);
                 }
             }
             _ => return -1,
         }
     }
-    if !体.is_empty() {
-        请求 = 请求.body(体);
+    if !body_text.is_empty() {
+        req = req.body(body_text);
     }
 
-    let 响应 = match 请求.send() {
+    let response = match req.send() {
         Ok(r) => r,
         Err(_) => return -3,
     };
 
-    注册响应(响应)
+    register_response(response)
 }
 
-/// 把一个**已经拿到**的 blocking Response 接进流池，返回句柄。
+/// 把一个**已经拿到**的 blocking Response 接进STREAMS，返回句柄。
 ///
-/// 给需要自己发请求的调用方用（LLM 流式要按 provider 加鉴权头、走会话端点，
+/// 给需要自己发请求的调用方用（LLM 流式要按 provider 加鉴权头、走会话endpoint，
 /// 那套逻辑在 llm_ffi 里，不该在这儿重复一遍）。接进来之后读取/超时/关闭
 /// 全走同一套，UTF-8 边界处理也一样。
-pub(crate) fn 注册响应(响应: reqwest::blocking::Response) -> i64 {
-    let 状态码 = 响应.status().as_u16() as i64;
-    let 响应头 = {
-        let mut 表 = serde_json::Map::new();
-        for (名, 值) in 响应.headers().iter() {
+pub(crate) fn register_response(response: reqwest::blocking::Response) -> i64 {
+    let status = response.status().as_u16() as i64;
+    let headers = {
+        let mut map = serde_json::Map::new();
+        for (k, v) in response.headers().iter() {
             // 头名大小写在 HTTP 里不敏感，reqwest 给的是小写，直接用。
             //
             // 值按 HTTP 规范只能是可见 ASCII，`to_str()` 也只认这个。真遇到非 ASCII
             // （服务端不守规矩，比如把中文文件名塞进自定义头）**不能丢掉这一条** ——
             // 丢了之后 qi 侧看到的是「压根没有这个头」，会往「服务端没发」的方向查，
             // 而实际上发了、只是值不规范。lossy 解出来至少保住「它存在」这个事实。
-            let 值文本 = match 值.to_str() {
+            let value_text = match v.to_str() {
                 Ok(v) => v.to_string(),
-                Err(_) => String::from_utf8_lossy(值.as_bytes()).into_owned(),
+                Err(_) => String::from_utf8_lossy(v.as_bytes()).into_owned(),
             };
-            表.insert(名.as_str().to_string(), serde_json::Value::String(值文本));
+            map.insert(
+                k.as_str().to_string(),
+                serde_json::Value::String(value_text),
+            );
         }
-        serde_json::Value::Object(表).to_string()
+        serde_json::Value::Object(map).to_string()
     };
 
-    let (发送器, 接收器) = crossbeam::channel::bounded::<块>(通道容量);
-    let 已取消 = Arc::new(AtomicBool::new(false));
-    let 线程取消 = 已取消.clone();
+    let (sender, receiver) = crossbeam::channel::bounded::<Chunk>(CHANNEL_CAP);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let thread_cancelled = cancelled.clone();
 
     std::thread::spawn(move || {
-        let mut 响应 = 响应;
-        let mut 缓冲 = vec![0u8; 读缓冲];
+        let mut response = response;
+        let mut buf = vec![0u8; READ_BUF];
         loop {
-            if 线程取消.load(Ordering::Relaxed) {
+            if thread_cancelled.load(Ordering::Relaxed) {
                 return;
             }
-            match 响应.read(&mut 缓冲) {
-                Ok(0) => return, // EOF：发送器随本闭包一起 drop，接收端读到 Disconnected
+            match response.read(&mut buf) {
+                Ok(0) => return, // EOF：sender随本闭包一起 drop，接收端读到 Disconnected
                 Ok(n) => {
                     // send 失败 = 接收端没了（流被关掉），退出即可，不是错误
-                    if 发送器.send(块::数据(缓冲[..n].to_vec())).is_err() {
+                    if sender.send(Chunk::Data(buf[..n].to_vec())).is_err() {
                         return;
                     }
                 }
                 Err(e) => {
-                    let _ = 发送器.send(块::错误(format!("读取响应体失败: {}", e)));
+                    let _ = sender.send(Chunk::Err_(format!("读取响应体失败: {}", e)));
                     return;
                 }
             }
         }
     });
 
-    let 句柄 = 句柄计数器.fetch_add(1, Ordering::Relaxed);
-    let 流对象 = Arc::new(流 {
-        状态码,
-        响应头,
-        接收器,
-        已取消,
-        上次状态: Mutex::new(状态_有数据),
-        错误信息: Mutex::new(String::new()),
-        半个字符: Mutex::new(Vec::new()),
-        已结束: Mutex::new(false),
+    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    let stream = Arc::new(stream {
+        status,
+        headers,
+        receiver,
+        cancelled,
+        last_state: Mutex::new(STATE_DATA),
+        error_msg: Mutex::new(String::new()),
+        partial_char: Mutex::new(Vec::new()),
+        finished: Mutex::new(false),
     });
-    match 池().lock() {
+    match pool().lock() {
         Ok(mut p) => {
-            p.insert(句柄, 流对象);
-            句柄
+            p.insert(handle, stream);
+            handle
         }
         Err(_) => -2,
     }
 }
 
-/// HTTP 状态码。句柄无效返回 -1。
+/// HTTP status。句柄无效返回 -1。
 #[no_mangle]
 pub extern "C" fn qi_http_stream_status(handle: i64) -> i64 {
-    match 取流(handle) {
-        Some(s) => s.状态码,
+    match get_stream(handle) {
+        Some(s) => s.status,
         None => -1,
     }
 }
 
-/// 全部响应头，JSON 对象（头名小写）。句柄无效返回空串。
+/// 全部headers，JSON 对象（头名小写）。句柄无效返回empty_cstr。
 #[no_mangle]
 pub extern "C" fn qi_http_stream_headers(handle: i64) -> *mut c_char {
-    match 取流(handle) {
-        Some(s) => rc_cstr_from_string(s.响应头.clone()),
-        None => 空串(),
+    match get_stream(handle) {
+        Some(s) => rc_cstr_from_string(s.headers.clone()),
+        None => empty_cstr(),
     }
 }
 
@@ -313,113 +316,113 @@ pub extern "C" fn qi_http_stream_headers(handle: i64) -> *mut c_char {
 /// 读完必须问 流状态() 才知道是哪种情况。
 #[no_mangle]
 pub extern "C" fn qi_http_stream_read_bytes(handle: i64, timeout_ms: i64) -> i64 {
-    let Some(流) = 取流(handle) else {
+    let Some(stream) = get_stream(handle) else {
         return 0;
     };
-    match 收一块(&流, timeout_ms) {
-        Some(字节) => {
-            记状态(&流, 状态_有数据);
-            crate::stdlib::bytes_ffi::register_bytes(字节)
+    match recv_chunk(&stream, timeout_ms) {
+        Some(bytes) => {
+            set_state(&stream, STATE_DATA);
+            crate::stdlib::bytes_ffi::register_bytes(bytes)
         }
         None => 0,
     }
 }
 
-/// 取一块文本。结尾不完整的多字节字符会留到下一次，不会交出半个字符。
-/// 没有数据时返回空串 —— 用 流状态() 区分超时 / 结束 / 出错。
+/// 取一块文本。结尾不完整的多字节字符会留到下一次，不会交出partial_char。
+/// 没有数据时返回empty_cstr —— 用 流状态() 区分超时 / 结束 / 出错。
 #[no_mangle]
 pub extern "C" fn qi_http_stream_read(handle: i64, timeout_ms: i64) -> *mut c_char {
-    let Some(流) = 取流(handle) else {
-        return 空串();
+    let Some(stream) = get_stream(handle) else {
+        return empty_cstr();
     };
-    let 新字节 = match 收一块(&流, timeout_ms) {
+    let new_bytes = match recv_chunk(&stream, timeout_ms) {
         Some(b) => b,
         None => {
             // 流正常结束时，缓冲里还剩着凑不齐的字节 = 响应体不是合法 UTF-8
             // （截断的多字节序列）。这必须报出来：无声吞掉的话调用方会拿到一段
-            // 少了尾巴的文本，而且完全看不出少了。
-            if 流.上次状态.lock().map(|s| *s).unwrap_or(状态_结束) == 状态_结束 {
-                let 剩 = 流
-                    .半个字符
+            // 少了tail的文本，而且完全看不出少了。
+            if stream.last_state.lock().map(|s| *s).unwrap_or(STATE_EOF) == STATE_EOF {
+                let leftover = stream
+                    .partial_char
                     .lock()
                     .map(|mut b| std::mem::take(&mut *b))
                     .unwrap_or_default();
-                if !剩.is_empty() {
-                    记错误(
-                        &流,
+                if !leftover.is_empty() {
+                    set_error(
+                        &stream,
                         format!(
                             "响应体结尾有 {} 个字节凑不成完整字符（不是合法 UTF-8）",
-                            剩.len()
+                            leftover.len()
                         ),
                     );
                 }
             }
-            return 空串();
+            return empty_cstr();
         }
     };
 
-    let mut 待解码 = match 流.半个字符.lock() {
-        Ok(mut 半) => {
-            let mut v = std::mem::take(&mut *半);
-            v.extend_from_slice(&新字节);
+    let mut pending = match stream.partial_char.lock() {
+        Ok(mut held) => {
+            let mut v = std::mem::take(&mut *held);
+            v.extend_from_slice(&new_bytes);
             v
         }
-        Err(_) => 新字节,
+        Err(_) => new_bytes,
     };
 
     // 切到最后一个完整字符处；余下的字节留给下一块。
-    let 完整长度 = match std::str::from_utf8(&待解码) {
-        Ok(_) => 待解码.len(),
+    let valid_len = match std::str::from_utf8(&pending) {
+        Ok(_) => pending.len(),
         Err(e) => {
             if e.error_len().is_some() {
                 // 真的非法（不是「还没读全」），这条流的字节流本身坏了。
-                记错误(
-                    &流,
+                set_error(
+                    &stream,
                     format!("响应体含非法 UTF-8 字节（偏移 {}）", e.valid_up_to()),
                 );
-                return 空串();
+                return empty_cstr();
             }
             e.valid_up_to()
         }
     };
-    let 尾巴 = 待解码.split_off(完整长度);
-    if let Ok(mut 半) = 流.半个字符.lock() {
-        *半 = 尾巴;
+    let tail = pending.split_off(valid_len);
+    if let Ok(mut held) = stream.partial_char.lock() {
+        *held = tail;
     }
 
-    记状态(&流, 状态_有数据);
-    match String::from_utf8(待解码) {
+    set_state(&stream, STATE_DATA);
+    match String::from_utf8(pending) {
         Ok(s) => rc_cstr_from_string(s),
         // 上面已经切到合法边界，走不到这里；真走到也不能 panic。
         Err(e) => rc_cstr_from_string(String::from_utf8_lossy(e.as_bytes()).into_owned()),
     }
 }
 
-/// 从通道收一块。顺带把 上次状态 记好（超时 / 结束 / 出错）。
-fn 收一块(流: &流, timeout_ms: i64) -> Option<Vec<u8>> {
+/// 从通道recv_chunk。顺带把 last_state 记好（超时 / 结束 / 出错）。
+fn recv_chunk(stream: &stream, timeout_ms: i64) -> Option<Vec<u8>> {
     // 已经判定结束的流不要再去 recv —— 通道断开后 recv_timeout 立刻返回
     // Disconnected，会被当成又一次「结束」没问题，但白等一轮没意义，
     // 更重要的是保证反复问的答案稳定。
-    if 流.已结束.lock().map(|v| *v).unwrap_or(false) {
-        记状态(流, 状态_结束);
+    if stream.finished.lock().map(|v| *v).unwrap_or(false) {
+        set_state(stream, STATE_EOF);
         return None;
     }
-    let 等待 = Duration::from_millis(timeout_ms.max(0) as u64);
-    match 流.接收器.recv_timeout(等待) {
-        Ok(块::数据(b)) => Some(b),
-        Ok(块::错误(e)) => {
-            记错误(流, e);
+    let wait = Duration::from_millis(timeout_ms.max(0) as u64);
+    match stream.receiver.recv_timeout(wait) {
+        Ok(Chunk::Data(b)) => Some(b),
+        Ok(Chunk::Err_(e)) => {
+            set_error(stream, e);
             None
         }
         Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-            记状态(流, 状态_超时);
+            set_state(stream, STATE_TIMEOUT);
             None
         }
         Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
-            if let Ok(mut 完) = 流.已结束.lock() {
-                *完 = true;
+            if let Ok(mut done) = stream.finished.lock() {
+                *done = true;
             }
-            记状态(流, 状态_结束);
+            set_state(stream, STATE_EOF);
             None
         }
     }
@@ -428,18 +431,18 @@ fn 收一块(流: &流, timeout_ms: i64) -> Option<Vec<u8>> {
 /// 上一次读取的结果：0 有数据 / 1 超时 / 2 结束 / 3 出错 / 4 无此流。
 #[no_mangle]
 pub extern "C" fn qi_http_stream_state(handle: i64) -> i64 {
-    match 取流(handle) {
-        Some(s) => s.上次状态.lock().map(|v| *v).unwrap_or(状态_出错),
-        None => 状态_无此流,
+    match get_stream(handle) {
+        Some(s) => s.last_state.lock().map(|v| *v).unwrap_or(STATE_ERROR),
+        None => STATE_NO_STREAM,
     }
 }
 
-/// 出错时的说明；没出错返回空串。
+/// 出错时的说明；没出错返回empty_cstr。
 #[no_mangle]
 pub extern "C" fn qi_http_stream_error(handle: i64) -> *mut c_char {
-    match 取流(handle) {
-        Some(s) => rc_cstr_from_string(s.错误信息.lock().map(|v| v.clone()).unwrap_or_default()),
-        None => 空串(),
+    match get_stream(handle) {
+        Some(s) => rc_cstr_from_string(s.error_msg.lock().map(|v| v.clone()).unwrap_or_default()),
+        None => empty_cstr(),
     }
 }
 
@@ -449,10 +452,10 @@ pub extern "C" fn qi_http_stream_error(handle: i64) -> *mut c_char {
 /// 但 qi 侧不等它。
 #[no_mangle]
 pub extern "C" fn qi_http_stream_close(handle: i64) -> i64 {
-    let 取出 = 池().lock().ok().and_then(|mut p| p.remove(&handle));
-    match 取出 {
-        Some(流) => {
-            流.已取消.store(true, Ordering::Relaxed);
+    let removed = pool().lock().ok().and_then(|mut p| p.remove(&handle));
+    match removed {
+        Some(stream) => {
+            stream.cancelled.store(true, Ordering::Relaxed);
             1
         }
         None => 0,
@@ -470,7 +473,7 @@ mod tests {
         CString::new(s).unwrap()
     }
 
-    fn 取串(p: *mut c_char) -> String {
+    fn to_string_owned(p: *mut c_char) -> String {
         if p.is_null() {
             return String::new();
         }
@@ -479,37 +482,38 @@ mod tests {
             .into_owned()
     }
 
-    /// 起一个只服务一次的 HTTP 服务，按 分片 逐块写出、每块之间停 停顿。
-    /// 返回端点地址。
-    fn 起服务(分片: Vec<Vec<u8>>, 头: &'static str, 停顿: Duration) -> String {
-        let 监听 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let 端口 = 监听.local_addr().unwrap().port();
+    /// 起一个只服务一次的 HTTP 服务，按 chunks 逐块写出、每块之间停 gap。
+    /// 返回endpoint地址。
+    fn serve_once(chunks: Vec<Vec<u8>>, header: &'static str, gap: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            if let Ok((mut 连, _)) = 监听.accept() {
-                let mut 丢 = [0u8; 4096];
-                let _ = 连.read(&mut 丢);
-                let _ = 连.write_all(头.as_bytes());
-                let _ = 连.flush();
-                for 片 in 分片 {
-                    if !停顿.is_zero() {
-                        std::thread::sleep(停顿);
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut scratch = [0u8; 4096];
+                let _ = conn.read(&mut scratch);
+                let _ = conn.write_all(header.as_bytes());
+                let _ = conn.flush();
+                for chunk in chunks {
+                    if !gap.is_zero() {
+                        std::thread::sleep(gap);
                     }
-                    if 连.write_all(&片).is_err() {
+                    if conn.write_all(&chunk).is_err() {
                         return;
                     }
-                    let _ = 连.flush();
+                    let _ = conn.flush();
                 }
             }
         });
-        format!("http://127.0.0.1:{}/", 端口)
+        format!("http://127.0.0.1:{}/", port)
     }
 
-    const 定长头: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n";
+    const FIXED_HEADER: &str =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n";
 
-    fn 开(端点: &str) -> i64 {
+    fn open_stream(endpoint: &str) -> i64 {
         qi_http_stream_open(
             c("GET").as_ptr(),
-            c(端点).as_ptr(),
+            c(endpoint).as_ptr(),
             c("").as_ptr(),
             c("").as_ptr(),
             5_000,
@@ -518,195 +522,206 @@ mod tests {
     }
 
     /// 读到流结束，返回拼起来的全文。
-    fn 读到底(流: i64) -> String {
-        let mut 全 = String::new();
+    fn read_all(stream: i64) -> String {
+        let mut all = String::new();
         for _ in 0..500 {
-            全.push_str(&取串(qi_http_stream_read(流, 2_000)));
-            let 态 = qi_http_stream_state(流);
-            if 态 == 状态_结束 || 态 == 状态_出错 {
+            all.push_str(&to_string_owned(qi_http_stream_read(stream, 2_000)));
+            let st = qi_http_stream_state(stream);
+            if st == STATE_EOF || st == STATE_ERROR {
                 break;
             }
         }
-        全
+        all
     }
 
     #[test]
-    fn 分块到达能逐块读出() {
-        let 端点 = 起服务(
+    fn chunks_arrive_incrementally() {
+        let endpoint = serve_once(
             vec![
                 b"hello ".to_vec(),
                 b"streaming ".to_vec(),
                 b"world".to_vec(),
             ],
-            定长头,
+            FIXED_HEADER,
             Duration::from_millis(30),
         );
-        let 流 = 开(&端点);
-        assert!(流 > 0, "开流失败: {}", 流);
-        assert_eq!(qi_http_stream_status(流), 200);
-        assert_eq!(读到底(流), "hello streaming world");
-        assert_eq!(qi_http_stream_state(流), 状态_结束);
-        qi_http_stream_close(流);
+        let stream = open_stream(&endpoint);
+        assert!(stream > 0, "开流失败: {}", stream);
+        assert_eq!(qi_http_stream_status(stream), 200);
+        assert_eq!(read_all(stream), "hello streaming world");
+        assert_eq!(qi_http_stream_state(stream), STATE_EOF);
+        qi_http_stream_close(stream);
     }
 
     /// 这条是整个模块存在的理由：一个汉字被拆在两个网络块里，
     /// 不能变成乱码，也不能变成 U+FFFD。
     #[test]
-    fn 汉字跨块不被截断() {
-        let 文 = "流式读取中文测试".as_bytes().to_vec();
+    fn cjk_split_across_chunks_is_intact() {
+        let text = "流式读取中文测试".as_bytes().to_vec();
         // 在第 4 个字节处切开 —— 正好落在第二个汉字中间
-        let (甲, 乙) = 文.split_at(4);
-        let 端点 = 起服务(
-            vec![甲.to_vec(), 乙.to_vec()],
-            定长头,
+        let (head, rest) = text.split_at(4);
+        let endpoint = serve_once(
+            vec![head.to_vec(), rest.to_vec()],
+            FIXED_HEADER,
             Duration::from_millis(30),
         );
-        let 流 = 开(&端点);
-        assert!(流 > 0);
-        let 全 = 读到底(流);
-        assert_eq!(全, "流式读取中文测试");
+        let stream = open_stream(&endpoint);
+        assert!(stream > 0);
+        let all = read_all(stream);
+        assert_eq!(all, "流式读取中文测试");
         assert!(
-            !全.contains('\u{fffd}'),
+            !all.contains('\u{fffd}'),
             "出现替换字符，说明半个字符被交出去了"
         );
-        qi_http_stream_close(流);
+        qi_http_stream_close(stream);
     }
 
     /// 每个字节单独一块 —— 最坏情况，每个汉字都被拆成三块。
     #[test]
-    fn 逐字节到达也不乱码() {
-        let 文 = "汉字逐字节abc混排".as_bytes().to_vec();
-        let 分片: Vec<Vec<u8>> = 文.iter().map(|b| vec![*b]).collect();
-        let 端点 = 起服务(分片, 定长头, Duration::from_millis(1));
-        let 流 = 开(&端点);
-        assert!(流 > 0);
-        assert_eq!(读到底(流), "汉字逐字节abc混排");
-        qi_http_stream_close(流);
+    fn byte_at_a_time_is_intact() {
+        let text = "汉字逐字节abc混排".as_bytes().to_vec();
+        let chunks: Vec<Vec<u8>> = text.iter().map(|b| vec![*b]).collect();
+        let endpoint = serve_once(chunks, FIXED_HEADER, Duration::from_millis(1));
+        let stream = open_stream(&endpoint);
+        assert!(stream > 0);
+        assert_eq!(read_all(stream), "汉字逐字节abc混排");
+        qi_http_stream_close(stream);
     }
 
     /// 服务端半天不说话时，读要能按时返回「超时」而不是挂住，且流还活着。
     #[test]
-    fn 超时后流仍可继续读() {
-        let 端点 = 起服务(vec![b"late".to_vec()], 定长头, Duration::from_millis(600));
-        let 流 = 开(&端点);
-        assert!(流 > 0);
+    fn stream_survives_read_timeout() {
+        let endpoint = serve_once(
+            vec![b"late".to_vec()],
+            FIXED_HEADER,
+            Duration::from_millis(600),
+        );
+        let stream = open_stream(&endpoint);
+        assert!(stream > 0);
 
-        let 起 = std::time::Instant::now();
-        let 首次 = 取串(qi_http_stream_read(流, 150));
-        assert_eq!(首次, "");
-        assert_eq!(qi_http_stream_state(流), 状态_超时);
-        assert!(起.elapsed() < Duration::from_millis(500), "没有按时返回");
+        let started = std::time::Instant::now();
+        let first = to_string_owned(qi_http_stream_read(stream, 150));
+        assert_eq!(first, "");
+        assert_eq!(qi_http_stream_state(stream), STATE_TIMEOUT);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "没有按时返回"
+        );
 
         // 流没被超时弄死，继续等就能拿到
-        let mut 全 = String::new();
+        let mut all = String::new();
         for _ in 0..20 {
-            全.push_str(&取串(qi_http_stream_read(流, 300)));
-            if 全.contains("late") {
+            all.push_str(&to_string_owned(qi_http_stream_read(stream, 300)));
+            if all.contains("late") {
                 break;
             }
         }
-        assert_eq!(全, "late");
-        qi_http_stream_close(流);
+        assert_eq!(all, "late");
+        qi_http_stream_close(stream);
     }
 
     #[test]
-    fn 读取字节不做任何解码() {
+    fn read_bytes_does_no_decoding() {
         // 故意不是合法 UTF-8
-        let 原始 = vec![0xff, 0xfe, 0x00, 0x41, 0x42];
-        let 端点 = 起服务(vec![原始.clone()], 定长头, Duration::ZERO);
-        let 流 = 开(&端点);
-        assert!(流 > 0);
-        let mut 收 = Vec::new();
+        let raw = vec![0xff, 0xfe, 0x00, 0x41, 0x42];
+        let endpoint = serve_once(vec![raw.clone()], FIXED_HEADER, Duration::ZERO);
+        let stream = open_stream(&endpoint);
+        assert!(stream > 0);
+        let mut got = Vec::new();
         for _ in 0..50 {
-            let h = qi_http_stream_read_bytes(流, 1_000);
+            let h = qi_http_stream_read_bytes(stream, 1_000);
             if h != 0 {
-                收.extend(crate::stdlib::bytes_ffi::clone_bytes(h).unwrap_or_default());
+                got.extend(crate::stdlib::bytes_ffi::clone_bytes(h).unwrap_or_default());
             }
-            let 态 = qi_http_stream_state(流);
-            if 态 == 状态_结束 || 态 == 状态_出错 {
+            let st = qi_http_stream_state(stream);
+            if st == STATE_EOF || st == STATE_ERROR {
                 break;
             }
         }
-        assert_eq!(收, 原始);
-        qi_http_stream_close(流);
+        assert_eq!(got, raw);
+        qi_http_stream_close(stream);
     }
 
     /// 非法 UTF-8 走文本读取时必须报错，不能悄悄替换成 U+FFFD。
     #[test]
-    fn 文本读遇非法utf8要报错() {
-        let 端点 = 起服务(vec![vec![b'a', 0xff, 0xfe, b'b']], 定长头, Duration::ZERO);
-        let 流 = 开(&端点);
-        assert!(流 > 0);
-        let mut 出错了 = false;
+    fn invalid_utf8_reports_error() {
+        let endpoint = serve_once(
+            vec![vec![b'a', 0xff, 0xfe, b'b']],
+            FIXED_HEADER,
+            Duration::ZERO,
+        );
+        let stream = open_stream(&endpoint);
+        assert!(stream > 0);
+        let mut saw_error = false;
         for _ in 0..50 {
-            let _ = 取串(qi_http_stream_read(流, 1_000));
-            let 态 = qi_http_stream_state(流);
-            if 态 == 状态_出错 {
-                出错了 = true;
+            let _ = to_string_owned(qi_http_stream_read(stream, 1_000));
+            let st = qi_http_stream_state(stream);
+            if st == STATE_ERROR {
+                saw_error = true;
                 assert!(
-                    取串(qi_http_stream_error(流)).contains("非法 UTF-8"),
+                    to_string_owned(qi_http_stream_error(stream)).contains("非法 UTF-8"),
                     "错误信息没说清楚"
                 );
                 break;
             }
-            if 态 == 状态_结束 {
+            if st == STATE_EOF {
                 break;
             }
         }
-        assert!(出错了, "非法 UTF-8 被静默吞掉了");
-        qi_http_stream_close(流);
+        assert!(saw_error, "非法 UTF-8 被静默吞掉了");
+        qi_http_stream_close(stream);
     }
 
     #[test]
-    fn 状态码与响应头可读() {
-        let 端点 = 起服务(
+    fn status_and_headers_readable() {
+        let endpoint = serve_once(
             vec![b"nope".to_vec()],
             "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nX-Qi-Test: abc-123\r\nX-Qi-Bad: 值\r\nConnection: close\r\n\r\n",
             Duration::ZERO,
         );
-        let 流 = 开(&端点);
-        assert!(流 > 0);
-        assert_eq!(qi_http_stream_status(流), 404);
-        let 头: serde_json::Value =
-            serde_json::from_str(&取串(qi_http_stream_headers(流))).unwrap();
-        assert_eq!(头["content-type"], serde_json::json!("text/plain"));
-        assert_eq!(头["x-qi-test"], serde_json::json!("abc-123"));
+        let stream = open_stream(&endpoint);
+        assert!(stream > 0);
+        assert_eq!(qi_http_stream_status(stream), 404);
+        let header: serde_json::Value =
+            serde_json::from_str(&to_string_owned(qi_http_stream_headers(stream))).unwrap();
+        assert_eq!(header["content-type"], serde_json::json!("text/plain"));
+        assert_eq!(header["x-qi-test"], serde_json::json!("abc-123"));
         // 非 ASCII 头值不合 HTTP 规范，但不能因此让这一条**消失** ——
         // 消失了 qi 侧会以为服务端没发这个头，查错方向。
         assert_eq!(
-            头["x-qi-bad"],
+            header["x-qi-bad"],
             serde_json::json!("值"),
             "不规范的头值被丢掉了"
         );
-        qi_http_stream_close(流);
+        qi_http_stream_close(stream);
     }
 
     #[test]
-    fn 关闭后句柄立刻失效且重复关闭无害() {
-        let 端点 = 起服务(vec![b"x".to_vec()], 定长头, Duration::ZERO);
-        let 流 = 开(&端点);
-        assert!(流 > 0);
-        assert_eq!(qi_http_stream_close(流), 1);
-        assert_eq!(qi_http_stream_close(流), 0, "重复关闭应无副作用");
-        assert_eq!(qi_http_stream_state(流), 状态_无此流);
-        assert_eq!(qi_http_stream_status(流), -1);
-        assert_eq!(取串(qi_http_stream_read(流, 10)), "");
+    fn close_invalidates_handle_and_is_idempotent() {
+        let endpoint = serve_once(vec![b"x".to_vec()], FIXED_HEADER, Duration::ZERO);
+        let stream = open_stream(&endpoint);
+        assert!(stream > 0);
+        assert_eq!(qi_http_stream_close(stream), 1);
+        assert_eq!(qi_http_stream_close(stream), 0, "重复关闭应无副作用");
+        assert_eq!(qi_http_stream_state(stream), STATE_NO_STREAM);
+        assert_eq!(qi_http_stream_status(stream), -1);
+        assert_eq!(to_string_owned(qi_http_stream_read(stream, 10)), "");
     }
 
-    /// 句柄不复用：关掉一条再开一条，新句柄不能等于旧的。
+    /// handles_are_never_reused：关掉一条再开一条，新句柄不能等于旧的。
     #[test]
-    fn 句柄不复用() {
-        let 端点 = 起服务(vec![b"a".to_vec()], 定长头, Duration::ZERO);
-        let 甲 = 开(&端点);
-        qi_http_stream_close(甲);
-        let 端点2 = 起服务(vec![b"b".to_vec()], 定长头, Duration::ZERO);
-        let 乙 = 开(&端点2);
-        assert_ne!(甲, 乙, "句柄被复用了");
-        qi_http_stream_close(乙);
+    fn handles_are_never_reused() {
+        let endpoint = serve_once(vec![b"a".to_vec()], FIXED_HEADER, Duration::ZERO);
+        let head = open_stream(&endpoint);
+        qi_http_stream_close(head);
+        let endpoint2 = serve_once(vec![b"b".to_vec()], FIXED_HEADER, Duration::ZERO);
+        let rest = open_stream(&endpoint2);
+        assert_ne!(head, rest, "句柄被复用了");
+        qi_http_stream_close(rest);
     }
 
     #[test]
-    fn 坏参数不崩() {
+    fn bad_args_do_not_crash() {
         assert_eq!(
             qi_http_stream_open(
                 std::ptr::null(),

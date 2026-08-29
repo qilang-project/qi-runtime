@@ -328,8 +328,8 @@ pub extern "C" fn qi_io_eprintln(s: *const c_char) -> c_int {
     }
     unsafe {
         match CStr::from_ptr(s).to_str() {
-            Ok(rust_str) => {
-                eprintln!("{}", rust_str);
+            Ok(text) => {
+                eprintln!("{}", text);
                 0
             }
             Err(_) => {
@@ -348,8 +348,8 @@ pub extern "C" fn qi_io_eprint(s: *const c_char) -> c_int {
     }
     unsafe {
         match CStr::from_ptr(s).to_str() {
-            Ok(rust_str) => {
-                eprint!("{}", rust_str);
+            Ok(text) => {
+                eprint!("{}", text);
                 let _ = std::io::Write::flush(&mut std::io::stderr());
                 0
             }

@@ -3001,26 +3001,35 @@ pub extern "C" fn qi_llm_chat_async(session_handle: i64, prompt: *const c_char) 
 /// 给个空对象让它按「字段都取不到」走，比多一条字符串分支干净）。
 #[no_mangle]
 pub extern "C" fn qi_llm_session_view(session_handle: i64) -> *mut c_char {
-    let 会话池 = 获取会话池().lock().unwrap();
-    let Some(会话) = 会话池.get(&session_handle) else {
+    let pool = 获取会话池().lock().unwrap();
+    let Some(session) = pool.get(&session_handle) else {
         return crate::stdlib::qi_str::rc_cstr_from_string("{}".to_string());
     };
-    let 配置: serde_json::Map<String, Value> = 会话
+    let cfg: serde_json::Map<String, Value> = session
         .配置
         .iter()
         .map(|(k, v)| (k.clone(), json!(v)))
         .collect();
-    let 视图 = json!({
-        "端点": 会话.端点,
-        "模型": 会话.模型,
-        "提供商": 会话.提供商,
-        "配置": Value::Object(配置),
-        "历史": 会话.历史,
-        "预算上限": 会话.预算上限,
-        "累计用量": 会话.累计用量,
-        "有密钥": 会话.密钥.is_some(),
+    let name_map: serde_json::Map<String, Value> = session
+        .工具名称映射
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v)))
+        .collect();
+    let view = json!({
+        "端点": session.端点,
+        "模型": session.模型,
+        "提供商": session.提供商,
+        "配置": Value::Object(cfg),
+        "历史": session.历史,
+        "预算上限": session.预算上限,
+        "累计用量": session.累计用量,
+        "有密钥": session.密钥.is_some(),
+        // 工具定义已经是**注册时就成形好**的 OpenAI 形状（含 provider-safe 名），
+        // qi 侧按 provider 再翻译。名称映射是 安全名 → Qi 原名，取工具调用名字要用。
+        "工具列表": session.工具列表,
+        "工具名称映射": Value::Object(name_map),
     });
-    crate::stdlib::qi_str::rc_cstr_from_string(视图.to_string())
+    crate::stdlib::qi_str::rc_cstr_from_string(view.to_string())
 }
 
 /// 把 qi 拼好的请求体发出去，返回响应体。中间夹预算闸和磁带闸。
@@ -3039,48 +3048,48 @@ pub extern "C" fn qi_llm_exchange(
     purpose: *const c_char,
     request_json: *const c_char,
 ) -> *mut c_char {
-    fn 失败(消息: String) -> *mut c_char {
-        crate::stdlib::qi_str::rc_cstr_from_string(json!({"ok": false, "error": 消息}).to_string())
+    fn fail(msg: String) -> *mut c_char {
+        crate::stdlib::qi_str::rc_cstr_from_string(json!({"ok": false, "error": msg}).to_string())
     }
     if purpose.is_null() || request_json.is_null() {
-        return 失败("参数为空".to_string());
+        return fail("参数为空".to_string());
     }
-    let 用途 = unsafe { CStr::from_ptr(purpose) }
+    let purpose = unsafe { CStr::from_ptr(purpose) }
         .to_string_lossy()
         .to_string();
-    let 请求文本 = unsafe { CStr::from_ptr(request_json) }
+    let req_text = unsafe { CStr::from_ptr(request_json) }
         .to_string_lossy()
         .to_string();
-    let 请求体: Value = match serde_json::from_str(&请求文本) {
+    let req_body: Value = match serde_json::from_str(&req_text) {
         Ok(v) => v,
-        Err(e) => return 失败(format!("请求体不是合法 JSON: {}", e)),
+        Err(e) => return fail(format!("请求体不是合法 JSON: {}", e)),
     };
 
-    let 会话池 = 获取会话池().lock().unwrap();
-    let Some(会话) = 会话池.get(&session_handle) else {
-        return 失败("无效会话句柄".to_string());
+    let pool = 获取会话池().lock().unwrap();
+    let Some(session) = pool.get(&session_handle) else {
+        return fail("无效会话句柄".to_string());
     };
 
-    let 结果 = match 用途.as_str() {
+    let outcome = match purpose.as_str() {
         // 嵌入不过预算闸也不合 extra_body —— 跟原 嵌入 的语义逐条一致
         // （请求体就是 {"model","input"}，只读会话）。
-        "embed" => 会话.嵌入请求响应(请求体),
-        "chat" => match 会话.预算检查() {
+        "embed" => session.嵌入请求响应(req_body),
+        "chat" => match session.预算检查() {
             Err(e) => Err(e),
             // extra_body 不在这里合 —— 合并**位置**会影响键序，而位置只有 qi
             // 那边知道：单轮对话是「合完就发」，多候选却是「合完再加 n」。
             // 在这儿统一合的话，多候选就变成「加 n 再合」，extra_body 带一个
             // 新键时键序就跟原实现不同了。qi 侧调 合并额外参数 自己挑时机。
-            Ok(()) => 会话.请求响应(请求体),
+            Ok(()) => session.请求响应(req_body),
         },
-        其他 => Err(format!("未知用途「{}」（只认 chat / embed）", 其他)),
+        other => Err(format!("未知用途「{}」（只认 chat / embed）", other)),
     };
 
-    match 结果 {
-        Ok(体) => {
-            crate::stdlib::qi_str::rc_cstr_from_string(json!({"ok": true, "body": 体}).to_string())
-        }
-        Err(e) => 失败(e),
+    match outcome {
+        Ok(body) => crate::stdlib::qi_str::rc_cstr_from_string(
+            json!({"ok": true, "body": body}).to_string(),
+        ),
+        Err(e) => fail(e),
     }
 }
 
@@ -3105,21 +3114,21 @@ pub extern "C" fn qi_llm_stream_open(session_handle: i64, request_json: *const c
     if request_json.is_null() {
         return -1;
     }
-    let 请求文本 = unsafe { CStr::from_ptr(request_json) }
+    let req_text = unsafe { CStr::from_ptr(request_json) }
         .to_string_lossy()
         .to_string();
-    let Ok(请求体) = serde_json::from_str::<Value>(&请求文本) else {
+    let Ok(req_body) = serde_json::from_str::<Value>(&req_text) else {
         return -1;
     };
-    let 会话 = {
-        let 会话池 = 获取会话池().lock().unwrap();
-        match 会话池.get(&session_handle) {
+    let session = {
+        let pool = 获取会话池().lock().unwrap();
+        match pool.get(&session_handle) {
             Some(s) => s.clone(),
             None => return -2,
         }
     };
-    match 会话.发送请求体(请求体) {
-        Ok(响应) => crate::io::http_stream_ffi::注册响应(响应),
+    match session.发送请求体(req_body) {
+        Ok(resp) => crate::io::http_stream_ffi::register_response(resp),
         Err(e) => {
             eprintln!("[qi-llm] 流式请求失败: {}", e);
             -3
@@ -3134,33 +3143,33 @@ pub extern "C" fn qi_llm_stream_open(session_handle: i64, request_json: *const c
 /// 注入的是假 URL/KEY，真联网只会得到一个看不懂的网络错误）。
 #[no_mangle]
 pub extern "C" fn qi_llm_stream_tape_get(request_json: *const c_char) -> *mut c_char {
-    let 回放 = 环境开(&["QI_LLM_REPLAY"]);
-    let 缓存 = 环境开(&["QI_LLM_CACHE"]);
-    let 录制 = 环境开(&["QI_LLM_RECORD"]);
-    let mut 出 = json!({
+    let replaying = 环境开(&["QI_LLM_REPLAY"]);
+    let caching = 环境开(&["QI_LLM_CACHE"]);
+    let recording = 环境开(&["QI_LLM_RECORD"]);
+    let mut out = json!({
         "命中": 0,
-        "回放": if 回放 { 1 } else { 0 },
-        "要录": if 录制 || 缓存 { 1 } else { 0 },
+        "回放": if replaying { 1 } else { 0 },
+        "要录": if recording || caching { 1 } else { 0 },
     });
     if request_json.is_null() {
-        return crate::stdlib::qi_str::rc_cstr_from_string(出.to_string());
+        return crate::stdlib::qi_str::rc_cstr_from_string(out.to_string());
     }
-    let 请求文本 = unsafe { CStr::from_ptr(request_json) }
+    let req_text = unsafe { CStr::from_ptr(request_json) }
         .to_string_lossy()
         .to_string();
-    let Ok(请求体) = serde_json::from_str::<Value>(&请求文本) else {
-        return crate::stdlib::qi_str::rc_cstr_from_string(出.to_string());
+    let Ok(req_body) = serde_json::from_str::<Value>(&req_text) else {
+        return crate::stdlib::qi_str::rc_cstr_from_string(out.to_string());
     };
-    let 键 = 流式磁带键(&请求体);
-    出["键"] = json!(键);
-    if 回放 || 缓存 {
-        if let Some(值) = 磁带::取(&键) {
-            let (块列表, _工具) = 解析流式磁带值(&值);
-            出["命中"] = json!(1);
-            出["块"] = json!(块列表);
+    let key = 流式磁带键(&req_body);
+    out["键"] = json!(key);
+    if replaying || caching {
+        if let Some(val) = 磁带::取(&key) {
+            let (chunks, _tools) = 解析流式磁带值(&val);
+            out["命中"] = json!(1);
+            out["块"] = json!(chunks);
         }
     }
-    crate::stdlib::qi_str::rc_cstr_from_string(出.to_string())
+    crate::stdlib::qi_str::rc_cstr_from_string(out.to_string())
 }
 
 /// 把一条读尽的纯文本流落盘。`chunks_json` 是内容块字符串数组。
@@ -3175,19 +3184,19 @@ pub extern "C" fn qi_llm_stream_tape_put(
     if request_json.is_null() || chunks_json.is_null() {
         return 0;
     }
-    let 请求文本 = unsafe { CStr::from_ptr(request_json) }
+    let req_text = unsafe { CStr::from_ptr(request_json) }
         .to_string_lossy()
         .to_string();
-    let 块文本 = unsafe { CStr::from_ptr(chunks_json) }
+    let chunks_text = unsafe { CStr::from_ptr(chunks_json) }
         .to_string_lossy()
         .to_string();
-    let (Ok(请求体), Ok(块列表)) = (
-        serde_json::from_str::<Value>(&请求文本),
-        serde_json::from_str::<Value>(&块文本),
+    let (Ok(req_body), Ok(chunks)) = (
+        serde_json::from_str::<Value>(&req_text),
+        serde_json::from_str::<Value>(&chunks_text),
     ) else {
         return 0;
     };
-    磁带::存(&流式磁带键(&请求体), &块列表);
+    磁带::存(&流式磁带键(&req_body), &chunks);
     1
 }
 
@@ -3211,18 +3220,18 @@ pub extern "C" fn qi_llm_merge_extra(
     if request_json.is_null() {
         return crate::stdlib::qi_str::rc_cstr_from_string(String::new());
     }
-    let 原文 = unsafe { CStr::from_ptr(request_json) }
+    let original = unsafe { CStr::from_ptr(request_json) }
         .to_string_lossy()
         .to_string();
-    let Ok(mut 请求体) = serde_json::from_str::<Value>(&原文) else {
-        return crate::stdlib::qi_str::rc_cstr_from_string(原文);
+    let Ok(mut req_body) = serde_json::from_str::<Value>(&original) else {
+        return crate::stdlib::qi_str::rc_cstr_from_string(original);
     };
-    let 会话池 = 获取会话池().lock().unwrap();
-    let Some(会话) = 会话池.get(&session_handle) else {
-        return crate::stdlib::qi_str::rc_cstr_from_string(原文);
+    let pool = 获取会话池().lock().unwrap();
+    let Some(session) = pool.get(&session_handle) else {
+        return crate::stdlib::qi_str::rc_cstr_from_string(original);
     };
-    会话.注入额外参数(&mut 请求体);
-    crate::stdlib::qi_str::rc_cstr_from_string(请求体.to_string())
+    session.注入额外参数(&mut req_body);
+    crate::stdlib::qi_str::rc_cstr_from_string(req_body.to_string())
 }
 
 /// 一次对话完成后落账：追加历史 + 记用量 + 预算累进。三件事必须在**同一把锁**
@@ -3245,7 +3254,7 @@ pub extern "C" fn qi_llm_commit(
     completion_tokens: i64,
     total_tokens: i64,
 ) -> i64 {
-    let 读 = |p: *const c_char| -> Option<Value> {
+    let parse_msg = |p: *const c_char| -> Option<Value> {
         if p.is_null() {
             return None;
         }
@@ -3255,28 +3264,28 @@ pub extern "C" fn qi_llm_commit(
         }
         serde_json::from_str(&s).ok()
     };
-    let 用户消息 = 读(user_msg_json);
-    let 助手消息 = 读(assistant_msg_json);
+    let user_msg = parse_msg(user_msg_json);
+    let assistant_msg = parse_msg(assistant_msg_json);
 
-    let mut 会话池 = 获取会话池().lock().unwrap();
-    let Some(会话) = 会话池.get_mut(&session_handle) else {
+    let mut pool = 获取会话池().lock().unwrap();
+    let Some(session) = pool.get_mut(&session_handle) else {
         return 0;
     };
-    let mut 动过历史 = false;
-    if let Some(m) = 用户消息 {
-        会话.历史.push(m);
-        动过历史 = true;
+    let mut touched = false;
+    if let Some(m) = user_msg {
+        session.历史.push(m);
+        touched = true;
     }
-    if let Some(m) = 助手消息 {
-        会话.历史.push(m);
-        动过历史 = true;
+    if let Some(m) = assistant_msg {
+        session.历史.push(m);
+        touched = true;
     }
-    if 动过历史 {
-        会话.历史版本 += 1;
+    if touched {
+        session.历史版本 += 1;
     }
     if total_tokens >= 0 {
-        会话.最近用量 = (prompt_tokens, completion_tokens, total_tokens);
-        会话.累计用量 += total_tokens;
+        session.最近用量 = (prompt_tokens, completion_tokens, total_tokens);
+        session.累计用量 += total_tokens;
     }
     1
 }
