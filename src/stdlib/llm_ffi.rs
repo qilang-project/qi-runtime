@@ -3167,6 +3167,11 @@ pub extern "C" fn qi_llm_stream_tape_get(request_json: *const c_char) -> *mut c_
             let (chunks, _tools) = 解析流式磁带值(&val);
             out["命中"] = json!(1);
             out["块"] = json!(chunks);
+            // 工具流的磁带值是 {"chunks":[…],"tool_calls":[…]}；tool_calls 原样
+            // 透给 qi（它就是 OpenAI 形状的调用对象），qi 侧拿去还原 assistant 消息。
+            if let Some(calls) = val.get("tool_calls") {
+                out["工具调用"] = calls.clone();
+            }
         }
     }
     crate::stdlib::qi_str::rc_cstr_from_string(out.to_string())
@@ -3176,10 +3181,15 @@ pub extern "C" fn qi_llm_stream_tape_get(request_json: *const c_char) -> *mut c_
 ///
 /// **只在流读尽时调**（qi 侧判定）—— 半途关流不录，否则磁带里存下的是个
 /// 截断的回答，之后每次回放都拿到半句话，而且完全看不出来是磁带的问题。
+///
+/// `tool_calls_json` 传空串表示纯文本流（磁带值就是块数组）；带工具的流传
+/// tool_calls 数组，磁带值变成 `{"chunks":[…],"tool_calls":[…]}` —— 回放时
+/// 要靠它还原完整 assistant 消息，否则续传对不上是哪个调用。
 #[no_mangle]
 pub extern "C" fn qi_llm_stream_tape_put(
     request_json: *const c_char,
     chunks_json: *const c_char,
+    tool_calls_json: *const c_char,
 ) -> i64 {
     if request_json.is_null() || chunks_json.is_null() {
         return 0;
@@ -3196,7 +3206,25 @@ pub extern "C" fn qi_llm_stream_tape_put(
     ) else {
         return 0;
     };
-    磁带::存(&流式磁带键(&req_body), &chunks);
+    let tools_text = if tool_calls_json.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(tool_calls_json) }
+            .to_string_lossy()
+            .to_string()
+    };
+    // 形状由「是不是工具流」决定，**不是**「有没有工具调用」：带工具但模型这轮
+    // 没调工具时，仍然存 `{"chunks":[…]}` 对象（只是没有 tool_calls 键）。
+    // 按「有没有调用」分的话，同一条流在两种实现下会存成不同形状，
+    // 磁带互放就对不上。qi 侧传空串表示纯文本流。
+    let val = match serde_json::from_str::<Value>(&tools_text) {
+        Ok(Value::Array(calls)) if !calls.is_empty() => {
+            json!({ "chunks": chunks, "tool_calls": Value::Array(calls) })
+        }
+        Ok(Value::Array(_)) => json!({ "chunks": chunks }),
+        _ => chunks,
+    };
+    磁带::存(&流式磁带键(&req_body), &val);
     1
 }
 
