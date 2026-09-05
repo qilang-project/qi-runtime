@@ -636,6 +636,7 @@ pub extern "C" fn qi_datetime_sleep_millis(millis: i64) {
 
 /// 异步睡眠（同步阻塞版）— 在 tokio task 里调走 block_in_place + block_on，
 /// 在普通线程里走 thread::sleep。仍 pin 一个 worker。
+#[cfg(not(target_family = "wasm"))]
 #[no_mangle]
 pub extern "C" fn qi_datetime_async_sleep_millis(millis: i64) {
     if millis <= 0 {
@@ -665,6 +666,7 @@ pub extern "C" fn qi_datetime_async_sleep_millis(millis: i64) {
 /// 注意：仍受语言限制 —— `等待` 在 sync wrapper 里 block 当前 worker。要 1000 个
 /// 这种 sleep 在 12 个线程上并发完成，需要 compiler async/await 把 `等待` 真正
 /// 编译成 .await（让 task 自己 yield）。这一步等下个 milestone。
+#[cfg(not(target_family = "wasm"))]
 #[no_mangle]
 pub extern "C" fn qi_datetime_async_sleep_future(
     millis: i64,
@@ -687,6 +689,27 @@ pub extern "C" fn qi_datetime_async_sleep_future(
     });
 
     f_ptr
+}
+// ── wasm 目标：没有 tokio，也没有第二根线程 ─────────────────────────────
+// 「异步睡眠」在 wasm 里就是同步睡（wasi poll_oneoff）；返回的 Future 一出生就
+// 已完成。语义上等价于「等待 立刻返回」，只是不并发 —— wasm 本来就单线程。
+#[cfg(target_family = "wasm")]
+#[no_mangle]
+pub extern "C" fn qi_datetime_async_sleep_millis(millis: i64) {
+    if millis > 0 {
+        thread::sleep(std::time::Duration::from_millis(millis as u64));
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[no_mangle]
+pub extern "C" fn qi_datetime_async_sleep_future(
+    millis: i64,
+) -> *mut crate::async_runtime::future::Future {
+    if millis > 0 {
+        thread::sleep(std::time::Duration::from_millis(millis as u64));
+    }
+    crate::async_runtime::future::qi_future_ready_i64(0)
 }
 
 /// 睡眠指定微秒数

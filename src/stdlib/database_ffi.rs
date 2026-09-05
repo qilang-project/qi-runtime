@@ -242,7 +242,7 @@ pub extern "C" fn qi_db_query_params(
 
 /// 关闭数据库连接；有活动事务时先回滚并令事务句柄失效。
 #[no_mangle]
-pub extern "C" fn qi_db_close(conn_id: i64) -> i32 {
+pub extern "C" fn qi_db_close(conn_id: i64) -> i64 {
     let 句柄 = CONNECTIONS.lock().unwrap().remove(&conn_id);
     let Some(句柄) = 句柄 else {
         return -1;
@@ -297,7 +297,7 @@ pub extern "C" fn qi_db_last_insert_id(conn_id: i64) -> i64 {
 
 /// 开始连接级事务（旧 API，保留兼容）。
 #[no_mangle]
-pub extern "C" fn qi_db_begin_transaction(conn_id: i64) -> i32 {
+pub extern "C" fn qi_db_begin_transaction(conn_id: i64) -> i64 {
     let Some(句柄) = connection(conn_id) else {
         return -1;
     };
@@ -309,7 +309,7 @@ pub extern "C" fn qi_db_begin_transaction(conn_id: i64) -> i32 {
 
 /// 提交连接级事务（旧 API，保留兼容）。
 #[no_mangle]
-pub extern "C" fn qi_db_commit(conn_id: i64) -> i32 {
+pub extern "C" fn qi_db_commit(conn_id: i64) -> i64 {
     let Some(句柄) = connection(conn_id) else {
         return -1;
     };
@@ -321,7 +321,7 @@ pub extern "C" fn qi_db_commit(conn_id: i64) -> i32 {
 
 /// 回滚连接级事务（旧 API，保留兼容）。
 #[no_mangle]
-pub extern "C" fn qi_db_rollback(conn_id: i64) -> i32 {
+pub extern "C" fn qi_db_rollback(conn_id: i64) -> i64 {
     let Some(句柄) = connection(conn_id) else {
         return -1;
     };
@@ -406,13 +406,13 @@ fn finish_transaction(tx_id: i64, 动作: 事务动作) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn qi_db_transaction_commit(tx_id: i64) -> i32 {
-    finish_transaction(tx_id, 事务动作::提交)
+pub extern "C" fn qi_db_transaction_commit(tx_id: i64) -> i64 {
+    finish_transaction(tx_id, 事务动作::提交) as i64
 }
 
 #[no_mangle]
-pub extern "C" fn qi_db_transaction_rollback(tx_id: i64) -> i32 {
-    finish_transaction(tx_id, 事务动作::回滚)
+pub extern "C" fn qi_db_transaction_rollback(tx_id: i64) -> i64 {
+    finish_transaction(tx_id, 事务动作::回滚) as i64
 }
 
 /// 释放字符串

@@ -215,10 +215,18 @@ pub extern "C" fn qi_os_homedir() -> *mut c_char {
 /// 返回: 临时目录路径（需要调用 qi_os_free_string 释放）
 #[no_mangle]
 pub extern "C" fn qi_os_tempdir() -> *mut c_char {
-    let temp = env::temp_dir();
-    let temp_str = temp.to_string_lossy().to_string();
-
-    rc_cstr_from_string(temp_str)
+    // wasi 上 std::env::temp_dir 直接 panic（"not supported by WASI yet"），
+    // 而 panic=abort 会把整个程序带走 —— 给个约定值
+    #[cfg(target_family = "wasm")]
+    {
+        rc_cstr_from_string("/tmp".to_string())
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let temp = env::temp_dir();
+        let temp_str = temp.to_string_lossy().to_string();
+        rc_cstr_from_string(temp_str)
+    }
 }
 
 /// 获取CPU核心数
@@ -234,7 +242,15 @@ pub extern "C" fn qi_os_cpu_count() -> i64 {
 /// 返回: 当前进程ID
 #[no_mangle]
 pub extern "C" fn qi_os_getpid() -> i64 {
-    std::process::id() as i64
+    // wasi 没有进程号，std::process::id 会 panic（"no pids on this platform"）
+    #[cfg(target_family = "wasm")]
+    {
+        0
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::process::id() as i64
+    }
 }
 
 /// 退出程序

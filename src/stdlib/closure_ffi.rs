@@ -84,7 +84,8 @@ pub extern "C" fn qi_closure_intern(fn_ptr: *const c_void) -> *mut c_void {
         (*h).refcount = AtomicI64::new(IMMORTAL_RC); // 不朽：永不释放、不计泄漏
         (*h).size = size as i64;
         let data = raw.add(HEADER_SIZE);
-        *(data as *mut *const c_void) = fn_ptr;
+        // 槽一律按 8 字节 i64 存取（wasm32 上指针 4 字节，按指针类型下标会踩错槽）
+        *(data as *mut i64) = fn_ptr as usize as i64;
         // 不调 diag_clo_alloc —— 不朽单例不算活跃对象（同 immortal 字面量）
         m.insert(key, data as usize);
         data as *mut c_void
@@ -109,7 +110,8 @@ pub extern "C" fn qi_closure_create(fn_ptr: *const c_void, num_caps: i64) -> *mu
         (*h).size = size as i64;
         let data = raw.add(HEADER_SIZE);
         // 写 fn_ptr 到 slot 0
-        *(data as *mut *const c_void) = fn_ptr;
+        // 槽一律按 8 字节 i64 存取（wasm32 上指针 4 字节，按指针类型下标会踩错槽）
+        *(data as *mut i64) = fn_ptr as usize as i64;
         super::rc_obj::diag_clo_alloc();
         data as *mut c_void
     }
@@ -121,7 +123,7 @@ pub extern "C" fn qi_closure_get_fn(env: *const c_void) -> *const c_void {
     if env.is_null() {
         return std::ptr::null();
     }
-    unsafe { *(env as *const *const c_void) }
+    unsafe { *(env as *const i64) as usize as *const c_void }
 }
 
 /// 写一个 i64 捕获槽
@@ -155,8 +157,8 @@ pub extern "C" fn qi_closure_set_ptr(env: *mut c_void, idx: i64, val: *const c_v
         return;
     }
     unsafe {
-        let base = (env as *mut *const c_void).add(1 + idx as usize);
-        *base = val;
+        let base = (env as *mut i64).add(1 + idx as usize);
+        *base = val as usize as i64;
     }
 }
 
@@ -166,8 +168,8 @@ pub extern "C" fn qi_closure_get_ptr(env: *const c_void, idx: i64) -> *const c_v
         return std::ptr::null();
     }
     unsafe {
-        let base = (env as *const *const c_void).add(1 + idx as usize);
-        *base
+        let base = (env as *const i64).add(1 + idx as usize);
+        *base as usize as *const c_void
     }
 }
 
@@ -186,8 +188,8 @@ pub extern "C" fn qi_closure_set_dtor(env: *mut c_void, dtor: *const c_void) {
         if slots < 2 {
             return;
         }
-        let base = (env as *mut *const c_void).add(slots - 1);
-        *base = dtor;
+        let base = (env as *mut i64).add(slots - 1);
+        *base = dtor as usize as i64;
     }
 }
 
@@ -218,7 +220,7 @@ pub(crate) unsafe fn clo_release_raw(data: *const u8) {
         let size = (*h).size as usize;
         let slots = size / SLOT_SIZE;
         if slots >= 2 {
-            let dtor = *(data as *const *const c_void).add(slots - 1);
+            let dtor = *(data as *const i64).add(slots - 1) as usize as *const c_void;
             if !dtor.is_null() {
                 let f: extern "C" fn(*const c_void) = std::mem::transmute(dtor);
                 f(data as *const c_void);

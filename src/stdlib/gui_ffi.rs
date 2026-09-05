@@ -620,7 +620,7 @@ pub extern "C" fn qi_gui_egui_scroll_end() {
 
 /// 折叠区开始(标题) → 1 展开 / 0 收起
 #[no_mangle]
-pub extern "C" fn qi_gui_egui_collapse_begin(title: *const c_char) -> i32 {
+pub extern "C" fn qi_gui_egui_collapse_begin(title: *const c_char) -> i64 {
     #[cfg(has_gui)]
     {
         unsafe { qi_gui_egui_collapse_begin_impl(title) }
@@ -643,7 +643,7 @@ pub extern "C" fn qi_gui_egui_collapse_end() {
 
 /// 单选按钮 → 1 被点击
 #[no_mangle]
-pub extern "C" fn qi_gui_egui_radio(text: *const c_char, selected: i32) -> i32 {
+pub extern "C" fn qi_gui_egui_radio(text: *const c_char, selected: i32) -> i64 {
     #[cfg(has_gui)]
     {
         unsafe { qi_gui_egui_radio_impl(text, selected) }
@@ -657,7 +657,7 @@ pub extern "C" fn qi_gui_egui_radio(text: *const c_char, selected: i32) -> i32 {
 
 /// 可选中列表项 → 1 被点击
 #[no_mangle]
-pub extern "C" fn qi_gui_egui_selectable(text: *const c_char, selected: i32) -> i32 {
+pub extern "C" fn qi_gui_egui_selectable(text: *const c_char, selected: i32) -> i64 {
     #[cfg(has_gui)]
     {
         unsafe { qi_gui_egui_selectable_impl(text, selected) }

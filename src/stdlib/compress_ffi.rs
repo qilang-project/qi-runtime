@@ -12,7 +12,7 @@ use std::os::raw::c_char;
 
 /// 压缩文件（gzip）
 #[no_mangle]
-pub extern "C" fn qi_compress_gzip_file(source: *const c_char, dest: *const c_char) -> i32 {
+pub extern "C" fn qi_compress_gzip_file(source: *const c_char, dest: *const c_char) -> i64 {
     if source.is_null() || dest.is_null() {
         return -1;
     }
@@ -52,7 +52,7 @@ pub extern "C" fn qi_compress_gzip_file(source: *const c_char, dest: *const c_ch
 
 /// 解压文件（gzip）
 #[no_mangle]
-pub extern "C" fn qi_compress_gunzip_file(source: *const c_char, dest: *const c_char) -> i32 {
+pub extern "C" fn qi_compress_gunzip_file(source: *const c_char, dest: *const c_char) -> i64 {
     if source.is_null() || dest.is_null() {
         return -1;
     }

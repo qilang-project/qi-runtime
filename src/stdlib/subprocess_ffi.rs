@@ -214,7 +214,7 @@ pub extern "C" fn qi_subprocess_read_line_timeout(handle: i64, timeout_ms: i64) 
 
 /// 是否仍存活。1=活，0=已退出/不存在。
 #[no_mangle]
-pub extern "C" fn qi_subprocess_is_alive(handle: i64) -> i32 {
+pub extern "C" fn qi_subprocess_is_alive(handle: i64) -> i64 {
     let cell = match get_child(handle) {
         Some(c) => c,
         None => return 0,
@@ -232,7 +232,7 @@ pub extern "C" fn qi_subprocess_is_alive(handle: i64) -> i32 {
 
 /// 结束子进程并从注册表移除。成功 1，失败 0。
 #[no_mangle]
-pub extern "C" fn qi_subprocess_terminate(handle: i64) -> i32 {
+pub extern "C" fn qi_subprocess_terminate(handle: i64) -> i64 {
     let cell = match registry().lock().unwrap().remove(&handle) {
         Some(c) => c,
         None => return 0,

@@ -109,7 +109,7 @@ pub extern "C" fn qi_sync_mutex_create() -> i64 {
 
 /// 阻塞直到获得锁。成功 1，失败 -1。
 #[no_mangle]
-pub extern "C" fn qi_sync_mutex_lock(handle: i64) -> i32 {
+pub extern "C" fn qi_sync_mutex_lock(handle: i64) -> i64 {
     // 先拿到 &'static Mutex<()>
     let m = {
         let reg = match mutex_registry().lock() {
@@ -140,7 +140,7 @@ pub extern "C" fn qi_sync_mutex_lock(handle: i64) -> i32 {
 
 /// 释放之前通过 qi_sync_mutex_lock 获得的锁。成功 1，失败 -1。
 #[no_mangle]
-pub extern "C" fn qi_sync_mutex_unlock(handle: i64) -> i32 {
+pub extern "C" fn qi_sync_mutex_unlock(handle: i64) -> i64 {
     match guard_registry().lock() {
         Ok(mut gr) => {
             if let Some(sg) = gr.remove(&handle) {
@@ -159,7 +159,7 @@ pub extern "C" fn qi_sync_mutex_unlock(handle: i64) -> i32 {
 
 /// 尝试加锁（非阻塞）。1=成功获得锁，0=锁被占用，-1=错误。
 #[no_mangle]
-pub extern "C" fn qi_sync_mutex_trylock(handle: i64) -> i32 {
+pub extern "C" fn qi_sync_mutex_trylock(handle: i64) -> i64 {
     let m = {
         let reg = match mutex_registry().lock() {
             Ok(g) => g,
@@ -186,7 +186,7 @@ pub extern "C" fn qi_sync_mutex_trylock(handle: i64) -> i32 {
 
 /// 销毁互斥锁（同时释放可能持有的 guard）。成功 1，失败 -1。
 #[no_mangle]
-pub extern "C" fn qi_sync_mutex_destroy(handle: i64) -> i32 {
+pub extern "C" fn qi_sync_mutex_destroy(handle: i64) -> i64 {
     // 先释放 guard（如果有）— SendableGuard::drop 会自动 unlock
     let _ = guard_registry().lock().map(|mut gr| gr.remove(&handle));
     // 从注册表移除（注意：Box::leak 的内存不回收——生命周期与进程同）
@@ -232,7 +232,7 @@ pub extern "C" fn qi_sync_atomic_load(handle: i64) -> i64 {
 
 /// 原子写入值。成功 1，失败 -1。
 #[no_mangle]
-pub extern "C" fn qi_sync_atomic_store(handle: i64, val: i64) -> i32 {
+pub extern "C" fn qi_sync_atomic_store(handle: i64, val: i64) -> i64 {
     match atomic_registry().lock() {
         Ok(reg) => match reg.get(&handle) {
             Some(a) => {
@@ -259,7 +259,7 @@ pub extern "C" fn qi_sync_atomic_add(handle: i64, delta: i64) -> i64 {
 
 /// 原子比较交换（CAS）。expected==当前值时写入 new，返回 1；否则返回 0；出错 -1。
 #[no_mangle]
-pub extern "C" fn qi_sync_atomic_cas(handle: i64, expected: i64, new: i64) -> i32 {
+pub extern "C" fn qi_sync_atomic_cas(handle: i64, expected: i64, new: i64) -> i64 {
     match atomic_registry().lock() {
         Ok(reg) => match reg.get(&handle) {
             Some(a) => {
@@ -276,7 +276,7 @@ pub extern "C" fn qi_sync_atomic_cas(handle: i64, expected: i64, new: i64) -> i3
 
 /// 销毁原子整数，释放 Arc。成功 1，失败 -1。
 #[no_mangle]
-pub extern "C" fn qi_sync_atomic_destroy(handle: i64) -> i32 {
+pub extern "C" fn qi_sync_atomic_destroy(handle: i64) -> i64 {
     match atomic_registry().lock() {
         Ok(mut reg) => {
             if reg.remove(&handle).is_some() {

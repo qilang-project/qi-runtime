@@ -1022,7 +1022,7 @@ pub extern "C" fn qi_mcpc_set_sampling_handler(
 pub extern "C" fn qi_mcpc_set_elicitation_handler(
     conn_id: i64,
     closure_ptr: *const std::ffi::c_void,
-) -> i32 {
+) -> i64 {
     if closure_ptr.is_null() {
         return -1;
     }
