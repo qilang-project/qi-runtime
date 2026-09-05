@@ -271,23 +271,87 @@ fn platform_cpu_ms() -> (i64, i64) {
 
 #[cfg(windows)]
 mod win {
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
-    use windows_sys::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetCurrentProcessId, GetProcessHandleCount, GetProcessTimes,
-    };
+    //! 全部 API 都取 **kernel32** 里的那一份，不引 windows-sys，也不引 psapi。
+    //!
+    //! 原因是 qi 生成的可执行文件不走 cargo 链接：qi/src/lib.rs 里硬编码了一张
+    //! Windows 系统库清单（kernel32/user32/advapi32/ntdll/userenv/ws2_32/shell32/ole32），
+    //! rlib 元数据里的 `#[link]` 指示不会被那条 clang 命令兑现。所以只要用了清单外
+    //! 的导入库（psapi 就是），**每个** qi 程序都会在链接期报 LNK1120 未解析符号 ——
+    //! 而 qi-runtime 自己 cargo build 是过的，本地一点看不出来。
+    //!
+    //! GetProcessMemoryInfo 在 psapi，但它从 Windows 7 起在 kernel32 里有一份同签名的
+    //! `K32GetProcessMemoryInfo`；其余几个本来就在 kernel32。
 
-    fn memory_counters() -> Option<PROCESS_MEMORY_COUNTERS> {
+    use std::os::raw::c_void;
+
+    type Handle = *mut c_void;
+    type Bool32 = i32;
+
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const INVALID_HANDLE: Handle = -1isize as Handle;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ThreadEntry32 {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_thread_id: u32,
+        th32_owner_process_id: u32,
+        tp_base_pri: i32,
+        tp_delta_pri: i32,
+        dw_flags: u32,
+    }
+
+    extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn GetCurrentProcessId() -> u32;
+        fn CloseHandle(h: Handle) -> Bool32;
+        fn K32GetProcessMemoryInfo(
+            process: Handle,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> Bool32;
+        fn GetProcessTimes(
+            process: Handle,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> Bool32;
+        fn GetProcessHandleCount(process: Handle, count: *mut u32) -> Bool32;
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
+        fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> Bool32;
+        fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> Bool32;
+    }
+
+    fn memory_counters() -> Option<ProcessMemoryCounters> {
         // SAFETY: POD 结构体，cb 填好后由系统按大小写入。
         unsafe {
-            let mut c: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
-            c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-            if GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+            let mut c: ProcessMemoryCounters = std::mem::zeroed();
+            c.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
                 Some(c)
             } else {
                 None
@@ -297,27 +361,27 @@ mod win {
 
     pub fn rss_bytes() -> i64 {
         memory_counters()
-            .map(|c| c.WorkingSetSize as i64)
+            .map(|c| c.working_set_size as i64)
             .unwrap_or(0)
     }
 
     pub fn peak_rss_bytes() -> i64 {
         memory_counters()
-            .map(|c| c.PeakWorkingSetSize as i64)
+            .map(|c| c.peak_working_set_size as i64)
             .unwrap_or(0)
     }
 
-    fn filetime_100ns(ft: FILETIME) -> i64 {
-        ((ft.dwHighDateTime as i64) << 32) | ft.dwLowDateTime as i64
+    fn filetime_100ns(ft: FileTime) -> i64 {
+        ((ft.high as i64) << 32) | ft.low as i64
     }
 
     /// (创建时刻 100ns, 内核时间 100ns, 用户时间 100ns)
     fn process_times() -> Option<(i64, i64, i64)> {
         unsafe {
-            let mut creation: FILETIME = std::mem::zeroed();
-            let mut exit: FILETIME = std::mem::zeroed();
-            let mut kernel: FILETIME = std::mem::zeroed();
-            let mut user: FILETIME = std::mem::zeroed();
+            let mut creation: FileTime = std::mem::zeroed();
+            let mut exit: FileTime = std::mem::zeroed();
+            let mut kernel: FileTime = std::mem::zeroed();
+            let mut user: FileTime = std::mem::zeroed();
             if GetProcessTimes(
                 GetCurrentProcess(),
                 &mut creation,
@@ -350,16 +414,16 @@ mod win {
     pub fn thread_count() -> i64 {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            if snap == INVALID_HANDLE_VALUE {
+            if snap == INVALID_HANDLE || snap.is_null() {
                 return 0;
             }
             let me = GetCurrentProcessId();
-            let mut entry: THREADENTRY32 = std::mem::zeroed();
-            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut entry: ThreadEntry32 = std::mem::zeroed();
+            entry.dw_size = std::mem::size_of::<ThreadEntry32>() as u32;
             let mut n: i64 = 0;
             if Thread32First(snap, &mut entry) != 0 {
                 loop {
-                    if entry.th32OwnerProcessID == me {
+                    if entry.th32_owner_process_id == me {
                         n += 1;
                     }
                     if Thread32Next(snap, &mut entry) == 0 {
