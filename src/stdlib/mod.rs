@@ -37,6 +37,7 @@ pub mod os_ffi;
 pub mod path_ffi;
 pub mod plugin_ffi;
 pub mod process_ffi;
+pub mod process_stats_ffi;
 pub mod profiler;
 #[cfg(feature = "grpc")]
 pub mod protobuf_ffi;
@@ -68,7 +69,7 @@ pub use debug::{DebugInfo, DebugModule};
 pub use llm::{大模型模块, 嵌入器, 提示模板, 知识库};
 pub use math::{MathModule, MathOperation};
 pub use mcp::{
-    工具参数, 工具回调函数, 资源内容, 资源类型, MCP工具, MCP提示, MCP服务器, MCP服务器模块, MCP资源,
+    MCP工具, MCP提示, MCP服务器, MCP服务器模块, MCP资源, 工具参数, 工具回调函数, 资源内容, 资源类型,
 };
 pub use string::{StringModule, StringOperation};
 pub use system::{SystemInfo, SystemModule};

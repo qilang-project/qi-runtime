@@ -104,6 +104,10 @@ static READY: Mutex<VecDeque<Cptr>> = Mutex::new(VecDeque::new());
 static CV: Condvar = Condvar::new();
 /// 活跃协程数（spawn++ / 完成或取消--）。到 0 → 全部完成。
 static LIVE: AtomicI64 = AtomicI64::new(0);
+/// 活跃协程数快照（给 进程统计 用；未启用 QI_CORO 时恒为 0）。
+pub fn live_coroutine_count() -> i64 {
+    LIVE.load(Ordering::Acquire).max(0)
+}
 /// 正在被某 worker resume 的协程数（就绪队列取出即 ++，跑完 --）。
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
 /// 可调度协程总数镜像（全局 READY + 所有 worker 本地队列，不含 NEXT 单槽）。无锁快照：

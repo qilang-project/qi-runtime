@@ -282,6 +282,7 @@ pub extern "C" fn qi_runtime_spawn_goroutine(function_ptr: *const c_void) {
     // 这样 sync 的 goroutine body 不会 pin 主 worker pool；同时 blocking pool
     // 自己能伸缩到 max_blocking_threads。
     全局异步运行时().spawn_blocking(move || {
+        let _live = LiveGoroutineTicket::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _g = crate::stdlib::exception_ffi::GoroutineGuard::new();
             let func = std::mem::transmute::<usize, fn()>(func_addr);
@@ -326,6 +327,7 @@ pub extern "C" fn qi_runtime_spawn_goroutine_with_args(
     };
 
     全局异步运行时().spawn_blocking(move || {
+        let _live = LiveGoroutineTicket::new();
         let copied = copied;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _g = crate::stdlib::exception_ffi::GoroutineGuard::new();
@@ -364,6 +366,30 @@ static GOROUTINE_HANDLES: OnceLock<Mutex<HashMap<i64, std::sync::Arc<GoroutineHa
     OnceLock::new();
 static NEXT_GOROUTINE_HANDLE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
 
+/// `启动` 出去、还没跑完的协程数（三条 spawn 路径共用）。给 进程统计 用。
+static LIVE_GOROUTINES: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// 进入协程体时 +1，离开（正常或 panic）时 -1 —— 放在 Drop 里，panic 也不会漏减。
+struct LiveGoroutineTicket;
+impl LiveGoroutineTicket {
+    fn new() -> Self {
+        LIVE_GOROUTINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+impl Drop for LiveGoroutineTicket {
+    fn drop(&mut self) {
+        LIVE_GOROUTINES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 当前存活的 `启动` 协程数快照
+pub fn live_goroutine_count() -> i64 {
+    LIVE_GOROUTINES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(0)
+}
+
 fn goroutine_handles() -> &'static Mutex<HashMap<i64, std::sync::Arc<GoroutineHandleState>>> {
     GOROUTINE_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -393,6 +419,7 @@ pub extern "C" fn qi_runtime_spawn_goroutine_handle(closure_obj: *const c_void) 
 
     let obj_addr = closure_obj as usize;
     全局异步运行时().spawn_blocking(move || {
+        let _live = LiveGoroutineTicket::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let _g = crate::stdlib::exception_ffi::GoroutineGuard::new();
             let obj = obj_addr as *const c_void;

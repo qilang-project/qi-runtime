@@ -24,6 +24,14 @@ fn init_json_storage() {
     }
 }
 
+/// 句柄池里还活着的 JSON 值个数（给 进程统计 用：涨不停 = 有人忘了 删除）
+pub fn live_handle_count() -> i64 {
+    JSON_VALUES
+        .lock()
+        .map(|s| s.as_ref().map(|m| m.len() as i64).unwrap_or(0))
+        .unwrap_or(0)
+}
+
 /// 获取下一个JSON ID（原子，真并发安全）
 fn next_json_id() -> u64 {
     NEXT_JSON_ID.fetch_add(1, Ordering::Relaxed)

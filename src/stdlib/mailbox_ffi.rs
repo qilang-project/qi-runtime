@@ -39,6 +39,11 @@ fn 取池() -> &'static Mutex<HashMap<i64, Arc<邮箱>>> {
     邮箱池.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 池里存活的邮箱数（给 进程统计 用）
+pub fn live_mailbox_count() -> i64 {
+    取池().lock().map(|m| m.len() as i64).unwrap_or(0)
+}
+
 fn 取邮箱(句柄: i64) -> Option<Arc<邮箱>> {
     取池()
         .lock()
