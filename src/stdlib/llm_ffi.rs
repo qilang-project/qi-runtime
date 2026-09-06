@@ -79,6 +79,15 @@ struct LLM会话 {
     /// 会话预算：token 上限（0 = 不限）与累计已用 total。超限后再调用直接拒绝（不打 API）。
     预算上限: i64,
     累计用量: i64,
+    /// 最近一次请求的**提示缓存** token：(缓存读, 缓存写)。由 qi 侧从响应体里
+    /// 按 provider 提取后经 qi_llm_record_cache 送进来；未知/未请求为 0。
+    /// 新字段用英文名（既有中文字段是历史风格，不顺手改）。
+    last_cache: (i64, i64),
+    /// 会话累计缓存读 / 缓存写 token。**跟 累计用量 分开计**：
+    /// 累计用量 的语义（= 各家 usage 的 total 之和）保持原样不动，
+    /// 缓存量另立两个计数器，谁要算真实输入量自己加，见 qi_llm_record_cache 的注释。
+    cache_read_total: i64,
+    cache_write_total: i64,
     /// 提供商："openai"（默认，OpenAI-compatible chat completions）/"anthropic"/"gemini"。
     /// 经 设置配置(会话,"provider",..) 切换。历史始终以 OpenAI 消息格式为内部规范表示，
     /// 请求时按提供商翻译形状，响应再归一化回 OpenAI assistant 消息。
@@ -100,6 +109,9 @@ impl LLM会话 {
             最近用量: (0, 0, 0),
             预算上限: 0,
             累计用量: 0,
+            last_cache: (0, 0),
+            cache_read_total: 0,
+            cache_write_total: 0,
             提供商: "openai".to_string(),
         }
     }
@@ -3023,6 +3035,9 @@ pub extern "C" fn qi_llm_session_view(session_handle: i64) -> *mut c_char {
         "历史": session.历史,
         "预算上限": session.预算上限,
         "累计用量": session.累计用量,
+        // 提示缓存计数（累计）。跟 累计用量 并列而不是并进去 —— 见 qi_llm_record_cache。
+        "累计缓存读": session.cache_read_total,
+        "累计缓存写": session.cache_write_total,
         "有密钥": session.密钥.is_some(),
         // 工具定义已经是**注册时就成形好**的 OpenAI 形状（含 provider-safe 名），
         // qi 侧按 provider 再翻译。名称映射是 安全名 → Qi 原名，取工具调用名字要用。
@@ -3316,6 +3331,93 @@ pub extern "C" fn qi_llm_commit(
         session.累计用量 += total_tokens;
     }
     1
+}
+
+/// 记一次**提示缓存**用量：cache read / cache write 两个 token 数。
+///
+/// ## 为什么是单独一个 FFI，而不是给 qi_llm_commit 加两个参数
+///
+/// 1. `qi_llm_commit` 的签名是 **ABI**。已经编译出去的 .qi（qi-harness、AIOne
+///    那批课件产物）按六参调它，加参数就是让它们全部当场崩。
+/// 2. 缓存计数跟「写历史」正交。落账 有三个档位（写历史+记账 / 只记账 /
+///    只写历史，靠 total<0 区分），缓存量在这三种里都可能有也可能没有；
+///    塞进同一个调用只会让那张真值表再翻一倍。
+/// 3. 它不参与 历史版本 的 CAS —— 落账 之所以必须三件事一把锁，是因为流式
+///    提交拿 历史版本 做 compare-and-swap；缓存计数没有这个约束，
+///    单独一把锁不会制造新的交错状态。
+///
+/// 负数一律当没写（跟 落账 的 total<0 同一个约定）。会话不存在返回 0。
+#[no_mangle]
+pub extern "C" fn qi_llm_record_cache(
+    session_handle: i64,
+    cache_read: i64,
+    cache_write: i64,
+) -> i64 {
+    if cache_read < 0 || cache_write < 0 {
+        return 0;
+    }
+    let mut pool = 获取会话池().lock().unwrap();
+    let Some(session) = pool.get_mut(&session_handle) else {
+        return 0;
+    };
+    session.last_cache = (cache_read, cache_write);
+    session.cache_read_total += cache_read;
+    session.cache_write_total += cache_write;
+    // 预算口径**故意不动**：累计用量 仍然只累加各家 usage 的 total。
+    // Anthropic 的 input_tokens 不含 cache_read（DeepSeek 的 prompt_tokens 含），
+    // 所以「真实输入量」在 Anthropic 上确实是 p + cache_read。但改 累计用量
+    // 会静默改掉所有已有会话的预算行为，那是另一个决定，留给调用方自己加。
+    1
+}
+
+/// 提示缓存用量，JSON 串
+/// `{"read":..,"write":..,"read_total":..,"write_total":..}`。
+/// read/write 是**最近一次**请求的，_total 是会话累计。会话不存在 → 全 0。
+#[no_mangle]
+pub extern "C" fn qi_llm_cache_usage(session_handle: i64) -> *mut c_char {
+    let pool = 获取会话池().lock().unwrap();
+    let (r, w, rt, wt) = pool
+        .get(&session_handle)
+        .map(|s| {
+            (
+                s.last_cache.0,
+                s.last_cache.1,
+                s.cache_read_total,
+                s.cache_write_total,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0));
+    let text = json!({"read": r, "write": w, "read_total": rt, "write_total": wt}).to_string();
+    crate::stdlib::qi_str::rc_cstr_from_string(text)
+}
+
+/// 最近一次请求的提示缓存命中率，**百分比整数**（0-100，向下取整）。
+///
+/// 分母取「这次请求实际读进去的提示 token 总量」。各家 usage 的口径不同：
+/// - Anthropic：`input_tokens` **不含** cache_read / cache_creation，所以
+///   分母 = prompt + read + write。
+/// - DeepSeek / OpenAI：`prompt_tokens` **已含** 命中部分，分母 = prompt。
+///
+/// 两种口径靠一条判据分开：prompt < read 只可能出现在「不含」那一家。
+/// 猜错的代价只是这个观测数字偏一点，不影响记账 —— 记账走 累计用量。
+/// 分母为 0（没请求过 / 会话不存在）返回 0。
+#[no_mangle]
+pub extern "C" fn qi_llm_cache_hit_rate(session_handle: i64) -> i64 {
+    let pool = 获取会话池().lock().unwrap();
+    let Some(session) = pool.get(&session_handle) else {
+        return 0;
+    };
+    let prompt = session.最近用量.0;
+    let (read, write) = session.last_cache;
+    let total = if prompt < read {
+        prompt + read + write
+    } else {
+        prompt.max(read + write)
+    };
+    if total <= 0 {
+        return 0;
+    }
+    read * 100 / total
 }
 
 // ───────────────── LLM 磁带（录制 / 回放 / 缓存） ─────────────────
@@ -4325,5 +4427,92 @@ mod tests {
             消息["tool_calls"][0]["function"]["arguments"],
             json!("{\"city\":\"东京\"}")
         );
+    }
+
+    // ── 提示缓存计数 ──
+
+    /// 建一个真在池子里的会话，返回句柄。缓存这几个 FFI 都要走会话池。
+    fn pooled_session() -> i64 {
+        let mut counter = 获取会话计数器().lock().unwrap();
+        *counter += 1;
+        let handle = *counter;
+        drop(counter);
+        获取会话池().lock().unwrap().insert(
+            handle,
+            LLM会话::创建("https://example.com".into(), "m".into(), None),
+        );
+        handle
+    }
+
+    #[test]
+    fn record_cache_accumulates_and_leaves_budget_alone() {
+        let h = pooled_session();
+        // 预算口径必须纹丝不动：累计用量 只由 落账 推进
+        assert_eq!(
+            qi_llm_commit(h, std::ptr::null(), std::ptr::null(), 6, 4, 10),
+            1
+        );
+        assert_eq!(qi_llm_record_cache(h, 120, 30), 1);
+        assert_eq!(qi_llm_record_cache(h, 200, 0), 1);
+        assert_eq!(qi_llm_budget_used(h), 10, "缓存量不许混进预算");
+
+        let pool = 获取会话池().lock().unwrap();
+        let s = pool.get(&h).unwrap();
+        assert_eq!(s.last_cache, (200, 0), "last_cache 是最近一次，不是累计");
+        assert_eq!(s.cache_read_total, 320);
+        assert_eq!(s.cache_write_total, 30);
+    }
+
+    #[test]
+    fn record_cache_ignores_negatives_and_bad_handles() {
+        let h = pooled_session();
+        assert_eq!(qi_llm_record_cache(h, -1, 5), 0);
+        assert_eq!(qi_llm_record_cache(999_999_999, 1, 1), 0);
+        let pool = 获取会话池().lock().unwrap();
+        assert_eq!(pool.get(&h).unwrap().cache_read_total, 0);
+    }
+
+    #[test]
+    fn cache_hit_rate_handles_both_provider_conventions() {
+        // Anthropic：input_tokens 不含缓存 → 分母 = p + read + write
+        let a = pooled_session();
+        qi_llm_commit(a, std::ptr::null(), std::ptr::null(), 6, 4, 10);
+        qi_llm_record_cache(a, 120, 30);
+        assert_eq!(qi_llm_cache_hit_rate(a), 120 * 100 / 156);
+
+        // DeepSeek/OpenAI：prompt_tokens 已含命中 → 分母 = p
+        let d = pooled_session();
+        qi_llm_commit(d, std::ptr::null(), std::ptr::null(), 100, 7, 107);
+        qi_llm_record_cache(d, 64, 0);
+        assert_eq!(qi_llm_cache_hit_rate(d), 64);
+
+        // 没请求过 / 坏句柄 → 0，不除零
+        let e = pooled_session();
+        assert_eq!(qi_llm_cache_hit_rate(e), 0);
+        assert_eq!(qi_llm_cache_hit_rate(-7), 0);
+    }
+
+    #[test]
+    fn session_view_and_cache_usage_expose_the_counters() {
+        let h = pooled_session();
+        qi_llm_record_cache(h, 11, 22);
+
+        let usage = unsafe { CStr::from_ptr(qi_llm_cache_usage(h)) }
+            .to_string_lossy()
+            .to_string();
+        let v: Value = serde_json::from_str(&usage).unwrap();
+        assert_eq!(v["read"], 11);
+        assert_eq!(v["write"], 22);
+        assert_eq!(v["read_total"], 11);
+        assert_eq!(v["write_total"], 22);
+
+        let view = unsafe { CStr::from_ptr(qi_llm_session_view(h)) }
+            .to_string_lossy()
+            .to_string();
+        let v: Value = serde_json::from_str(&view).unwrap();
+        assert_eq!(v["累计缓存读"], 11);
+        assert_eq!(v["累计缓存写"], 22);
+        // 累计用量 的语义没被动过
+        assert_eq!(v["累计用量"], 0);
     }
 }
