@@ -264,16 +264,24 @@ pub extern "C" fn qi_os_exit(code: i32) {
 
 /// 获取所有环境变量
 ///
-/// 返回: 环境变量列表，格式为 "KEY1=VALUE1\nKEY2=VALUE2\n..."（需要调用 qi_os_free_string 释放）
+/// 返回：字符串列表句柄，每个元素一条 `KEY=VALUE`。归调用方释放
+/// （`列表::删除列表`）。
+///
+/// 2.0 之前返回的是 `"K1=V1\nK2=V2\n"` 这样一整个大字符串，调用方自己按
+/// `\n` 切。值里带换行的环境变量（合法，比如多行的 PEM）会把这个格式撕开，
+/// 而且「没有任何环境变量」和「取不到」都是空串，分不出来。
 #[no_mangle]
-pub extern "C" fn qi_os_environ() -> *mut c_char {
-    let mut result = String::new();
-
+pub extern "C" fn qi_os_environ() -> i64 {
+    let 表 = crate::stdlib::list::qi_list_string_create();
     for (key, value) in env::vars() {
-        result.push_str(&format!("{}={}\n", key, value));
+        let 条目 = match std::ffi::CString::new(format!("{}={}", key, value)) {
+            Ok(c) => c,
+            // 环境变量里带 NUL 是不可能的，真遇到就跳过而不是丢掉整张表
+            Err(_) => continue,
+        };
+        crate::stdlib::list::qi_list_string_push(表, 条目.as_ptr());
     }
-
-    rc_cstr_from_string(result)
+    表
 }
 
 /// 从 .env 文件加载环境变量
@@ -337,38 +345,38 @@ pub extern "C" fn qi_os_load_env(path: *const c_char) -> i64 {
 /// 参数:
 /// - path: 目录路径
 ///
-/// 返回: 目录内容，每行一个文件/目录名（需要调用 qi_os_free_string 释放）
-///        如果失败返回空字符串
+/// 返回：字符串列表句柄，每个元素一个文件 / 目录名（不含路径）。
+///       目录打不开返回 **-1**，空目录返回一个**空表**（>0）—— 这两件事以前
+///       都是空字符串，分不出来。归调用方释放（`列表::删除列表`）。
+///
+/// 2.0 之前返回 `"a\nb\nc\n"` 一整个大字符串让调用方自己切。Unix 文件名里
+/// 换行是合法的，一个带换行的文件名就能把那个格式撕开，凭空多出几个"文件"。
 #[no_mangle]
-pub extern "C" fn qi_os_list_dir(path: *const c_char) -> *mut c_char {
+pub extern "C" fn qi_os_list_dir(path: *const c_char) -> i64 {
     if path.is_null() {
-        return rc_cstr_from_str("");
+        return -1;
     }
 
     unsafe {
         let path_str = match CStr::from_ptr(path).to_str() {
             Ok(s) => s,
-            Err(_) => return rc_cstr_from_str(""),
+            Err(_) => return -1,
         };
 
-        let dir_path = std::path::Path::new(path_str);
-
-        let entries = match std::fs::read_dir(dir_path) {
+        let entries = match std::fs::read_dir(std::path::Path::new(path_str)) {
             Ok(entries) => entries,
-            Err(_) => return rc_cstr_from_str(""),
+            Err(_) => return -1,
         };
 
-        let mut result = String::new();
-        for entry in entries {
-            if let Ok(entry) = entry {
-                if let Some(name) = entry.file_name().to_str() {
-                    result.push_str(name);
-                    result.push('\n');
+        let 表 = crate::stdlib::list::qi_list_string_create();
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Ok(c) = std::ffi::CString::new(name) {
+                    crate::stdlib::list::qi_list_string_push(表, c.as_ptr());
                 }
             }
         }
-
-        rc_cstr_from_string(result)
+        表
     }
 }
 
