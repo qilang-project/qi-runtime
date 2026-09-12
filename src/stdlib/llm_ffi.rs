@@ -735,7 +735,7 @@ impl LLM会话 {
         let 录制 = 环境开(&["QI_LLM_RECORD"]);
 
         if 回放 || 缓存 {
-            if let Some(v) = 磁带::取(&键) {
+            if let Some(v) = 磁带::取兼容(&请求体, "") {
                 return Ok(v);
             }
             if 回放 {
@@ -918,7 +918,7 @@ impl LLM会话 {
         let 录制 = 环境开(&["QI_LLM_RECORD"]);
 
         if 回放 || 缓存 {
-            if let Some(v) = 磁带::取(&键) {
+            if let Some(v) = 磁带::取兼容(&请求体, "") {
                 return Ok(v);
             }
             if 回放 {
@@ -1703,7 +1703,7 @@ fn 打开流带磁带(
     let 录制 = 环境开(&["QI_LLM_RECORD"]);
 
     if 回放 || 缓存 {
-        if let Some(值) = 磁带::取(&键) {
+        if let Some(值) = 磁带::取兼容(&请求体, "stream:") {
             let (块列表, 工具调用) = 解析流式磁带值(&值);
             return Ok(LLM流::创建回放(
                 会话句柄,
@@ -3178,7 +3178,7 @@ pub extern "C" fn qi_llm_stream_tape_get(request_json: *const c_char) -> *mut c_
     let key = 流式磁带键(&req_body);
     out["键"] = json!(key);
     if replaying || caching {
-        if let Some(val) = 磁带::取(&key) {
+        if let Some(val) = 磁带::取兼容(&req_body, "stream:") {
             let (chunks, _tools) = 解析流式磁带值(&val);
             out["命中"] = json!(1);
             out["块"] = json!(chunks);
@@ -3462,18 +3462,65 @@ mod 磁带 {
         })
     }
 
-    /// 规范化请求体 → 稳定键。序列化后哈希（serde_json 默认 Map 有序，故稳定）；
-    /// 剔除 stream 字段（键只由内容决定）。流式录制/回放在此键上再加 "stream:"
-    /// 前缀（见 流式磁带键），与非流式键空间隔离——两者的值形状不同。
+    /// 递归按键名排序，让「同样的内容」只有一种序列化文本。
+    ///
+    /// 数组**不排序** —— JSON 数组里顺序有语义（messages 就是对话顺序）。
+    fn 排序键(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let mut 项: Vec<(&String, &Value)> = m.iter().collect();
+                项.sort_by(|a, b| a.0.cmp(b.0));
+                let mut 出 = serde_json::Map::new();
+                for (k, val) in 项 {
+                    出.insert(k.clone(), 排序键(val));
+                }
+                Value::Object(出)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(排序键).collect()),
+            其他 => 其他.clone(),
+        }
+    }
+
+    /// 请求体 → 稳定键。**递归排序键名之后**再序列化哈希；剔除 stream 字段
+    /// （键只由内容决定）。流式录制/回放在此键上再加 "stream:" 前缀
+    /// （见 流式磁带键），与非流式键空间隔离——两者的值形状不同。
+    ///
+    /// 为什么要排序：qi-runtime 的 serde_json 开着 **preserve_order**，Map 是
+    /// IndexMap，键序 = 插入序。于是「构造请求体时字段的插入顺序」直接进了
+    /// 哈希 —— 内容一模一样的请求，只要哪天代码里换了两行字段的先后，磁带
+    /// 就整体 miss。这个雷埋在 llm_ffi 每一次改请求形状的路上。
     pub fn 请求键(请求体: &Value) -> String {
         let mut v = 请求体.clone();
         if let Value::Object(ref mut m) = v {
             m.remove("stream");
         }
-        let s = serde_json::to_string(&v).unwrap_or_default();
+        哈希(&serde_json::to_string(&排序键(&v)).unwrap_or_default())
+    }
+
+    /// 2.0 之前的键：不排序，直接按插入序序列化。
+    ///
+    /// **只用于读**。已经录好的磁带全是这个键 —— AIOne 线上判分就在断网只读
+    /// 挂载 课堂磁带.json 回放（105 条），换键等于当场判分全挂。所以读的时候
+    /// 先查新键、再回退旧键，写只写新键：老磁带照常命中，新录的从此与字段
+    /// 顺序无关。等老磁带重录完，这个函数和回退分支一起删。
+    pub fn 旧请求键(请求体: &Value) -> String {
+        let mut v = 请求体.clone();
+        if let Value::Object(ref mut m) = v {
+            m.remove("stream");
+        }
+        哈希(&serde_json::to_string(&v).unwrap_or_default())
+    }
+
+    fn 哈希(s: &str) -> String {
         let mut h = DefaultHasher::new();
         s.hash(&mut h);
         format!("{:016x}", h.finish())
+    }
+
+    /// 按请求体取磁带：先新键，miss 再回退旧键。`前缀` 给流式用（"stream:"）。
+    pub fn 取兼容(请求体: &Value, 前缀: &str) -> Option<Value> {
+        取(&format!("{}{}", 前缀, 请求键(请求体)))
+            .or_else(|| 取(&format!("{}{}", 前缀, 旧请求键(请求体))))
     }
 
     pub fn 取(键: &str) -> Option<Value> {
@@ -3487,6 +3534,75 @@ mod 磁带 {
         if let Ok(s) = serde_json::to_string_pretty(&*m) {
             let _ = std::fs::write(路径(), s);
         }
+    }
+}
+
+#[cfg(test)]
+mod 磁带键测试 {
+    use super::磁带;
+    use serde_json::json;
+
+    /// 内容相同、字段插入顺序不同 —— 新键必须一样。
+    ///
+    /// 这正是旧键做不到的事：qi-runtime 开着 serde_json 的 preserve_order，
+    /// Map 是 IndexMap，插入序直接进哈希。改一行字段先后就让整盘磁带 miss。
+    #[test]
+    fn 字段顺序不影响新键() {
+        let mut 甲 = serde_json::Map::new();
+        甲.insert("model".into(), json!("m"));
+        甲.insert("messages".into(), json!([{"role":"user","content":"hi"}]));
+        甲.insert("temperature".into(), json!(0.5));
+
+        let mut 乙 = serde_json::Map::new();
+        乙.insert("temperature".into(), json!(0.5));
+        乙.insert("messages".into(), json!([{"role":"user","content":"hi"}]));
+        乙.insert("model".into(), json!("m"));
+
+        let 甲 = serde_json::Value::Object(甲);
+        let 乙 = serde_json::Value::Object(乙);
+        assert_eq!(磁带::请求键(&甲), 磁带::请求键(&乙), "新键该与字段顺序无关");
+        assert_ne!(
+            磁带::旧请求键(&甲),
+            磁带::旧请求键(&乙),
+            "旧键本来就受插入序影响；这条断言坏了说明 preserve_order 被关了，\
+             那回退分支就没必要留了"
+        );
+    }
+
+    /// 嵌套对象里的键序同样不能影响结果。
+    #[test]
+    fn 嵌套对象也排序() {
+        let 甲 = json!({"a": {"x": 1, "y": 2}, "b": [{"p": 1, "q": 2}]});
+        let mut 内 = serde_json::Map::new();
+        内.insert("y".into(), json!(2));
+        内.insert("x".into(), json!(1));
+        let mut 元 = serde_json::Map::new();
+        元.insert("q".into(), json!(2));
+        元.insert("p".into(), json!(1));
+        let mut 乙 = serde_json::Map::new();
+        乙.insert("b".into(), serde_json::Value::Array(vec![serde_json::Value::Object(元)]));
+        乙.insert("a".into(), serde_json::Value::Object(内));
+        assert_eq!(
+            磁带::请求键(&甲),
+            磁带::请求键(&serde_json::Value::Object(乙))
+        );
+    }
+
+    /// **数组顺序必须仍然影响键** —— messages 是对话顺序，调换了就是另一个请求。
+    #[test]
+    fn 数组顺序仍然算数() {
+        let 甲 = json!({"messages": [{"role":"user","content":"1"}, {"role":"user","content":"2"}]});
+        let 乙 = json!({"messages": [{"role":"user","content":"2"}, {"role":"user","content":"1"}]});
+        assert_ne!(磁带::请求键(&甲), 磁带::请求键(&乙));
+    }
+
+    /// stream 字段照旧不进键。
+    #[test]
+    fn stream字段不进键() {
+        let 甲 = json!({"model": "m", "stream": true});
+        let 乙 = json!({"model": "m"});
+        assert_eq!(磁带::请求键(&甲), 磁带::请求键(&乙));
+        assert_eq!(磁带::旧请求键(&甲), 磁带::旧请求键(&乙));
     }
 }
 
