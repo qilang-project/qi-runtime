@@ -191,22 +191,29 @@ pub extern "C" fn qi_http_head(url: *const c_char) -> *mut c_char {
         return std::ptr::null_mut();
     }
 
+    // 真发 HEAD。原来走 HttpClient::execute —— 那是 simulate_http_request，
+    // 永远 200，跟 获取状态码 同一个坑（见下）。
     unsafe {
         let 地址 = CStr::from_ptr(url).to_string_lossy().to_string();
-
-        let mut 请求 = HttpRequest::get(地址);
-        请求.method = HttpMethod::Head;
-
-        let 客户端 = 获取HTTP客户端().lock().unwrap();
-        match 客户端.execute(请求) {
-            Ok(响应) => {
-                // HEAD 请求返回状态码和响应头信息
-                let 状态信息 = format!("Status: {}", 响应.status_code);
-                crate::stdlib::qi_str::rc_cstr_from_string(状态信息)
+        match 真状态码(reqwest::Method::HEAD, &地址) {
+            Ok(码) => crate::stdlib::qi_str::rc_cstr_from_string(format!("Status: {}", 码)),
+            Err(错误) => {
+                crate::stdlib::qi_str::rc_cstr_from_string(format!("HTTP错误: {}", 错误))
             }
-            Err(_) => std::ptr::null_mut(),
         }
     }
+}
+
+/// 真发一次请求，只要状态码。GET/POST 那几条 2026-05 就换成 reqwest 了，
+/// 获取状态码 / 请求头 两条一直留在旧的模拟客户端上没人发现 —— 直到
+/// tests/wasm/http断言.sh 拿原生和 wasm 对拍：服务器回 201，原生打出 200。
+fn 真状态码(方法: reqwest::Method, 地址: &str) -> Result<u16, String> {
+    let 客户端 = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let 响应 = 客户端.request(方法, 地址).send().map_err(|e| e.to_string())?;
+    Ok(响应.status().as_u16())
 }
 
 /// HTTP PATCH 请求
@@ -472,22 +479,17 @@ pub extern "C" fn qi_http_request_execute(handle: i64) -> *mut c_char {
     }
 }
 
-/// 获取 HTTP 状态码（简化版，返回 200 表示成功）
+/// 获取 HTTP 状态码：真发一次 GET，返回状态码；发不出去返回 -1。
+/// （曾经是「简化版，返回 200 表示成功」—— 也就是不管服务器回什么都 200。）
 #[no_mangle]
 pub extern "C" fn qi_http_get_status(url: *const c_char) -> i64 {
     if url.is_null() {
         return -1;
     }
-
-    unsafe {
-        let 地址 = CStr::from_ptr(url).to_string_lossy().to_string();
-        let 请求 = HttpRequest::get(地址);
-
-        let 客户端 = 获取HTTP客户端().lock().unwrap();
-        match 客户端.execute(请求) {
-            Ok(响应) => 响应.status_code as i64,
-            Err(_) => -1,
-        }
+    let 地址 = unsafe { CStr::from_ptr(url).to_string_lossy().to_string() };
+    match 真状态码(reqwest::Method::GET, &地址) {
+        Ok(码) => 码 as i64,
+        Err(_) => -1,
     }
 }
 

@@ -189,3 +189,7 @@ pub mod io {
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 pub mod host;
+
+// wasm 上的 HTTP：不自己实现，声明宿主导入让 JS 那边用 fetch/XHR 去发。
+// 只有真用到 HTTP 的程序才会带上这个导入（wasm-ld 只链引用到的）。
+pub mod http_host;
