@@ -66,7 +66,18 @@ pub extern "C" fn qi_string_find_from(
             Err(_) => return -1,
         };
 
-        let start = start as usize;
+        let mut start = start as usize;
+        if start >= text.len() {
+            return -1;
+        }
+        // 防御：start 落在多字节字符中间时 &text[start..] 会 panic，而且是跨 FFI 的
+        // non-unwinding panic —— 直接 abort 掉用户程序，连栈都展不开。
+        // 「从上一个命中的后面接着找」这种再普通不过的写法（从 = 位 + 1）撞上中文就必炸。
+        // 向后收缩到最近的字符边界：宁可少看一两个字节，也绝不 abort。
+        // qi_string_substring 早就这么防了，这里和 qi_string_substring_from 漏了。
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
         if start >= text.len() {
             return -1;
         }
@@ -137,8 +148,15 @@ pub extern "C" fn qi_string_substring_from(text_ptr: *const c_char, start: i64) 
             Err(_) => return empty_c_string(),
         };
 
-        let start = start as usize;
+        let mut start = start as usize;
 
+        if start >= text.len() {
+            return empty_c_string();
+        }
+        // 同 qi_string_find_from：起点落在字符中间会 non-unwinding panic 并 abort
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
         if start >= text.len() {
             return empty_c_string();
         }
@@ -532,6 +550,45 @@ mod tests {
         let not_found = CString::new("不存在").unwrap();
         let pos = qi_string_find(text.as_ptr(), not_found.as_ptr());
         assert_eq!(pos, -1);
+    }
+
+    /// 起点落在多字节字符中间不许 panic。
+    ///
+    /// 这是真踩到的：`从 = 位 + 1` 接着往下找是最自然的写法，而中文一个字三字节，
+    /// 位+1 就落在字符中间，`&text[start..]` 当场 non-unwinding panic —— 不是返回错误，
+    /// 是直接 abort 掉整个用户程序，栈都展不开。测试一跑就是 exit 134。
+    #[test]
+    fn find_from_不因起点落在字符中间而崩() {
+        let text = CString::new("谁依赖 KV？谁依赖 Graph？").unwrap();
+        let search = CString::new("谁依赖").unwrap();
+
+        let first = qi_string_find_from(text.as_ptr(), search.as_ptr(), 0);
+        assert_eq!(first, 0);
+
+        // 从 1 开始 —— 正好在「谁」这个字的三个字节中间
+        let second = qi_string_find_from(text.as_ptr(), search.as_ptr(), 1);
+        assert!(second > 0, "应当找到第二处，实得 {}", second);
+
+        // 每个字节位置都试一遍，一个都不许崩
+        let len = "谁依赖 KV？谁依赖 Graph？".len() as i64;
+        for i in 0..len {
+            let _ = qi_string_find_from(text.as_ptr(), search.as_ptr(), i);
+        }
+    }
+
+    /// 子串从 同样的毛病
+    #[test]
+    fn substring_from_不因起点落在字符中间而崩() {
+        let text = CString::new("中文字符串").unwrap();
+        let len = "中文字符串".len() as i64;
+        for i in 0..len {
+            let p = qi_string_substring_from(text.as_ptr(), i);
+            assert!(!p.is_null());
+            // 拿回来的必须是合法 UTF-8（边界向后收缩，不会切碎字符）
+            let got = unsafe { CStr::from_ptr(p) }.to_str();
+            assert!(got.is_ok(), "起点 {} 切出了非法 UTF-8", i);
+            unsafe { qi_string_free(p) };
+        }
     }
 
     #[test]
