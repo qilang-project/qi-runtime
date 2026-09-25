@@ -258,6 +258,34 @@ pub fn rc_cstr_from_bytes(data: &[u8]) -> *mut c_char {
     alloc_owned(data).ptr as *mut c_char
 }
 
+/// 分配一个长度为 `len` 的 RC C 字符串，交给 `fill` 往数据区就地写 —— 一次分配，
+/// 不经中间 `String`。header 与尾部 NUL 这里负责。`len == 0` 时不调 `fill`，
+/// 返回静态 immortal 空串（与 [`rc_cstr_from_bytes`] 同一口径）。
+///
+/// # Safety
+/// `fill` 拿到的是 `len` 字节**未初始化**的数据区起点，必须恰好写满 `len` 个字节，
+/// 且写成合法 UTF-8（QiStr 公约）；不得越界、不得保留该指针。
+pub unsafe fn rc_cstr_build(len: usize, fill: impl FnOnce(*mut u8)) -> *mut c_char {
+    if len == 0 {
+        return RC_CSTR_EMPTY.data.as_ptr() as *mut c_char;
+    }
+    let layout = buffer_layout(len);
+    let raw = alloc(layout);
+    if raw.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    (raw as *mut BufHeader).write(BufHeader {
+        magic: QI_STR_MAGIC,
+        refcount: AtomicI64::new(1),
+        capacity: len as i64,
+    });
+    let data_ptr = raw.add(HEADER_SIZE);
+    fill(data_ptr);
+    *data_ptr.add(len) = 0;
+    super::rc_obj::diag_str_alloc();
+    data_ptr as *mut c_char
+}
+
 /// 便利函数：从 &str 分配 RC C 字符串
 #[inline]
 pub fn rc_cstr_from_str(s: &str) -> *mut c_char {

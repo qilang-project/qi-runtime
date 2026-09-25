@@ -145,28 +145,17 @@ pub unsafe extern "C" fn qi_runtime_string_concat(
     s1: *const c_char,
     s2: *const c_char,
 ) -> *mut c_char {
-    if s1.is_null() || s2.is_null() {
-        return std::ptr::null_mut();
-    }
-    match (CStr::from_ptr(s1).to_str(), CStr::from_ptr(s2).to_str()) {
-        (Ok(a), Ok(b)) => {
-            let mut out = String::with_capacity(a.len() + b.len());
-            out.push_str(a);
-            out.push_str(b);
-            crate::stdlib::qi_str::rc_cstr_from_string(out)
-        }
-        _ => std::ptr::null_mut(),
-    }
+    crate::stdlib::str_format::concat2(s1, s2)
 }
 
 #[no_mangle]
 pub extern "C" fn qi_runtime_int_to_string(value: i64) -> *mut c_char {
-    crate::stdlib::qi_str::rc_cstr_from_string(value.to_string())
+    crate::stdlib::str_format::rc_cstr_from_i64(value)
 }
 
 #[no_mangle]
 pub extern "C" fn qi_runtime_float_to_string(value: f64) -> *mut c_char {
-    crate::stdlib::qi_str::rc_cstr_from_string(value.to_string())
+    crate::stdlib::str_format::rc_cstr_from_f64(value)
 }
 
 #[no_mangle]

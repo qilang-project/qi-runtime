@@ -619,13 +619,8 @@ pub extern "C" fn qi_runtime_string_concat(s1: *const c_char, s2: *const c_char)
         return std::ptr::null_mut();
     }
 
-    unsafe {
-        if let (Ok(str1), Ok(str2)) = (CStr::from_ptr(s1).to_str(), CStr::from_ptr(s2).to_str()) {
-            let result = format!("{}{}", str1, str2);
-            return crate::stdlib::qi_str::rc_cstr_from_string(result);
-        }
-        std::ptr::null_mut()
-    }
+    // 一次分配：两侧字节直接拷进 RC 缓冲（不再经中间 String）；null / 非法 UTF-8 → null 不变
+    unsafe { crate::stdlib::str_format::concat2(s1, s2) }
 }
 
 /// Get substring (caller must free the result)
@@ -987,15 +982,15 @@ pub extern "C" fn qi_runtime_array_length(array: *const u8) -> i64 {
 /// Convert integer to string (caller must free the result)
 #[no_mangle]
 pub extern "C" fn qi_runtime_int_to_string(value: i64) -> *mut c_char {
-    let string = value.to_string();
-    crate::stdlib::qi_str::rc_cstr_from_string(string)
+    // 数字先落栈再分配 RC 缓冲 —— 一次分配（以前 to_string 的 String 是第二次）
+    crate::stdlib::str_format::rc_cstr_from_i64(value)
 }
 
 /// Convert float to string (caller must free the result)
 #[no_mangle]
 pub extern "C" fn qi_runtime_float_to_string(value: f64) -> *mut c_char {
-    let string = value.to_string();
-    crate::stdlib::qi_str::rc_cstr_from_string(string)
+    // 文本同 to_string()，先落栈再分配 —— 一次分配
+    crate::stdlib::str_format::rc_cstr_from_f64(value)
 }
 
 /// Convert string to integer

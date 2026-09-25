@@ -92,6 +92,8 @@ pub mod stdlib {
     pub mod reflect_ffi;
     #[path = "../../../src/stdlib/regex_ffi.rs"]
     pub mod regex_ffi;
+    #[path = "../../../src/stdlib/str_format.rs"]
+    pub mod str_format;
     #[path = "../../../src/stdlib/string.rs"]
     pub mod string;
     #[path = "../../../src/stdlib/string_ffi.rs"]
