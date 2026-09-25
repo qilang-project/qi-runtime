@@ -5,23 +5,84 @@
 //!
 //! 热路径上的几个取舍（见 qi/基准/哈希表.qi）：
 //! - 查 / 判 / 删 直接借 C 串做 `&str` 去查，不再每次拷一份 `String` 再 free；
-//! - 写入走 `entry_ref`：只哈希一次，键已存在就原地改值，只有新键才分配；
+//! - 写入只哈希一次（raw_entry），键已存在就原地改值；
+//! - 键 ≤15 字节内联存在桶里（`Key`）：新键不分配，比较不跳指针，释放表也不用逐个 free；
 //! - 键哈希用 ahash（运行时随机种子，抗 HashDoS —— qi-web 的表里装的是请求来的键），
 //!   比 std 的 SipHash-1-3 短键快一截；
 //! - 句柄登记表的键是自增 id，不是外部输入，用一个乘法混合的轻哈希代替 SipHash。
 //! - 登记表用读写锁：只读操作走读锁，不再每次进 pthread_mutex。
 
-use hashbrown::hash_map::EntryRef;
+use hashbrown::hash_map::RawEntryMut;
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// 表内键的哈希器：ahash + 进程级随机种子（抗 HashDoS）
 type KeyHasher = ahash::RandomState;
-type KeyMap<V> = hashbrown::HashMap<String, V, KeyHasher>;
+type KeyMap<V> = hashbrown::HashMap<Key, V, KeyHasher>;
+
+/// 短键内联的上限（字节）。15 字节 + 1 字节长度 = 16，枚举整体仍是 24 字节，跟 String 一样大
+const INLINE_CAP: usize = 15;
+
+/// 表内的键。≤15 字节直接放在桶里：新键不分配，比较时也不用再跳一次指针
+/// 去读堆上的串（大表里那一跳基本是一次缓存缺失）；更长的键放堆上。
+/// 哈希 / 相等都按 `str` 的语义，所以可以直接拿借来的 `&str` 去查（Borrow<str>）。
+enum Key {
+    Inline { len: u8, buf: [u8; INLINE_CAP] },
+    Heap(Box<str>),
+}
+
+impl Key {
+    fn as_str(&self) -> &str {
+        match self {
+            // SAFETY: buf[..len] 是从一个 &str 原样拷进来的，必然是合法 UTF-8
+            Key::Inline { len, buf } => unsafe {
+                std::str::from_utf8_unchecked(buf.get_unchecked(..*len as usize))
+            },
+            Key::Heap(s) => s,
+        }
+    }
+}
+
+impl From<&str> for Key {
+    fn from(s: &str) -> Self {
+        if s.len() <= INLINE_CAP {
+            let mut buf = [0u8; INLINE_CAP];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            Key::Inline {
+                len: s.len() as u8,
+                buf,
+            }
+        } else {
+            Key::Heap(s.into())
+        }
+    }
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for Key {}
+
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // 必须与 str 的 Hash 完全一致：查的时候拿 &str 算哈希
+        self.as_str().hash(state)
+    }
+}
+
+impl Borrow<str> for Key {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
 
 // 哈希表值类型
 enum MapValue {
@@ -102,14 +163,15 @@ unsafe fn borrow_key<'a>(s: *const c_char) -> Option<&'a str> {
     CStr::from_ptr(s).to_str().ok()
 }
 
-/// 写入：只哈希一次；键已存在原地改值，新键才分配 `String`
+/// 写入：只哈希一次；键已存在原地改值，新键才构造 `Key`（短键不分配）
 fn put<V>(map: &mut KeyMap<V>, key: &str, value: V) {
-    match map.entry_ref(key) {
-        EntryRef::Occupied(mut e) => {
-            e.insert(value);
+    let hash = BuildHasher::hash_one(map.hasher(), key);
+    match map.raw_entry_mut().from_key_hashed_nocheck(hash, key) {
+        RawEntryMut::Occupied(mut e) => {
+            *e.get_mut() = value;
         }
-        EntryRef::Vacant(e) => {
-            e.insert(value);
+        RawEntryMut::Vacant(e) => {
+            e.insert_hashed_nocheck(hash, Key::from(key), value);
         }
     }
 }
@@ -313,15 +375,16 @@ pub extern "C" fn qi_hashmap_string_set(
         let Some(m) = as_string(v) else {
             return false;
         };
-        match m.entry_ref(k) {
+        let hash = BuildHasher::hash_one(m.hasher(), k);
+        match m.raw_entry_mut().from_key_hashed_nocheck(hash, k) {
             // 键已存在：复用旧值的缓冲区，容量够就不分配
-            EntryRef::Occupied(mut e) => {
+            RawEntryMut::Occupied(mut e) => {
                 let slot = e.get_mut();
                 slot.clear();
                 slot.push_str(val);
             }
-            EntryRef::Vacant(e) => {
-                e.insert(val.to_owned());
+            RawEntryMut::Vacant(e) => {
+                e.insert_hashed_nocheck(hash, Key::from(k), val.to_owned());
             }
         }
         true
@@ -667,6 +730,56 @@ mod tests {
         let k = c("t3-1999");
         assert_eq!(qi_hashmap_int_get(shared, k.as_ptr()), 1999);
         qi_hashmap_free(shared);
+    }
+
+    #[test]
+    fn inline_and_heap_keys_mix() {
+        // 键不比 String 大；内联 / 堆两种键在边界（15/16 字节）与多字节字符上都要对
+        assert_eq!(std::mem::size_of::<Key>(), std::mem::size_of::<String>());
+        let keys = [
+            String::new(),
+            "a".to_string(),
+            "x".repeat(INLINE_CAP),
+            "x".repeat(INLINE_CAP + 1),
+            "中文五个字".to_string(),   // 15 字节
+            "中文六个字了".to_string(), // 18 字节
+            "long-key-".repeat(20),
+        ];
+        let t = qi_hashmap_int_create();
+        let s = qi_hashmap_string_create();
+        // 足够多的键触发多次扩容重哈希，重哈希按 Key 算、查询按 &str 算，必须一致
+        for i in 0..5000i64 {
+            let k = c(&format!("{}#{}", keys[(i % 7) as usize], i));
+            assert_eq!(qi_hashmap_int_set(t, k.as_ptr(), i), 1);
+        }
+        for (i, k) in keys.iter().enumerate() {
+            let ck = c(k);
+            assert_eq!(qi_hashmap_int_set(t, ck.as_ptr(), i as i64 + 100), 1);
+            assert_eq!(qi_hashmap_string_set(s, ck.as_ptr(), ck.as_ptr()), 1);
+        }
+        for i in 0..5000i64 {
+            let k = c(&format!("{}#{}", keys[(i % 7) as usize], i));
+            assert_eq!(qi_hashmap_int_get(t, k.as_ptr()), i);
+        }
+        for (i, k) in keys.iter().enumerate() {
+            let ck = c(k);
+            assert_eq!(qi_hashmap_int_get(t, ck.as_ptr()), i as i64 + 100);
+            assert_eq!(
+                unsafe { read_and_free(qi_hashmap_string_get(s, ck.as_ptr())) }.as_deref(),
+                Some(k.as_str())
+            );
+        }
+        assert_eq!(qi_hashmap_int_size(t), 5000 + keys.len() as i64);
+        // 前缀相同、长度不同的键互不干扰
+        let k15 = c(&"x".repeat(INLINE_CAP));
+        let k14 = c(&"x".repeat(INLINE_CAP - 1));
+        assert_eq!(qi_hashmap_int_contains(t, k14.as_ptr()), 0);
+        assert_eq!(qi_hashmap_int_remove(t, k15.as_ptr()), 1);
+        assert_eq!(qi_hashmap_int_contains(t, k15.as_ptr()), 0);
+        let k16 = c(&"x".repeat(INLINE_CAP + 1));
+        assert_eq!(qi_hashmap_int_get(t, k16.as_ptr()), 103);
+        qi_hashmap_free(t);
+        qi_hashmap_free(s);
     }
 
     #[test]
