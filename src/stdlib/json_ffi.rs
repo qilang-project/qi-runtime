@@ -739,6 +739,55 @@ pub extern "C" fn qi_json_has_key(obj_id: i64, key: *const c_char) -> i64 {
     0
 }
 
+/// JSON 语义相等：对象**不看键序**，数字**按值**比（1 与 1.0 相等）。
+///
+/// 不能直接用 `Value == Value`：serde_json 的 `Number` 比的是内部表示，
+/// `1`（整数）和 `1.0`（浮点）不相等 —— 而 JSON 只有一种数字类型，
+/// 测试框架里「模型回 1.0、期望写 1」判不等只会制造噪音。
+/// 对象这里自己逐键比，不依赖 preserve_order 下 IndexMap 的比较语义。
+fn json_semantic_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| json_semantic_eq(v, w)))
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(v, w)| json_semantic_eq(v, w))
+        }
+        (Value::Number(x), Value::Number(y)) => json_number_eq(x, y),
+        _ => a == b,
+    }
+}
+
+fn json_number_eq(x: &Number, y: &Number) -> bool {
+    if let (Some(i), Some(j)) = (x.as_i64(), y.as_i64()) {
+        return i == j;
+    }
+    if let (Some(i), Some(j)) = (x.as_u64(), y.as_u64()) {
+        return i == j;
+    }
+    match (x.as_f64(), y.as_f64()) {
+        (Some(i), Some(j)) => i == j,
+        _ => false,
+    }
+}
+
+/// 两个 JSON 句柄是否语义相等（见 json_semantic_eq）。任一句柄无效返回 0。
+#[no_mangle]
+pub extern "C" fn qi_json_equal(a_id: i64, b_id: i64) -> i64 {
+    if a_id <= 0 || b_id <= 0 {
+        return 0;
+    }
+    let storage = JSON_VALUES.lock().unwrap();
+    if let Some(ref map) = *storage {
+        if let (Some(a), Some(b)) = (map.get(&(a_id as u64)), map.get(&(b_id as u64))) {
+            return json_semantic_eq(a, b) as i64;
+        }
+    }
+    0
+}
+
 /// 转换为JSON字符串
 #[no_mangle]
 pub extern "C" fn qi_json_to_string(json_id: i64) -> *mut c_char {
@@ -886,6 +935,37 @@ pub extern "C" fn qi_json_free(json_id: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use super::json_semantic_eq;
+
+    fn eq(a: &str, b: &str) -> bool {
+        json_semantic_eq(
+            &serde_json::from_str(a).unwrap(),
+            &serde_json::from_str(b).unwrap(),
+        )
+    }
+
+    #[test]
+    fn semantic_eq_ignores_key_order() {
+        assert!(eq(r#"{"a":1,"b":[1,2]}"#, r#"{"b":[1,2],"a":1}"#));
+        assert!(eq(r#"{"x":{"p":1,"q":2}}"#, r#"{"x":{"q":2,"p":1}}"#));
+    }
+
+    #[test]
+    fn semantic_eq_compares_numbers_by_value() {
+        assert!(eq("1", "1.0"));
+        assert!(eq(r#"{"n":2}"#, r#"{"n":2.0}"#));
+        assert!(!eq("1", "1.5"));
+    }
+
+    #[test]
+    fn semantic_eq_is_strict_where_it_should_be() {
+        // 数组有序、多一个键、类型不同 —— 都不相等
+        assert!(!eq("[1,2]", "[2,1]"));
+        assert!(!eq(r#"{"a":1}"#, r#"{"a":1,"b":2}"#));
+        assert!(!eq(r#"{"a":"1"}"#, r#"{"a":1}"#));
+        assert!(!eq("null", "false"));
+    }
+
     use super::*;
     use std::ffi::CString;
 
