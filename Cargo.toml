@@ -72,6 +72,10 @@ tokio = { version = "1.48.0", features = ["full"] }
 uuid = { version = "1.10.0", features = ["v4", "serde"] }
 crossbeam = "0.8.4"
 dashmap = "6.1"
+# 标准库.哈希表：entry_ref 单次哈希写入 + ahash 随机种子（抗 HashDoS）。
+# 两者本来就在依赖树里（indexmap / dashmap 带进来），wasm32-wasip1 可编。
+hashbrown = { version = "0.17", default-features = false, features = ["inline-more", "raw-entry"] }
+ahash = "0.8"
 libc = "0.2.158"
 num_cpus = "1.16.0"
 chrono = { version = "0.4.38", features = ["serde"] }
