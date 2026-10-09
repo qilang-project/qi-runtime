@@ -65,6 +65,28 @@ pub extern "C" fn qi_process_current_pid() -> i64 {
     std::process::id() as i64
 }
 
+/// 原始命令行参数 → `数组<字符串>`（Qi 数组布局：槽 0 是长度，之后每槽一个 rc=1 串）。
+///
+/// **含程序名**：下标 0 是程序路径（跟 C 的 argv、Rust 的 env::args 一致），
+/// 用户参数从下标 1 开始。非 UTF-8 的参数按有损转换（非法字节变成 U+FFFD），
+/// 不会因此丢掉一个参数、让下标错位。
+#[no_mangle]
+pub extern "C" fn qi_process_args() -> *mut std::os::raw::c_void {
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let n = args.len();
+    let p = crate::stdlib::rc_obj::qi_obj_alloc(((n + 1) * 8) as i64);
+    unsafe {
+        *(p as *mut i64) = n as i64;
+        for (i, a) in args.iter().enumerate() {
+            let s = crate::stdlib::qi_str::rc_cstr_from_str(a);
+            *(p as *mut i64).add(i + 1) = s as usize as i64;
+        }
+    }
+    p as *mut std::os::raw::c_void
+}
+
 /// 退出进程
 #[no_mangle]
 pub extern "C" fn qi_process_exit(code: i32) {

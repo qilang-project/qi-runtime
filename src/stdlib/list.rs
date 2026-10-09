@@ -406,6 +406,38 @@ pub extern "C" fn qi_list_string_size(list_id: i64) -> i64 {
     0
 }
 
+/// 清空浮点列表（与 qi_list_int_clear 对齐：成功 1，句柄无效或类型不符 0）
+#[no_mangle]
+pub extern "C" fn qi_list_float_clear(list_id: i64) -> i64 {
+    if list_id <= 0 {
+        return 0;
+    }
+    let mut lists = LISTS.lock().unwrap();
+    if let Some(ref mut map) = *lists {
+        if let Some(ListValue::Float(ref mut list)) = map.get_mut(&(list_id as u64)) {
+            list.clear();
+            return 1;
+        }
+    }
+    0
+}
+
+/// 清空字符串列表（同上）
+#[no_mangle]
+pub extern "C" fn qi_list_string_clear(list_id: i64) -> i64 {
+    if list_id <= 0 {
+        return 0;
+    }
+    let mut lists = LISTS.lock().unwrap();
+    if let Some(ref mut map) = *lists {
+        if let Some(ListValue::String(ref mut list)) = map.get_mut(&(list_id as u64)) {
+            list.clear();
+            return 1;
+        }
+    }
+    0
+}
+
 // ============================================================================
 // 指针列表 (Pointer List)
 // ============================================================================

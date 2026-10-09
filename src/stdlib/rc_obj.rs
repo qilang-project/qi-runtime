@@ -319,6 +319,124 @@ pub extern "C" fn qi_rc_release_any(p: *const u8) {
     }
 }
 
+// ─────────────────── 可增长数组：添加 / 弹出 的存储准备 ───────────────────
+//
+// 数组本体布局不变：`[len, e0, e1, …]`，每槽 8 字节，对象 header 的 size 是
+// **容量**（字节）。`数组<T>()` 只分配一个长度槽，`添加` 时按需翻倍扩容。
+//
+// 由 codegen 在 `甲.添加(x)` / `甲.弹出()` 处调用，返回值**写回接收者那个
+// 变量 / 字段**（扩容可能搬家）。元素的读写、ARC 的 retain/release 仍在
+// codegen 里做 —— 这里只管「这块存储能不能原地改」。
+
+/// 新容量（槽数，不含长度槽）：至少放得下 need 个元素，按 2 倍增长，起步 4。
+fn grown_slots(cur_slots: usize, need: usize) -> usize {
+    let mut cap = cur_slots.max(4);
+    while cap < need {
+        cap *= 2;
+    }
+    cap
+}
+
+/// 让 `arr` 变成**可以原地修改**、且至少还能再放 `extra` 个元素的数组，
+/// 返回（可能是新的）数组指针。调用方必须把返回值写回原来存放 arr 的地方。
+///
+/// - `arc == 0`（QI_ARC=0 的泄漏模式）：数组本体可能不是 RC 对象，header
+///   不可信 —— 每次都拷一份新的（旧的照泄漏模式的规矩不回收）。
+/// - 唯一持有（refcount == 1）：容量够就原样返回；不够就 realloc 原地扩容
+///   （元素槽整体搬家，所有权随槽转移，不需要 retain/release）。
+/// - 被共享（refcount > 1，含 immortal）或不是 RC 对象：**写时复制** ——
+///   拷出一份新数组，RC 元素（`elem_rc != 0`）逐个 retain，旧的减一次引用。
+///   于是 `乙 = 甲; 甲.添加(x);` 之后 乙 还是原来的长度，不会跟着变，也不会
+///   被搬家搬成野指针。函数参数在序言里被 retain 过，所以对参数 添加 也走这条。
+#[no_mangle]
+pub extern "C" fn qi_array_prepare_mut(
+    arr: *mut u8,
+    extra: i64,
+    elem_rc: i64,
+    arc: i64,
+) -> *mut u8 {
+    let extra = extra.max(0) as usize;
+    let len = if arr.is_null() {
+        0
+    } else {
+        unsafe { (*(arr as *const i64)).max(0) as usize }
+    };
+    let need = len + extra;
+
+    let unique = arc != 0
+        && !arr.is_null()
+        && unsafe {
+            let h = header_of(arr);
+            (*h).magic == QI_OBJ_MAGIC && (*h).refcount.load(Ordering::Acquire) == 1
+        };
+
+    if unique {
+        unsafe {
+            let h = header_of(arr);
+            let size = (*h).size as usize;
+            let need_bytes = (need + 1) * 8;
+            if size >= need_bytes {
+                return arr;
+            }
+            let new_slots = grown_slots(size / 8 - 1, need);
+            let new_bytes = (new_slots + 1) * 8;
+            let raw = std::alloc::realloc(h as *mut u8, obj_layout(size), HEADER_SIZE + new_bytes);
+            if raw.is_null() {
+                std::alloc::handle_alloc_error(obj_layout(new_bytes));
+            }
+            // 新增的尾部清零：RC 元素槽必须是 null 才能安全释放
+            std::ptr::write_bytes(raw.add(HEADER_SIZE + size), 0, new_bytes - size);
+            let h = raw as *mut ObjHeader;
+            (*h).size = new_bytes as i64;
+            return raw.add(HEADER_SIZE);
+        }
+    }
+
+    // 写时复制 / 泄漏模式：新开一块，拷长度和元素
+    let new_slots = if extra == 0 {
+        need.max(1)
+    } else {
+        grown_slots(len, need)
+    };
+    let fresh = qi_obj_alloc(((new_slots + 1) * 8) as i64);
+    if !arr.is_null() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(arr as *const i64, fresh as *mut i64, len + 1);
+            if arc != 0 {
+                if elem_rc != 0 {
+                    for i in 1..=len {
+                        let e = *(fresh as *const i64).add(i) as usize as *const u8;
+                        qi_obj_retain(e);
+                    }
+                }
+                // 只放掉我们这一份引用；对方还持有，不会归零。非 RC 对象 /
+                // immortal 时 qi_obj_dec 本身就是 no-op（或一次性警告）。
+                let magic = *(arr.sub(HEADER_SIZE) as *const u64);
+                if magic == QI_OBJ_MAGIC {
+                    let old = qi_obj_dec(arr);
+                    if old == 1 {
+                        // 只有并发竞争才会走到：别人在这期间放掉了它。按释放
+                        // 函数的约定，元素引用随旧本体一起交回 —— 我们刚才已为
+                        // 新数组 retain 过，旧数组那份要还掉。
+                        if elem_rc != 0 {
+                            for i in 1..=len {
+                                let e = *(arr as *const i64).add(i) as usize as *const u8;
+                                qi_rc_release_any(e);
+                            }
+                        }
+                        qi_obj_free(arr);
+                    }
+                }
+            }
+        }
+    } else {
+        unsafe {
+            *(fresh as *mut i64) = 0;
+        }
+    }
+    fresh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +484,67 @@ mod tests {
         assert_eq!(qi_obj_dec(p), 2); // 旧值 2 → 不释放
         assert_eq!(qi_obj_dec(p), 1); // 旧值 1 → 调用方负责 free
         qi_obj_free(p);
+    }
+
+    unsafe fn arr_len(p: *const u8) -> i64 {
+        *(p as *const i64)
+    }
+
+    #[test]
+    fn prepare_mut_grows_unique_array_in_place_semantics() {
+        // 空数组：只有长度槽
+        let mut a = qi_obj_alloc(8);
+        for i in 0..100i64 {
+            a = qi_array_prepare_mut(a, 1, 0, 1);
+            unsafe {
+                let n = arr_len(a);
+                *(a as *mut i64).add(n as usize + 1) = i * 10;
+                *(a as *mut i64) = n + 1;
+                assert!((*header_of(a)).size >= (n + 2) * 8);
+                assert_eq!(rc_of(a), 1, "扩容不应改变引用计数");
+            }
+        }
+        unsafe {
+            assert_eq!(arr_len(a), 100);
+            for i in 0..100 {
+                assert_eq!(*(a as *const i64).add(i + 1), i as i64 * 10);
+            }
+        }
+        assert_eq!(qi_obj_dec(a), 1);
+        qi_obj_free(a);
+    }
+
+    #[test]
+    fn prepare_mut_copies_shared_array_and_retains_elements() {
+        let s = rc_cstr_from_bytes(b"elem");
+        let a = qi_obj_alloc(16);
+        unsafe {
+            *(a as *mut i64) = 1;
+            *(a as *mut i64).add(1) = s as usize as i64;
+        }
+        qi_obj_retain(a); // 两个持有者
+        let b = qi_array_prepare_mut(a, 1, 1, 1);
+        assert_ne!(a, b, "共享数组必须写时复制");
+        unsafe {
+            assert_eq!(rc_of(a), 1, "旧数组只放掉我们这一份");
+            assert_eq!(rc_of(b), 1);
+            assert_eq!(arr_len(b), 1);
+            assert_eq!(*(b as *const i64).add(1), s as usize as i64);
+            // 字符串 header 与对象 header 同形，rc_of 读得出它的引用计数
+            assert_eq!(rc_of(s as *const u8), 2, "元素被两个数组各持有一份");
+        }
+    }
+
+    #[test]
+    fn prepare_mut_unique_with_room_returns_same_pointer() {
+        let a = qi_obj_alloc(8 * 5);
+        unsafe {
+            *(a as *mut i64) = 2;
+        }
+        assert_eq!(qi_array_prepare_mut(a, 1, 0, 1), a);
+        assert_eq!(qi_array_prepare_mut(a, 0, 0, 1), a);
+        assert_eq!(qi_obj_dec(a), 1);
+        qi_obj_free(a);
     }
 
     #[test]

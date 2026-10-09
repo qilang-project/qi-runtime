@@ -182,6 +182,22 @@ pub extern "C" fn qi_string_byte_length(text_ptr: *const c_char) -> i64 {
     }
 }
 
+/// 按**字节**取值：`字符串.字节(串, 下标)` → 0..=255；下标越界（含负数）或串为空指针 → -1。
+///
+/// 不做 UTF-8 解码 —— 要的就是原始字节（写解析器、校验魔数、按 ASCII 判断
+/// 字符类别）。按字符取请用 字符串.字符在。
+#[no_mangle]
+pub extern "C" fn qi_string_byte_at(text_ptr: *const c_char, index: i64) -> i64 {
+    if text_ptr.is_null() || index < 0 {
+        return -1;
+    }
+    let bytes = unsafe { CStr::from_ptr(text_ptr) }.to_bytes();
+    match bytes.get(index as usize) {
+        Some(b) => *b as i64,
+        None => -1,
+    }
+}
+
 /// Get the character count of a UTF-8 string
 #[no_mangle]
 pub extern "C" fn qi_string_char_count(text_ptr: *const c_char) -> i64 {
