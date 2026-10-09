@@ -108,6 +108,44 @@ extern "C" {
     fn qi_gui_egui_key_down_impl(name: *const c_char) -> i64;
     fn qi_gui_egui_key_pressed_impl(name: *const c_char) -> i64;
     fn qi_gui_egui_any_key_pressed_impl() -> i64;
+    // ── 编辑器层（2026-10）──
+    fn qi_gui_egui_rich_begin_impl();
+    fn qi_gui_egui_rich_span_impl(text: *const c_char, size: i64, flags: i64, color: i64);
+    fn qi_gui_egui_rich_end_impl(indent: i64, bar: i64);
+    fn qi_gui_egui_code_block_impl(text: *const c_char, size: i64);
+    fn qi_gui_egui_columns_begin_impl(left_permille: i64);
+    fn qi_gui_egui_columns_next_impl();
+    fn qi_gui_egui_columns_end_impl();
+    fn qi_gui_egui_editor_impl(
+        id: *const c_char,
+        value: *const c_char,
+        mono: i64,
+        size: i64,
+    ) -> *const c_char;
+    fn qi_gui_egui_editor_cursor_impl() -> i64;
+    fn qi_gui_egui_editor_set_cursor_impl(id: *const c_char, pos: i64);
+    fn qi_gui_egui_shortcut_impl(name: *const c_char, shift: i64) -> i64;
+    fn qi_gui_egui_image_fit_impl(path: *const c_char, max_width: i64) -> i64;
+    fn qi_gui_egui_dropped_files_impl() -> *const c_char;
+    fn qi_gui_egui_seek_bar_impl(id: *const c_char, permille: i64, width: i64) -> i64;
+    fn qi_gui_audio_position_ms_impl(audio_id: u64) -> i64;
+    fn qi_gui_audio_duration_ms_impl(audio_id: u64) -> i64;
+    fn qi_gui_audio_seek_ms_impl(audio_id: u64, ms: i64) -> i64;
+    fn qi_gui_egui_window_margin_impl(px: i64);
+    fn qi_gui_egui_set_appearance_impl(
+        bg: i64,
+        text: i64,
+        weak: i64,
+        accent: i64,
+        border: i64,
+        size: i64,
+    );
+    fn qi_gui_egui_weak_label_impl(text: *const c_char);
+    fn qi_gui_egui_add_space_impl(px: i64);
+    fn qi_gui_egui_region_begin_impl(height: i64, pad: i64, bg: i64, max_width: i64);
+    fn qi_gui_egui_region_end_impl();
+    fn qi_gui_egui_right_begin_impl();
+    fn qi_gui_egui_right_end_impl();
 }
 
 // ============================================================================
@@ -418,7 +456,7 @@ pub extern "C" fn qi_gui_egui_button(text: *const c_char) -> i64 {
 pub extern "C" fn qi_gui_egui_text_edit(id: *const c_char, value: *const c_char) -> *mut c_char {
     #[cfg(has_gui)]
     {
-        unsafe { qi_gui_egui_text_edit_impl(id, value) as *mut c_char }
+        super::qi_str::qi_string_from_cstr(unsafe { qi_gui_egui_text_edit_impl(id, value) })
     }
     #[cfg(not(has_gui))]
     {
@@ -435,7 +473,9 @@ pub extern "C" fn qi_gui_egui_text_edit_multiline(
 ) -> *mut c_char {
     #[cfg(has_gui)]
     {
-        unsafe { qi_gui_egui_text_edit_multiline_impl(id, value) as *mut c_char }
+        super::qi_str::qi_string_from_cstr(unsafe {
+            qi_gui_egui_text_edit_multiline_impl(id, value)
+        })
     }
     #[cfg(not(has_gui))]
     {
@@ -623,7 +663,7 @@ pub extern "C" fn qi_gui_egui_scroll_end() {
 pub extern "C" fn qi_gui_egui_collapse_begin(title: *const c_char) -> i64 {
     #[cfg(has_gui)]
     {
-        unsafe { qi_gui_egui_collapse_begin_impl(title) }
+        i64::from(unsafe { qi_gui_egui_collapse_begin_impl(title) })
     }
     #[cfg(not(has_gui))]
     {
@@ -646,7 +686,7 @@ pub extern "C" fn qi_gui_egui_collapse_end() {
 pub extern "C" fn qi_gui_egui_radio(text: *const c_char, selected: i32) -> i64 {
     #[cfg(has_gui)]
     {
-        unsafe { qi_gui_egui_radio_impl(text, selected) }
+        i64::from(unsafe { qi_gui_egui_radio_impl(text, selected) })
     }
     #[cfg(not(has_gui))]
     {
@@ -660,7 +700,7 @@ pub extern "C" fn qi_gui_egui_radio(text: *const c_char, selected: i32) -> i64 {
 pub extern "C" fn qi_gui_egui_selectable(text: *const c_char, selected: i32) -> i64 {
     #[cfg(has_gui)]
     {
-        unsafe { qi_gui_egui_selectable_impl(text, selected) }
+        i64::from(unsafe { qi_gui_egui_selectable_impl(text, selected) })
     }
     #[cfg(not(has_gui))]
     {
@@ -983,6 +1023,321 @@ pub extern "C" fn qi_gui_egui_any_key_pressed() -> i64 {
     }
     #[cfg(not(has_gui))]
     {
+        0
+    }
+}
+
+// ============================================================================
+// 编辑器层：富文本行 / 代码块 / 分栏 / 编辑区 / 组合键（实现在 qi-gui egui_editor.rs）
+// ============================================================================
+
+/// 富文本开始()
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_rich_begin() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_rich_begin_impl()
+    }
+}
+
+/// 富文本片段(文本, 字号, 样式位, 颜色)
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_rich_span(text: *const c_char, size: i64, flags: i64, color: i64) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_rich_span_impl(text, size, flags, color)
+    }
+    #[cfg(not(has_gui))]
+    let _ = (text, size, flags, color);
+}
+
+/// 富文本结束(缩进, 竖线)
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_rich_end(indent: i64, bar: i64) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_rich_end_impl(indent, bar)
+    }
+    #[cfg(not(has_gui))]
+    let _ = (indent, bar);
+}
+
+/// 代码块(文本, 字号)
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_code_block(text: *const c_char, size: i64) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_code_block_impl(text, size)
+    }
+    #[cfg(not(has_gui))]
+    let _ = (text, size);
+}
+
+/// 分栏开始(左栏千分比)
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_columns_begin(left_permille: i64) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_columns_begin_impl(left_permille)
+    }
+    #[cfg(not(has_gui))]
+    let _ = left_permille;
+}
+
+/// 分栏下一栏()
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_columns_next() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_columns_next_impl()
+    }
+}
+
+/// 分栏结束()
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_columns_end() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_columns_end_impl()
+    }
+}
+
+/// 编辑区(id, 当前值, 等宽, 字号) → 新值（Qi 拥有的 RC 串）
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_editor(
+    id: *const c_char,
+    value: *const c_char,
+    mono: i64,
+    size: i64,
+) -> *mut c_char {
+    #[cfg(has_gui)]
+    {
+        super::qi_str::qi_string_from_cstr(unsafe {
+            qi_gui_egui_editor_impl(id, value, mono, size)
+        })
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (id, mono, size);
+        super::qi_str::qi_string_from_cstr(value)
+    }
+}
+
+/// 编辑区光标() → 字符下标，没有光标 -1
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_editor_cursor() -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_editor_cursor_impl() }
+    }
+    #[cfg(not(has_gui))]
+    {
+        -1
+    }
+}
+
+/// 设置编辑区光标(id, 字符下标)
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_editor_set_cursor(id: *const c_char, pos: i64) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_editor_set_cursor_impl(id, pos)
+    }
+    #[cfg(not(has_gui))]
+    let _ = (id, pos);
+}
+
+/// 组合键(键名, 上档) → 1/0
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_shortcut(name: *const c_char, shift: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_shortcut_impl(name, shift) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (name, shift);
+        0
+    }
+}
+
+/// 设置窗口边距(像素)：根区域离窗口边缘多远，默认 10
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_window_margin(px: i64) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_window_margin_impl(px)
+    }
+    #[cfg(not(has_gui))]
+    let _ = (px,);
+}
+
+/// 设置外观(底色, 文字, 弱文字, 强调, 边框, 字号)：全套配色 + 基准字号，颜色是打包整数
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_set_appearance(
+    bg: i64,
+    text: i64,
+    weak: i64,
+    accent: i64,
+    border: i64,
+    size: i64,
+) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_set_appearance_impl(bg, text, weak, accent, border, size)
+    }
+    #[cfg(not(has_gui))]
+    let _ = (bg, text, weak, accent, border, size);
+}
+
+/// 弱标签(文本)：次要信息用的浅色文字
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_weak_label(text: *const c_char) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_weak_label_impl(text)
+    }
+    #[cfg(not(has_gui))]
+    let _ = (text,);
+}
+
+/// 空白(像素)：沿当前布局方向留空
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_add_space(px: i64) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_add_space_impl(px)
+    }
+    #[cfg(not(has_gui))]
+    let _ = (px,);
+}
+
+/// 区域开始(高度, 内边距, 背景色, 最大宽)：高度>0 定高，0 随内容，-1 撑满，-(N+1) 撑满让出 N 像素；背景色<0 不画；最大宽>0 居中
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_region_begin(height: i64, pad: i64, bg: i64, max_width: i64) {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_region_begin_impl(height, pad, bg, max_width)
+    }
+    #[cfg(not(has_gui))]
+    let _ = (height, pad, bg, max_width);
+}
+
+/// 区域结束()
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_region_end() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_region_end_impl()
+    }
+}
+
+/// 右对齐开始()：这一行剩下的宽度里从右往左排
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_right_begin() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_right_begin_impl()
+    }
+}
+
+/// 右对齐结束()
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_right_end() {
+    #[cfg(has_gui)]
+    unsafe {
+        qi_gui_egui_right_end_impl()
+    }
+}
+
+/// 适应图片(路径, 最大宽) → 1 显示了 / 0 读不了
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_image_fit(path: *const c_char, max_width: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_image_fit_impl(path, max_width) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (path, max_width);
+        0
+    }
+}
+
+/// 拖入文件() → 这一帧拖进来的路径（换行分隔），没有则空串
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_dropped_files() -> *mut c_char {
+    #[cfg(has_gui)]
+    {
+        super::qi_str::qi_string_from_cstr(unsafe { qi_gui_egui_dropped_files_impl() })
+    }
+    #[cfg(not(has_gui))]
+    {
+        super::qi_str::qi_string_from_cstr(std::ptr::null())
+    }
+}
+
+/// 进度拖条(id, 千分比, 宽) → 点/拖到的千分比，没动 -1
+#[no_mangle]
+pub extern "C" fn qi_gui_egui_seek_bar(id: *const c_char, permille: i64, width: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        unsafe { qi_gui_egui_seek_bar_impl(id, permille, width) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (id, permille, width);
+        -1
+    }
+}
+
+/// 音频位置(id) → 已播放毫秒
+#[no_mangle]
+pub extern "C" fn qi_gui_audio_position_ms(audio_id: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        if audio_id <= 0 {
+            return 0;
+        }
+        unsafe { qi_gui_audio_position_ms_impl(audio_id as u64) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = audio_id;
+        0
+    }
+}
+
+/// 音频时长(id) → 总毫秒，给不出时 0
+#[no_mangle]
+pub extern "C" fn qi_gui_audio_duration_ms(audio_id: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        if audio_id <= 0 {
+            return 0;
+        }
+        unsafe { qi_gui_audio_duration_ms_impl(audio_id as u64) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = audio_id;
+        0
+    }
+}
+
+/// 音频跳到(id, 毫秒) → 1 成功 / 0 失败
+#[no_mangle]
+pub extern "C" fn qi_gui_audio_seek_ms(audio_id: i64, ms: i64) -> i64 {
+    #[cfg(has_gui)]
+    {
+        if audio_id <= 0 {
+            return 0;
+        }
+        unsafe { qi_gui_audio_seek_ms_impl(audio_id as u64, ms) }
+    }
+    #[cfg(not(has_gui))]
+    {
+        let _ = (audio_id, ms);
         0
     }
 }
