@@ -47,6 +47,7 @@ fn 取客户配置() -> Arc<ClientConfig> {
             // 依赖系统证书库会在最小化容器里悄悄失败。
             let mut 根 = RootCertStore::empty();
             根.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            add_extra_roots(&mut 根);
             Arc::new(
                 ClientConfig::builder()
                     .with_root_certificates(根)
@@ -56,6 +57,44 @@ fn 取客户配置() -> Arc<ClientConfig> {
         .clone()
 }
 
+/// 额外信任的根证书（PEM）：`QI_TLS_CA_FILE`，没设就看 `SSL_CERT_FILE`。
+///
+/// 内置的 Mozilla 根证书认不了内网 CA 和自签证书 —— 公司内网的 wss 网关、
+/// 本地起的 TLS 测试服务都连不上，而且报错只是「握手失败」。设了这个变量就
+/// 在内置根之外**追加**这些证书（不替换：公网端点照样能连）。读不出来或
+/// 解析失败只打一行警告，不让整个进程连公网也连不了。
+fn add_extra_roots(roots: &mut RootCertStore) {
+    let path = std::env::var_os("QI_TLS_CA_FILE").or_else(|| std::env::var_os("SSL_CERT_FILE"));
+    let Some(path) = path else {
+        return;
+    };
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[qi TLS] 读不了额外根证书 {}: {e}", path.to_string_lossy());
+            return;
+        }
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut reader) {
+        match cert {
+            Ok(c) => {
+                if roots.add(c).is_ok() {
+                    added += 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("[qi TLS] 解析 {} 失败: {e}", path.to_string_lossy());
+                return;
+            }
+        }
+    }
+    if added == 0 {
+        eprintln!("[qi TLS] {} 里没有可用的证书", path.to_string_lossy());
+    }
+}
+
 pub struct TLS客户流 {
     socket: TcpStream,
     conn: Mutex<ClientConnection>,
@@ -63,10 +102,18 @@ pub struct TLS客户流 {
 
 impl TLS客户流 {
     /// 在已连上的 TCP 上完成 TLS 握手。域名用于 SNI 与证书校验。
-    pub fn 握手(mut socket: TcpStream, 域名: &str) -> Result<Self, std::io::Error> {
+    pub fn 握手(socket: TcpStream, 域名: &str) -> Result<Self, std::io::Error> {
+        Self::handshake_with(socket, 域名, 取客户配置())
+    }
+
+    fn handshake_with(
+        mut socket: TcpStream,
+        域名: &str,
+        config: Arc<ClientConfig>,
+    ) -> Result<Self, std::io::Error> {
         let 名 = ServerName::try_from(域名.to_string())
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "域名无效"))?;
-        let mut conn = ClientConnection::new(取客户配置(), 名)
+        let mut conn = ClientConnection::new(config, 名)
             .map_err(|e| std::io::Error::other(format!("TLS 初始化失败: {e}")))?;
 
         // 握手期是纯同步的、还没有别的协程碰这条连接，可以放心用 complete_io
@@ -146,9 +193,25 @@ impl TLS客户流 {
     /// 加密并发送。持锁很短，且不阻塞在读上。
     pub fn 发送(&self, 数据: &[u8]) -> Result<(), std::io::Error> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.writer().write_all(数据)?;
-        while conn.wants_write() {
-            conn.write_tls(&mut &self.socket)?;
+        // ⚠ 不能一把 write_all：rustls 的明文发送缓冲有上限（默认 64 KiB），
+        // 满了 write 就收下 0 字节，write_all 随即报 WriteZero —— 小帧没事，
+        // 一过 64 KiB 的帧（大段文本、音频）就整帧发不出去，连接被判坏。
+        // 所以每塞一批就把密文吐到 socket，腾出缓冲再塞下一批。
+        let mut sent = 0usize;
+        while sent < 数据.len() {
+            let n = conn.writer().write(&数据[sent..])?;
+            sent += n;
+            let mut flushed = false;
+            while conn.wants_write() {
+                conn.write_tls(&mut &self.socket)?;
+                flushed = true;
+            }
+            if n == 0 && !flushed {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "TLS 发送缓冲满且无法排空",
+                ));
+            }
         }
         Ok(())
     }
@@ -164,5 +227,71 @@ impl TLS客户流 {
             }
         }
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    const CA: &str = include_str!("../../tests/fixtures/tls/ca.pem");
+    const LEAF: &str = include_str!("../../tests/fixtures/tls/leaf.pem");
+    const LEAF_KEY: &str = include_str!("../../tests/fixtures/tls/leaf.pk8");
+
+    /// 超过 rustls 64 KiB 明文发送缓冲的一次发送：以前 write_all 撞上 WriteZero，
+    /// wss 上大帧整帧发不出去（小帧一直正常，所以只有大文本/音频才炸）。
+    #[test]
+    fn send_larger_than_plaintext_buffer() {
+        装默认加密提供者();
+        let certs: Vec<_> = rustls_pemfile::certs(&mut LEAF.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut LEAF_KEY.as_bytes())
+            .unwrap()
+            .unwrap();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        const N: usize = 300 * 1024;
+
+        // 服务端：收满 N 字节原样回送
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, sock);
+            let mut buf = vec![0u8; N];
+            tls.read_exact(&mut buf).unwrap();
+            tls.write_all(&buf).unwrap();
+            tls.flush().unwrap();
+        });
+
+        let mut roots = RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut CA.as_bytes()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let sock = TcpStream::connect(addr).unwrap();
+        let client = TLS客户流::handshake_with(sock, "localhost", config).unwrap();
+        let data: Vec<u8> = (0..N).map(|i| (i % 251) as u8).collect();
+        client.发送(&data).expect("大于 64 KiB 的一次发送不该失败");
+
+        let mut got = Vec::new();
+        while got.len() < N {
+            client
+                .泵(&mut got, Some(Duration::from_secs(10)))
+                .expect("回读失败");
+        }
+        assert_eq!(got, data);
+        server.join().unwrap();
     }
 }
