@@ -18,6 +18,7 @@ pub mod datetime_local;
 pub mod debug;
 pub mod env_ffi;
 pub mod exception_ffi;
+pub mod gui_editor_buf_ffi;
 pub mod gui_ffi;
 pub mod gui_sprite_ffi;
 pub mod hashmap;
