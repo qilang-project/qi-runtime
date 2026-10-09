@@ -26,6 +26,9 @@ pub const FMT_PART_STR: i64 = 0;
 pub const FMT_PART_INT: i64 = 1;
 /// 段类型：浮点（value = f64 的位模式）
 pub const FMT_PART_FLOAT: i64 = 2;
+/// 段类型：字符（value = Unicode 码点；非法码点输出 U+FFFD）。
+/// 编译器后端里 字符 就是 i64 码点，插值 / 打印 / 拼接字符时靠这一段按字符输出。
+pub const FMT_PART_CHAR: i64 = 3;
 
 /// 插值段 —— 编译器在栈上排成 `[N x {i64, i64}]` 传进来。
 /// 两个字段都用 i64，布局在 64 位与 wasm32 上一致（16 字节）。
@@ -202,6 +205,16 @@ pub unsafe extern "C" fn qi_string_format_parts(parts: *const FmtPart, n: i64) -
                 Some(b) => Piece::Borrowed(b.as_ptr(), b.len()),
                 None => return std::ptr::null_mut(),
             },
+            FMT_PART_CHAR => {
+                let off = scratch.len;
+                let c = u32::try_from(part.value)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or(char::REPLACEMENT_CHARACTER);
+                let mut buf = [0u8; 4];
+                scratch.push(c.encode_utf8(&mut buf).as_bytes());
+                Piece::Scratch(off, scratch.len - off)
+            }
             FMT_PART_FLOAT => {
                 let off = scratch.len;
                 push_f64(&mut scratch, f64::from_bits(part.value as u64));
@@ -259,6 +272,28 @@ mod tests {
         FmtPart {
             kind: FMT_PART_FLOAT,
             value: v.to_bits() as i64,
+        }
+    }
+
+    #[test]
+    fn char_parts_encode_utf8() {
+        let c = |v: i64| FmtPart {
+            kind: FMT_PART_CHAR,
+            value: v,
+        };
+        unsafe {
+            let parts = [
+                s(c"<"),
+                c('中' as i64),
+                c('a' as i64),
+                c('😀' as i64),
+                c(0xD800),
+                c(-1),
+                s(c">"),
+            ];
+            let p = qi_string_format_parts(parts.as_ptr(), parts.len() as i64);
+            assert_eq!(text(p), "<中a😀\u{FFFD}\u{FFFD}>");
+            rc_cstr_release(p);
         }
     }
 
