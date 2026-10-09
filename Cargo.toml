@@ -77,6 +77,9 @@ dashmap = "6.1"
 hashbrown = { version = "0.17", default-features = false, features = ["inline-more", "raw-entry"] }
 ahash = "0.8"
 libc = "0.2.158"
+# 标准库.张量 的矩阵乘（macOS 先试系统 Accelerate，拿不到才用它）。纯 Rust、
+# 无系统 BLAS 依赖，wasm32-wasip1 也能编；threading 按物理核数多线程分块。
+matrixmultiply = { version = "0.3", features = ["threading"] }
 num_cpus = "1.16.0"
 chrono = { version = "0.4.38", features = ["serde"] }
 regex = "1.10.0"

@@ -4,7 +4,7 @@
 //!
 //! 这个 crate 自己几乎不写业务逻辑：`stdlib::*` 下面的模块全部用 `#[path]` 从主运行时
 //! `../src/stdlib/*.rs` **原样编进来**。字符串 / JSON / 列表 / 哈希表 / 字节切片 / 数学 /
-//! 时间 / 闭包 / 反射 / 正则 / 加密 / 压缩 / 向量 / 词法索引，在 wasm 里跑的就是
+//! 时间 / 闭包 / 反射 / 正则 / 加密 / 压缩 / 向量 / 张量 / 词法索引，在 wasm 里跑的就是
 //! 原生那份代码，行为逐字节一致，改一处两边都改。
 //!
 //! 能这么做的前提是那些模块只依赖 `crate::stdlib::{qi_str, list, rc_obj}` 和几个纯 Rust
@@ -104,6 +104,10 @@ pub mod stdlib {
     pub mod sync_ffi;
     #[path = "../../../src/stdlib/system.rs"]
     pub mod system;
+    #[path = "../../../src/stdlib/tensor.rs"]
+    pub mod tensor;
+    #[path = "../../../src/stdlib/tensor_ffi.rs"]
+    pub mod tensor_ffi;
     #[path = "../../../src/stdlib/vector.rs"]
     pub mod vector;
     #[path = "../../../src/stdlib/vector_ffi.rs"]
