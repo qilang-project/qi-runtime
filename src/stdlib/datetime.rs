@@ -31,11 +31,7 @@ pub extern "C" fn qi_datetime_now_millis() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-/// 获取当前本地时间戳
-#[no_mangle]
-pub extern "C" fn qi_datetime_now_local() -> i64 {
-    Local::now().timestamp()
-}
+// 本地时区那一族（本地时间 / 时区偏移 / 本地年…）在 datetime_local.rs。
 
 /// 获取当前 Unix 时间戳（微秒）
 #[no_mangle]

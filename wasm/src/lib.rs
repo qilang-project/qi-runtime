@@ -70,6 +70,8 @@ pub mod stdlib {
     pub mod crypto_ffi;
     #[path = "../../../src/stdlib/datetime.rs"]
     pub mod datetime;
+    #[path = "../../../src/stdlib/datetime_local.rs"]
+    pub mod datetime_local;
     #[path = "../../../src/stdlib/hashmap.rs"]
     pub mod hashmap;
     #[path = "../../../src/stdlib/json_ffi.rs"]

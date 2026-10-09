@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod crypto_ffi;
 pub mod database_ffi;
 pub mod datetime;
+pub mod datetime_local;
 pub mod debug;
 pub mod env_ffi;
 pub mod exception_ffi;
