@@ -3580,7 +3580,10 @@ mod 磁带键测试 {
         元.insert("q".into(), json!(2));
         元.insert("p".into(), json!(1));
         let mut 乙 = serde_json::Map::new();
-        乙.insert("b".into(), serde_json::Value::Array(vec![serde_json::Value::Object(元)]));
+        乙.insert(
+            "b".into(),
+            serde_json::Value::Array(vec![serde_json::Value::Object(元)]),
+        );
         乙.insert("a".into(), serde_json::Value::Object(内));
         assert_eq!(
             磁带::请求键(&甲),
@@ -3591,8 +3594,10 @@ mod 磁带键测试 {
     /// **数组顺序必须仍然影响键** —— messages 是对话顺序，调换了就是另一个请求。
     #[test]
     fn 数组顺序仍然算数() {
-        let 甲 = json!({"messages": [{"role":"user","content":"1"}, {"role":"user","content":"2"}]});
-        let 乙 = json!({"messages": [{"role":"user","content":"2"}, {"role":"user","content":"1"}]});
+        let 甲 =
+            json!({"messages": [{"role":"user","content":"1"}, {"role":"user","content":"2"}]});
+        let 乙 =
+            json!({"messages": [{"role":"user","content":"2"}, {"role":"user","content":"1"}]});
         assert_ne!(磁带::请求键(&甲), 磁带::请求键(&乙));
     }
 
