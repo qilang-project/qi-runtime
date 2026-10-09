@@ -1,0 +1,113 @@
+name: CI
+
+# qi-runtime 以前没有 CI。2026-09-06 起 `--features gui` 编不过，一个月没人发现 ——
+# 普通构建照样绿，而发布包从来不编 gui。所以这里两种构建都跑，三个平台都跑。
+#
+# 布局：qi-runtime 的 gui feature 是 path 依赖 ../qi-gui，cargo 就算不开这个
+# feature 也要读它的 manifest（fmt / clippy 也一样）。actions/checkout 不能往
+# 工作区外面检出，所以两个仓都检出成工作区的子目录，并排放。
+
+on:
+  push:
+    branches: [main, "ci/**", "feat-*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      qi_gui_ref:
+        description: qi-gui 的分支或 tag
+        default: main
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI 要的是「最新运行时 + 最新 qi-gui」能不能一起编；发布那条路才钉 tag
+  QI_GUI_REF: ${{ github.event.inputs.qi_gui_ref || 'main' }}
+
+jobs:
+  build:
+    name: Build + Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: qi-runtime
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: qi-runtime
+
+      - uses: actions/checkout@v4
+        with:
+          repository: qilang-project/qi-gui
+          ref: ${{ env.QI_GUI_REF }}
+          path: qi-gui
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # 只有 gui feature 要：rodio → cpal → alsa-sys 走 pkg-config 找 ALSA。
+      # X11 / Wayland / xkbcommon 是运行时 dlopen 的，编译期不需要。
+      - name: Install ALSA (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            qi-runtime/target
+          key: ${{ matrix.os }}-runtime-${{ hashFiles('qi-runtime/Cargo.toml', 'qi-gui/Cargo.toml') }}
+          restore-keys: ${{ matrix.os }}-runtime-
+
+      - name: Build (default features)
+        run: cargo build --release
+
+      # 发布包里的 libqi_runtime_gui.a 就是这么编的（qi 仓 make runtime-gui）
+      - name: Build (--features gui)
+        run: cargo build --release --features gui
+
+      # 打印 GUI 版归档链接时要的系统库。静态库不带这份清单，得由 qi 编译器
+      # 在链 GUI 程序时补上（qi/src/runtime_archive.rs 的 push_gui_system_libs）——
+      # 依赖升级后多出来一个库，先在这里看得见。
+      - name: native-static-libs (--features gui)
+        run: cargo rustc --release --features gui --lib --crate-type staticlib -- --print native-static-libs 2>&1 | { grep native-static-libs || echo "（缓存命中没重编，看不到清单）"; }
+
+      # 有几个测试改进程环境变量（set_var），并发读 env 在 macOS 上会直接段错误 ——
+      # 跟 qi 仓 make test 一样串行跑
+      - name: Test
+        run: cargo test --release -- --test-threads=1
+
+      # 只挡 error 级 lint；两种 feature 组合各查一遍（has_gui 分支只在 gui 下编）
+      - name: Clippy (default)
+        run: cargo clippy --release
+      - name: Clippy (--features gui)
+        run: cargo clippy --release --features gui
+
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: qi-runtime
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: qi-runtime
+      - uses: actions/checkout@v4
+        with:
+          repository: qilang-project/qi-gui
+          ref: ${{ env.QI_GUI_REF }}
+          path: qi-gui
+      # 钉死，跟 qi 仓 Format Check 同一版。本地用 cargo +1.92.0 fmt
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: rustfmt
+      - run: cargo fmt -- --check
