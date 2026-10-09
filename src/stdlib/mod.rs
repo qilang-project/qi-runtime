@@ -57,6 +57,8 @@ pub mod string_ffi;
 pub mod subprocess_ffi;
 pub mod sync_ffi;
 pub mod system;
+pub mod tensor;
+pub mod tensor_ffi;
 pub mod test_ffi;
 pub mod vector;
 pub mod vector_ffi;
