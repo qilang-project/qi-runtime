@@ -23,6 +23,13 @@
 //! // runtime.execute_program(program_data).unwrap();
 //! ```
 
+// clippy::not_unsafe_ptr_arg_deref 默认是 deny，这个 crate 里有 400 多处，
+// 全是 `#[no_mangle] pub extern "C" fn` —— 调用方是 qi 生成的代码，不是 Rust。
+// 标成 `unsafe fn` 对 C 侧调用方毫无区别（ABI 一样），只会让 Rust 单测满屏
+// unsafe 块。CI 的 clippy 只挡 error 级，所以在这里整体放行；其余 deny 级
+// lint 照常拦。
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 // GUI 特性开启时把 qi-gui 拉入链接图，使其 #[no_mangle] qi_gui_*_impl 符号
 // 编入 libqi_runtime.a（供 stdlib::gui_ffi 的包装转调，含老 tao API 与 egui 控件层）。
 #[cfg(feature = "gui")]

@@ -212,7 +212,10 @@ fn 真状态码(方法: reqwest::Method, 地址: &str) -> Result<u16, String> {
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
-    let 响应 = 客户端.request(方法, 地址).send().map_err(|e| e.to_string())?;
+    let 响应 = 客户端
+        .request(方法, 地址)
+        .send()
+        .map_err(|e| e.to_string())?;
     Ok(响应.status().as_u16())
 }
 
